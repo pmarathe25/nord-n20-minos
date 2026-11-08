@@ -1,0 +1,83 @@
+#!/bin/sh
+export PATH=/bin
+B=/bin/busybox
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mkdir -p /dev/pts /sys/kernel/config /newroot
+mount -t devpts -o mode=600,ptmxmode=666 devpts /dev/pts
+ln -s pts/ptmx /dev/ptmx
+for spec in 'zero 1 5' 'random 1 8' 'urandom 1 9' 'tty 5 0'; do
+    set -- $spec
+    [ -c "/dev/$1" ] || mknod -m 666 "/dev/$1" c "$2" "$3"
+done
+mount -t configfs configfs /sys/kernel/config
+g=/sys/kernel/config/usb_gadget/n20
+mkdir -p "$g"
+echo 0x1d6b > "$g/idVendor"
+echo 0x0104 > "$g/idProduct"
+mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409" "$g/functions/acm.usb0" "$g/functions/ncm.usb0"
+echo 'N20-LINUX-EXPERIMENT' > "$g/strings/0x409/serialnumber"
+echo 'Linux' > "$g/strings/0x409/manufacturer"
+echo 'N20 serial and network' > "$g/strings/0x409/product"
+echo 'serial and network' > "$g/configs/c.1/strings/0x409/configuration"
+echo ca:51:53:fb:13:37 > "$g/functions/ncm.usb0/dev_addr"
+echo 0e:48:49:c8:79:62 > "$g/functions/ncm.usb0/host_addr"
+ln -s "$g/functions/acm.usb0" "$g/configs/c.1/acm.usb0"
+ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/ncm.usb0"
+echo 4e00000.dwc3 > "$g/UDC"
+sleep 3
+$B ip link set lo up
+$B ip link set usb0 up
+$B ip addr add 169.254.77.2/16 dev usb0
+$B ip addr add 192.168.137.2/24 dev usb0
+$B ip route add default via 192.168.137.1 dev usb0
+i=0
+while [ ! -r /sys/class/tty/ttyGS0/dev ] && [ "$i" -lt 30 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+if [ -r /sys/class/tty/ttyGS0/dev ]; then
+    number=$(cat /sys/class/tty/ttyGS0/dev)
+    mknod -m 600 /dev/ttyGS0 c "${number%:*}" "${number#*:}"
+fi
+
+found=''
+for block in /sys/class/block/*; do
+    if $B grep -qx PARTNAME=userdata "$block/uevent" 2>/dev/null; then
+        found=$block
+        break
+    fi
+done
+if [ -n "$found" ]; then
+    number=$(cat "$found/dev")
+    mknod /dev/userdata b "${number%:*}" "${number#*:}"
+    if $B blkid /dev/userdata | $B grep -q 'UUID="d52d9354-5eac-46e0-9661-1b3b253f5d1b"'; then
+        if mount -t ext4 /dev/userdata /newroot; then
+            mount -o bind /dev /newroot/dev
+            mount -o bind /dev/pts /newroot/dev/pts
+            mount -o bind /proc /newroot/proc
+            mount -o bind /sys /newroot/sys
+            mkdir -p /newroot/run
+            mount -t tmpfs -o mode=0755 tmpfs /newroot/run
+            if [ -x /newroot/usr/local/sbin/minecraft-supervisor ]; then
+                mkdir -p /newroot/var/log
+                setsid $B chroot /newroot /usr/local/sbin/minecraft-supervisor </dev/null >>/newroot/var/log/minecraft-supervisor.log 2>&1 &
+            fi
+            if [ -r /sys/class/drm/card0/dev ] && [ -x /newroot/usr/bin/kmscon ]; then
+                mkdir -p /dev/dri
+                number=$(cat /sys/class/drm/card0/dev)
+                mknod -m 600 /dev/dri/card0 c "${number%:*}" "${number#*:}"
+                setsid $B chroot /newroot /usr/bin/kmscon --no-switchvt --no-libseat --font-size 26 --login -- /usr/bin/tail -n 40 -F /var/log/minecraft.log </dev/null >>/newroot/var/log/kmscon.log 2>&1 &
+            fi
+            while true; do
+                setsid $B chroot /newroot /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin TERM=vt100 /bin/bash --noprofile --norc -i < /dev/ttyGS0 > /dev/ttyGS0 2>&1
+                sleep 1
+            done
+        fi
+    fi
+fi
+echo 'n20: persistent root unavailable; using emergency shell' > /dev/kmsg
+while true; do
+    setsid sh -i < /dev/ttyGS0 > /dev/ttyGS0 2>&1
+    sleep 1
+done

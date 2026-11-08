@@ -1,0 +1,11 @@
+[Unit]
+Description=QRTR TFTP service
+Requires=qrtr-ns.service
+After=qrtr-ns.service
+
+[Service]
+ExecStart=@prefix@/bin/tqftpserv
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

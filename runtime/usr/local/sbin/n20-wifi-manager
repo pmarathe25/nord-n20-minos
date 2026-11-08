@@ -1,0 +1,140 @@
+#!/usr/bin/python3
+"""Local touchscreen Wi-Fi control. WPA2 keys never appear in process arguments."""
+import hashlib
+import os
+import re
+import socket
+import subprocess
+import time
+
+RUN = '/run/n20'
+CTRL = '/run/wpa_supplicant/wlan0'
+os.umask(0o077)
+os.makedirs(RUN, exist_ok=True)
+os.makedirs('/run/wpa_supplicant', exist_ok=True)
+config = '/etc/n20-wpa.conf'
+if not os.path.exists(config):
+    with open(config, 'w') as f:
+        f.write('ctrl_interface=DIR=/run/wpa_supplicant GROUP=root\nupdate_config=1\n')
+os.chmod(config, 0o600)
+sockpath = RUN + '/wifi-control'
+try: os.unlink(sockpath)
+except FileNotFoundError: pass
+server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+server.bind(sockpath)
+os.chmod(sockpath, 0o600)
+server.settimeout(1)
+dhcp = None
+supp = None
+lastscan = 0
+pending = None
+pending_since = 0
+message = 'Starting Wi-Fi'
+laststate = 0
+
+def request(command):
+    path = RUN + '/wpa-client'
+    try: os.unlink(path)
+    except FileNotFoundError: pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.bind(path)
+        s.settimeout(2)
+        s.connect(CTRL)
+        s.send(command.encode('ascii'))
+        return s.recv(65535).decode('utf-8', 'replace').strip()
+    finally:
+        s.close()
+        try: os.unlink(path)
+        except FileNotFoundError: pass
+
+def unescape(s):
+    return re.sub(rb'\\x([0-9a-fA-F]{2})', lambda m: bytes([int(m.group(1),16)]), s.encode())
+
+def status():
+    return dict(line.split('=',1) for line in request('STATUS').splitlines() if '=' in line)
+
+def write_state():
+    global message
+    st = status()
+    rows = []
+    for line in request('SCAN_RESULTS').splitlines()[1:]:
+        parts = line.split('\t',4)
+        if len(parts) != 5: continue
+        _, freq, signal, flags, ssid = parts
+        raw = unescape(ssid)
+        if not raw or len(raw)>32: continue
+        kind = 'WPA2' if 'WPA2-PSK' in flags or 'RSN-PSK' in flags else 'OPEN' if not any(x in flags for x in ('WPA','WEP','SAE','OWE')) else 'UNSUPPORTED'
+        rows.append((raw, kind, int(signal) if signal.lstrip('-').isdigit() else -100))
+    unique = {}
+    for raw,kind,signal in rows:
+        key=(raw,kind)
+        if key not in unique or signal>unique[key]: unique[key]=signal
+    ip = st.get('ip_address','')
+    current = unescape(st.get('ssid','')).hex()
+    fields = ['STATE\t'+st.get('wpa_state','UNKNOWN'), 'IP\t'+ip, 'CURRENT\t'+current, 'MESSAGE\t'+message]
+    fields += ['NETWORK\t%s\t%s\t%d' % (raw.hex(),kind,signal) for (raw,kind),signal in sorted(unique.items(), key=lambda item:-item[1])[:30]]
+    tmp=RUN+'/wifi-state.tmp'
+    with open(tmp,'w') as f: f.write('\n'.join(fields)+'\n')
+    os.replace(tmp,RUN+'/wifi-state')
+
+def command(data):
+    global pending,pending_since,message,lastscan
+    parts = data.decode('ascii').strip().split(' ')
+    if parts[0]=='SCAN':
+        request('SCAN'); lastscan=time.monotonic(); message='Scanning for networks'; return
+    if parts[0]=='DISCONNECT':
+        request('DISCONNECT'); message='Disconnected'; return
+    if parts[0]!='CONNECT' or len(parts)!=4: return
+    ssid=bytes.fromhex(parts[1]); password=bytes.fromhex(parts[2]); kind=parts[3]
+    if not 1<=len(ssid)<=32 or kind not in ('WPA2','OPEN'): raise ValueError('Unsupported network')
+    if kind=='WPA2' and not (8<=len(password)<=63 or (len(password)==64 and all(c in b'0123456789abcdefABCDEF' for c in password))): raise ValueError('Password must be 8 to 63 characters')
+    nid=request('ADD_NETWORK')
+    if not nid.isdigit(): raise ValueError('Could not create network')
+    try:
+        commands=['SET_NETWORK %s ssid %s' % (nid,ssid.hex())]
+        if kind=='OPEN': commands+=['SET_NETWORK %s key_mgmt NONE' % nid]
+        else:
+            psk=password.decode() if len(password)==64 else hashlib.pbkdf2_hmac('sha1',password,ssid,4096,32).hex()
+            commands+=['SET_NETWORK %s key_mgmt WPA-PSK' % nid,'SET_NETWORK %s psk %s' % (nid,psk)]
+        for line in commands+['SELECT_NETWORK '+nid]:
+            if request(line)!='OK': raise ValueError('Could not configure network')
+        pending=nid; pending_since=time.monotonic(); message='Connecting...'
+    except Exception:
+        request('REMOVE_NETWORK '+nid)
+        raise
+
+while True:
+    try:
+        if not os.path.exists('/sys/class/net/wlan0'):
+            message='Starting Wi-Fi radio'; time.sleep(2); continue
+        if not os.path.exists(CTRL):
+            if supp is None or supp.poll() is not None:
+                supp=subprocess.Popen(['/usr/sbin/wpa_supplicant','-i','wlan0','-c',config,'-D','nl80211'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            time.sleep(2); continue
+        st=status(); connected=st.get('wpa_state')=='COMPLETED'
+        if connected and pending is None and message in ('Starting Wi-Fi','Starting Wi-Fi radio','Scanning for networks'):
+            message='Connected'
+        if connected and pending is not None and st.get('id')==pending:
+            request('ENABLE_NETWORK all'); request('SAVE_CONFIG'); pending=None; message='Connected'
+        if pending is not None and time.monotonic()-pending_since>60:
+            request('REMOVE_NETWORK '+pending); request('ENABLE_NETWORK all'); request('RECONNECT'); pending=None; message='Connection failed. Check the password and try again.'
+        if connected and (dhcp is None or dhcp.poll() is not None):
+            log=open('/var/log/n20-wifi-dhcp.log','ab',buffering=0)
+            dhcp=subprocess.Popen(['/usr/local/bin/busybox','udhcpc','-f','-i','wlan0','-s','/usr/local/sbin/n20-wifi-dhcp'],stdout=log,stderr=log)
+            log.close()
+        if not connected and dhcp is not None:
+            dhcp.terminate(); dhcp=None
+            subprocess.run(['/usr/local/sbin/n20-wifi-dhcp','deconfig'],env={'interface':'wlan0','PATH':'/usr/sbin:/usr/bin:/sbin:/bin'},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if not connected and time.monotonic()-lastscan>45:
+            request('SCAN'); lastscan=time.monotonic()
+        if time.monotonic()-laststate>3:
+            write_state(); laststate=time.monotonic()
+        try:
+            data=server.recv(2048)
+            try: command(data)
+            except (ValueError, OSError) as e: message=str(e)[:100]
+            laststate=0
+        except socket.timeout: pass
+    except (OSError,ValueError):
+        time.sleep(2)

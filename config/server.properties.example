@@ -1,0 +1,12 @@
+# Reference subset, not the phone's live settings. Generate a new secret locally.
+server-ip=
+server-port=25565
+online-mode=true
+enable-rcon=false
+view-distance=6
+simulation-distance=4
+management-server-enabled=true
+management-server-host=127.0.0.1
+management-server-port=25585
+management-server-tls-enabled=false
+management-server-secret=REPLACE_WITH_40_RANDOM_ALPHANUMERIC_CHARACTERS

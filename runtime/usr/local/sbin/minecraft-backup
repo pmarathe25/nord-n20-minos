@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility entry point: make a non-disruptive snapshot of saved files.
+exec /usr/local/sbin/n20-admin backup

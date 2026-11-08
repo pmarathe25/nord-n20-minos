@@ -1,0 +1,17 @@
+#!/bin/sh
+mkdir -p /dev/input
+for f in /sys/class/input/event*/dev; do
+    [ -r "$f" ] || continue
+    n=${f%/dev}; n=${n##*/}; d=$(cat "$f")
+    [ -c "/dev/input/$n" ] || /usr/local/bin/busybox mknod -m 600 "/dev/input/$n" c "${d%:*}" "${d#*:}"
+done
+/usr/local/sbin/n20-dashboard >>/var/log/n20-dashboard.log 2>&1
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "dashboard exited with status $status; starting console fallback" >>/var/log/n20-dashboard.log
+    if [ -x /usr/local/sbin/n20-display-watch-start ]; then
+        /usr/local/bin/busybox setsid /usr/local/sbin/n20-display-watch-start >>/var/log/n20-display-watch.log 2>&1 </dev/null &
+    fi
+    exec /usr/bin/kmscon.distrib "$@"
+fi
+exit 0

@@ -1,0 +1,76 @@
+#!/bin/sh
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /run /var/log /srv/minecraft
+# n20-wifi-start
+/usr/local/bin/busybox setsid /usr/local/sbin/n20-radio-start >>/var/log/n20-radio.log 2>&1 </dev/null &
+/usr/local/bin/busybox setsid /usr/local/sbin/n20-wifi-manager >>/var/log/n20-wifi.log 2>&1 </dev/null &
+/usr/local/bin/busybox setsid /usr/local/sbin/n20-mtp-start >>/var/log/n20-mtp-start.log 2>&1 </dev/null &
+if [ ! -x /usr/local/sbin/n20-dashboard ] && [ -x /usr/local/sbin/n20-display-watch-start ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-display-watch-start >>/var/log/n20-display-watch.log 2>&1 </dev/null &
+fi
+if [ -x /usr/local/sbin/n20-link-watch ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-link-watch >>/var/log/n20-link-watch.log 2>&1 </dev/null &
+fi
+if [ -x /usr/local/sbin/n20-timekeeper ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-timekeeper >>/var/log/n20-timekeeper.log 2>&1 </dev/null &
+fi
+if [ -x /usr/local/sbin/n20-save-events ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-save-events >>/var/log/n20-save-events.log 2>&1 </dev/null &
+fi
+if [ -x /usr/local/sbin/n20-admin ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-admin scheduler >>/var/log/n20-scheduler.log 2>&1 </dev/null &
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-admin powerguard >>/var/log/n20-powerguard.log 2>&1 </dev/null &
+fi
+if [ -x /usr/sbin/sshd ] && [ -f /etc/ssh/sshd_config_n20 ]; then
+    mkdir -p /run/sshd
+    /usr/sbin/sshd -t -f /etc/ssh/sshd_config_n20 && /usr/sbin/sshd -f /etc/ssh/sshd_config_n20
+fi
+cd /srv/minecraft || exit 1
+rm -f /run/minecraft-console
+mkfifo /run/minecraft-console || exit 1
+chown minecraft:minecraft /run/minecraft-console
+chmod 600 /run/minecraft-console
+exec 3<>/run/minecraft-console
+mkdir -p /run/n20
+exec 4>/run/n20/server-transition.lock
+while :; do
+    if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then
+        sleep 5
+        continue
+    fi
+    if [ ! -f server.jar ] || ! grep -q '^eula=true' eula.txt 2>/dev/null; then
+        sleep 10
+        continue
+    fi
+    n=0
+    while [ "$n" -lt 30 ]; do
+        now=$(/usr/local/bin/busybox wget -T 2 -qO - http://192.168.137.1:18888/time 2>/dev/null || /usr/local/bin/busybox wget -T 2 -qO - http://169.254.187.170:18888/time 2>/dev/null || true)
+        case "$now" in
+            ''|*[!0-9]*) sleep 2; n=$((n + 1)) ;;
+            *) /usr/local/bin/busybox date -u -s "@$now" >/dev/null; break ;;
+        esac
+    done
+    # A dead battery can reset the clock to 1970. Wait for a credible time;
+    # the background timekeeper retries while the USB host is unavailable.
+    while [ "$(date -u +%s)" -lt 1704067200 ]; do
+        if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then break; fi
+        sleep 5
+    done
+    if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then continue; fi
+    echo "$(date -u): starting Minecraft" >> /var/log/minecraft.log
+    flock -x 4
+    if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then
+        flock -u 4
+        continue
+    fi
+    setpriv --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G -jar server.jar nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
+    pid=$!
+    echo "$pid" > /run/minecraft.pid
+    flock -u 4
+    wait "$pid"
+    status=$?
+    rm -f /run/minecraft.pid
+    echo "$(date -u): Minecraft exited with status $status" >> /var/log/minecraft.log
+    sleep 10
+done

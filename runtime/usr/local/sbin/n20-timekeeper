@@ -1,0 +1,16 @@
+#!/bin/sh
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+B=/usr/local/bin/busybox
+while :; do
+    now=$($B wget -T 2 -qO - http://192.168.137.1:18888/time 2>/dev/null || true)
+    case "$now" in
+      ''|*[!0-9]*)
+        if [ -d /sys/class/net/wlan0 ] && $B ip addr show wlan0 | grep -q 'inet '; then
+          $B timeout 20 $B ntpd -n -q -p time.cloudflare.com -p time.google.com >/dev/null 2>&1 || :
+        fi
+        sleep 30 ;;
+      *) if [ "$now" -gt 1704067200 ] 2>/dev/null; then
+           $B date -u -s "@$now" >/dev/null 2>&1 || :; sleep 1800
+         else sleep 10; fi ;;
+    esac
+done

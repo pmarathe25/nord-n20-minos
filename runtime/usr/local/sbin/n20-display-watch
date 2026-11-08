@@ -1,0 +1,17 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Fcntl qw(O_RDONLY);
+use IO::Handle;
+$| = 1;
+sysopen(my $input, '/dev/input/event0', O_RDONLY) or die "power input: $!\n";
+print "power button watcher started\n";
+while (1) {
+    my $bytes = sysread($input, my $event, 24);
+    defined($bytes) or die "power input read: $!\n";
+    next unless $bytes == 24;
+    my ($type, $code, $value) = unpack('x16 S S l', $event);
+    next unless $type == 1 && $code == 116 && $value == 1;
+    print "power button pressed\n";
+    system('/usr/local/sbin/n20-display-wake');
+}

@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+g=/proc/1/root/sys/kernel/config/usb_gadget/n20
+udc=4e00000.dwc3
+B=/usr/local/bin/busybox
+restore_usb_network() {
+  i=0
+  while [ ! -e /sys/class/net/usb0 ]; do i=$((i+1)); [ "$i" -lt 10 ] || return 1; sleep 1; done
+  $B ip link set usb0 up
+  $B ip addr add 192.168.137.2/24 dev usb0 2>/dev/null || :
+  $B ip addr add 169.254.77.2/16 dev usb0 2>/dev/null || :
+  $B ip route add default via 192.168.137.1 dev usb0 metric 100 2>/dev/null || :
+}
+[ -d "$g/configs/c.1" ] || exit 1
+mkdir -p "$g/functions/ffs.mtp" /dev/ffs-mtp
+grep -q ' /dev/ffs-mtp ' /proc/mounts || mount -t functionfs mtp /dev/ffs-mtp
+/usr/bin/umtprd >>/var/log/n20-mtp.log 2>&1 </dev/null &
+pid=$!
+i=0
+while [ ! -e /dev/ffs-mtp/ep3 ]; do
+  kill -0 "$pid" 2>/dev/null || { echo 'MTP responder failed'; exit 1; }
+  i=$((i+1)); [ "$i" -lt 20 ] || { echo 'MTP descriptors timed out'; exit 1; }; sleep 1
+done
+# Ensure an interrupted reconfiguration brings the original USB network back.
+(
+  sleep 35
+  if [ -z "$(cat "$g/UDC")" ]; then
+    rm -f "$g/configs/c.1/ffs.mtp"
+    printf '%s' "$udc" > "$g/UDC" || :
+    restore_usb_network || :
+  fi
+) </dev/null >/dev/null 2>&1 &
+watchdog=$!
+printf '\n' > "$g/UDC"
+[ -L "$g/configs/c.1/ffs.mtp" ] || ln -s "$g/functions/ffs.mtp" "$g/configs/c.1/ffs.mtp"
+if ! printf '%s' "$udc" > "$g/UDC"; then
+  rm -f "$g/configs/c.1/ffs.mtp"
+  printf '%s' "$udc" > "$g/UDC" || :
+  restore_usb_network || :
+  exit 1
+fi
+restore_usb_network
+kill "$watchdog" 2>/dev/null || :
+echo 'MTP and USB network enabled'

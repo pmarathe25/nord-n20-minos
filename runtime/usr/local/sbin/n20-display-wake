@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+state=$(cat /sys/class/drm/card0-DSI-1/dpms 2>/dev/null || true)
+[ "$state" != On ] || exit 0
+pids=$(/usr/local/bin/busybox pidof kmscon || true)
+if [ -n "$pids" ]; then
+    kill $pids 2>/dev/null || true
+    sleep 1
+fi
+/usr/local/bin/busybox setsid /usr/bin/kmscon --no-switchvt --no-libseat --font-size 26 --login -- /usr/bin/tail -n 40 -F /var/log/minecraft.log >>/var/log/kmscon.log 2>&1 </dev/null &

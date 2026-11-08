@@ -1,0 +1,25 @@
+# Local build products and device-specific material must remain outside Git.
+/build/
+__pycache__/
+*.py[cod]
+*.o
+*.img
+*.apk
+*.cpio.gz
+*.tar.gz
+*.ko
+*.pem
+*.key
+*token*.json
+*credential*.json
+*password*
+*backup.pass
+id_rsa*
+id_ed25519*
+n20_usb_key*
+server.properties
+world/
+backups/
+recovery/
+firmware/
+.env

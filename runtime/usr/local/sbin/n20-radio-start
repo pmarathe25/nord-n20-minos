@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+base=/run/n20-radio-test
+tools=/usr/local/lib/n20-radio
+mkdir -p "$base/efs" "$base/wifi/sockets" "$base/persist" /mnt/n20-modem /vendor/firmware_mnt
+grep -q ' /mnt/n20-modem ' /proc/mounts || {
+  grep -qx PARTNAME=modem_b /sys/class/block/sde25/uevent
+  dev=$(cat /sys/class/block/sde25/dev)
+  [ -b /dev/n20-modem-b ] || mknod -m 600 /dev/n20-modem-b b "${dev%:*}" "${dev#*:}"
+  mount -t vfat -o ro /dev/n20-modem-b /mnt/n20-modem
+}
+for file in /mnt/n20-modem/image/*; do
+  [ -f "$file" ] || continue
+  name=${file##*/}
+  [ -e "/usr/lib/firmware/$name" ] || [ -L "/usr/lib/firmware/$name" ] || ln -s "../../../mnt/n20-modem/image/$name" "/usr/lib/firmware/$name"
+done
+printf '%s' /newroot/usr/lib/firmware > /sys/module/firmware_class/parameters/path
+for pair in modemst1:sdf4 modemst2:sdf5 fsg:sdf6 fsc:sdf7 oplusstanvbk:sdf19 oplusdycnvbk:sdf2; do
+  name=${pair%:*}; block=${pair#*:}; expected=$name
+  [ "$name" != oplusstanvbk ] || expected=oplusstanvbk_b
+  grep -qx "PARTNAME=$expected" "/sys/class/block/$block/uevent"
+  dev=$(cat "/sys/class/block/$block/dev")
+  [ -b "/dev/n20-$name" ] || mknod -m 600 "/dev/n20-$name" b "${dev%:*}" "${dev#*:}"
+  [ -s "$base/efs/$name" ] || cat "/dev/n20-$name" > "$base/efs/$name"
+done
+if [ ! -r /sys/class/uio/uio0/name ]; then
+  [ -e /sys/bus/platform/devices/0.qcom,rmtfs_sharedmem/driver ] || printf '%s' 0.qcom,rmtfs_sharedmem > /sys/bus/platform/drivers/msm_sharedmem/bind
+fi
+[ "$(cat /sys/class/uio/uio0/name)" = rmtfs ]
+dev=$(cat /sys/class/uio/uio0/dev)
+[ -c /dev/qcom_rmtfs_uio1 ] || mknod -m 600 /dev/qcom_rmtfs_uio1 c "${dev%:*}" "${dev#*:}"
+export LD_LIBRARY_PATH="$tools/qrtr"
+"$tools/rmtfs-n20" -r -P -o "$base/efs" >"$base/rmtfs.log" 2>&1 &
+rpid=$!
+"$tools/pd-mapper-n20" >"$base/pd-mapper.log" 2>&1 &
+ppid=$!
+"$tools/tqftpserv-n20" >"$base/tqftpserv.log" 2>&1 &
+tpid=$!
+sleep 2
+kill -0 "$rpid"; kill -0 "$ppid"; kill -0 "$tpid"
+dev=$(cat /sys/class/subsys/subsys_modem/dev)
+[ -c /dev/subsys_modem ] || mknod -m 600 /dev/subsys_modem c "${dev%:*}" "${dev#*:}"
+python3 -c 'import os,time; fd=os.open("/dev/subsys_modem",os.O_RDONLY); time.sleep(315360000)' >"$base/modem.log" 2>&1 &
+sleep 3
+env LD_LIBRARY_PATH="$tools/android" LD_PRELOAD="$tools/android/libn20-pm-stub.so" "$tools/android/linker64" "$tools/android/cnss-daemon" -n -d >"$base/cnss.log" 2>&1 &
+i=0
+while ! grep -q fwstatus_ready /sys/bus/platform/drivers/icnss2/firmware_ready 2>/dev/null; do
+  i=$((i+1)); [ "$i" -lt 90 ] || { echo 'Wi-Fi firmware did not become ready'; exit 1; }; sleep 1
+done
+if [ ! -e /sys/module/wlan ]; then
+  python3 -c 'import ctypes,os; f=os.open("/usr/local/lib/n20-radio/qca_cld3_wlan.ko",os.O_RDONLY); r=ctypes.CDLL(None,use_errno=True).syscall(273,f,b"",0); assert r == 0, os.strerror(ctypes.get_errno())'
+fi
+i=0
+while [ ! -e /sys/class/net/wlan0 ]; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 1; done
+/usr/local/bin/busybox ip link set wlan0 up
+echo 'Wi-Fi radio ready'

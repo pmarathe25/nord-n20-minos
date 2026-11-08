@@ -1,0 +1,24 @@
+#!/bin/sh
+# Recover the USB network after repeated loss of the connected PC's ARP replies.
+B=/usr/local/bin/busybox
+misses=0
+while :; do
+    sleep 15
+    if [ "$(cat /sys/class/net/usb0/carrier 2>/dev/null)" != 1 ]; then
+        misses=0
+        continue
+    fi
+    if $B arping -q -I usb0 -c 1 -w 2 192.168.137.1 >/dev/null 2>&1; then
+        misses=0
+        continue
+    fi
+    misses=$((misses + 1))
+    if [ "$misses" -ge 4 ]; then
+        echo "$(date -u): PC USB network unreachable; resetting usb0"
+        $B ip link set usb0 down
+        sleep 1
+        $B ip link set usb0 up
+        misses=0
+        sleep 120
+    fi
+done

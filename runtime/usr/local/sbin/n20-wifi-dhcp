@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+B=/usr/local/bin/busybox
+case "$1" in
+  bound|renew)
+    $B ip addr flush dev "$interface" scope global
+    case "${mask:-24}" in
+      *.*) prefix=$($B ipcalc -p "$ip" "$mask"); prefix=${prefix#PREFIX=} ;;
+      *) prefix=${mask:-24} ;;
+    esac
+    $B ip addr add "$ip/$prefix" dev "$interface"
+    $B ip route del default dev "$interface" 2>/dev/null || :
+    for gateway in ${router:-}; do $B ip route add default via "$gateway" dev "$interface" metric 50; break; done
+    if [ -n "${dns:-}" ]; then
+      : > /run/n20-wifi-resolv
+      for server in $dns; do printf 'nameserver %s\n' "$server" >> /run/n20-wifi-resolv; done
+      cp /run/n20-wifi-resolv /etc/resolv.conf
+    fi
+    ;;
+  deconfig)
+    $B ip addr flush dev "$interface" scope global || :
+    $B ip route del default dev "$interface" 2>/dev/null || :
+    ;;
+esac

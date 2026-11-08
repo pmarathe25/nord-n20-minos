@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""Watch the local Minecraft management socket for completed world saves."""
+import base64
+import hashlib
+import json
+import os
+import secrets
+import socket
+import struct
+import time
+from pathlib import Path
+
+RUN=Path('/run/n20')
+PID=Path('/run/minecraft.pid')
+PROPS=Path('/srv/minecraft/server.properties')
+EVENT=RUN/'save-event.json'
+PLAYERS=RUN/'players.json'
+GUID='258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+def secret():
+    for line in PROPS.read_text(encoding='utf-8').splitlines():
+        if line.startswith('management-server-secret='):
+            return line.split('=',1)[1].strip()
+    raise ValueError('management secret missing')
+
+def recv_exact(sock,n):
+    chunks=[]
+    while n:
+        b=sock.recv(n)
+        if not b: raise EOFError('management socket closed')
+        chunks.append(b); n-=len(b)
+    return b''.join(chunks)
+
+def send_frame(sock,payload,opcode=1):
+    n=len(payload)
+    if n<126: header=bytes([0x80|opcode,0x80|n])
+    elif n<65536: header=bytes([0x80|opcode,0x80|126])+struct.pack('>H',n)
+    else: header=bytes([0x80|opcode,0x80|127])+struct.pack('>Q',n)
+    mask=secrets.token_bytes(4)
+    sock.sendall(header+mask+bytes(b^mask[i%4] for i,b in enumerate(payload)))
+
+def handshake(sock,token):
+    key=base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+    request=('GET / HTTP/1.1\r\nHost: 127.0.0.1:25585\r\nUpgrade: websocket\r\n'
+             'Connection: Upgrade\r\nSec-WebSocket-Key: '+key+'\r\nSec-WebSocket-Version: 13\r\n'
+             'Authorization: Bearer '+token+'\r\n\r\n')
+    sock.sendall(request.encode('ascii'))
+    response=bytearray()
+    while not response.endswith(b'\r\n\r\n'):
+        response.extend(recv_exact(sock,1))
+        if len(response)>16384: raise ValueError('management headers too large')
+    lines=response.decode('iso-8859-1').split('\r\n')
+    if not lines[0].startswith('HTTP/1.1 101 '): raise ValueError('management handshake rejected')
+    headers={}
+    for line in lines[1:]:
+        if ':' in line:
+            k,v=line.split(':',1); headers[k.lower().strip()]=v.strip()
+    expected=base64.b64encode(hashlib.sha1((key+GUID).encode('ascii')).digest()).decode('ascii')
+    if headers.get('sec-websocket-accept')!=expected: raise ValueError('invalid websocket handshake')
+
+def frames(sock):
+    fragments=bytearray(); ongoing=False
+    while True:
+        a,b=recv_exact(sock,2); final=bool(a&128); opcode=a&15; masked=bool(b&128); size=b&127
+        if size==126: size=struct.unpack('>H',recv_exact(sock,2))[0]
+        elif size==127: size=struct.unpack('>Q',recv_exact(sock,8))[0]
+        if size>1024*1024: raise ValueError('management frame too large')
+        mask=recv_exact(sock,4) if masked else None
+        data=recv_exact(sock,size)
+        if mask: data=bytes(c^mask[i%4] for i,c in enumerate(data))
+        if opcode==8: raise EOFError('management closed')
+        if opcode==9: send_frame(sock,data,10); continue
+        if opcode==10: continue
+        if opcode==1: fragments=bytearray(data); ongoing=True
+        elif opcode==0 and ongoing: fragments.extend(data)
+        else: continue
+        if len(fragments)>1024*1024: raise ValueError('management message too large')
+        if final:
+            yield json.loads(fragments.decode('utf-8')); fragments.clear(); ongoing=False
+
+def record(event):
+    RUN.mkdir(mode=0o700,parents=True,exist_ok=True)
+    try: serverpid=int(PID.read_text().strip())
+    except (OSError, ValueError): serverpid=0
+    content=json.dumps({'time':time.time(),'monotonic':time.monotonic(),'server_pid':serverpid,'event':event})+'\n'
+    temp=RUN/('save-event.'+str(os.getpid())+'.tmp')
+    temp.write_text(content,encoding='utf-8'); os.chmod(temp,0o600); os.replace(temp,EVENT)
+    print('Minecraft save completed; queued event',flush=True)
+
+def query_players(sock):
+    send_frame(sock,b'{"jsonrpc":"2.0","id":2,"method":"minecraft:players"}')
+
+def record_players(result):
+    if not isinstance(result,list): return
+    RUN.mkdir(mode=0o700,parents=True,exist_ok=True)
+    try: serverpid=int(PID.read_text().strip())
+    except (OSError,ValueError): serverpid=0
+    names=[x.get('name') for x in result if isinstance(x,dict) and isinstance(x.get('name'),str)]
+    content=json.dumps({'time':time.time(),'server_pid':serverpid,'players':names})+'\n'
+    temp=RUN/('players.'+str(os.getpid())+'.tmp')
+    temp.write_text(content,encoding='utf-8');os.chmod(temp,0o600);os.replace(temp,PLAYERS)
+    print('Updated connected player list: '+str(len(names)),flush=True)
+
+def main():
+    while True:
+        try:
+            token=secret()
+            if len(token)!=40 or not token.isascii() or not token.isalnum(): raise ValueError('invalid management secret')
+            with socket.create_connection(('127.0.0.1',25585),timeout=10) as sock:
+                sock.settimeout(10); handshake(sock,token); sock.settimeout(None); print('Connected to local Minecraft management interface',flush=True)
+                send_frame(sock,b'{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}')
+                query_players(sock);last_query=time.monotonic()
+                for message in frames(sock):
+                    method=message.get('method')
+                    if method=='minecraft:notification/server/saved': record('saved')
+                    if message.get('id')==2 and 'result' in message: record_players(message['result'])
+                    if method in ('minecraft:notification/players/joined','minecraft:notification/players/left','minecraft:notification/server/started') or (method=='minecraft:notification/server/status' and time.monotonic()-last_query>=30):
+                        query_players(sock);last_query=time.monotonic()
+        except (OSError,ValueError,EOFError,json.JSONDecodeError) as exc:
+            print('Management connection unavailable: '+str(exc),flush=True); time.sleep(5)
+if __name__=='__main__':main()

@@ -1,0 +1,597 @@
+#!/usr/bin/python3
+"""Local, root-only administration and consistent world snapshots for the N20."""
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path('/srv/minecraft')
+WORLD = ROOT / 'world'
+REPO = Path('/srv/backups/world-history')
+PASS = Path('/etc/n20-backup.pass')
+RUN = Path('/run/n20')
+META = Path('/var/lib/n20')
+STOP = Path('/run/minecraft-stop')
+PID = Path('/run/minecraft.pid')
+FIFO = Path('/run/minecraft-console')
+HOLD = ROOT / '.n20-restore-hold'
+LOW = ROOT / '.n20-low-battery-hold'
+LOCK = RUN / 'operation.lock'
+OP = RUN / 'operation'
+ERR = META / 'error'
+CACHE = META / 'snapshots.json'
+LAST = META / 'last-auto-backup'
+LAST_SIG = META / 'last-world-signature.json'
+PRUNE = META / 'last-prune'
+STAGE = Path('/srv/backups/.n20-staging')
+STAGE_WORLD = STAGE / 'world'
+SAVE_EVENT = RUN / 'save-event.json'
+RESTIC = '/usr/bin/restic'
+MIN_FREE = 10 * 1024**3
+MAX_REPO = 20 * 1024**3
+NORMAL_INTERVAL = 15 * 60
+BUSY_INTERVAL = 5 * 60
+NAME = re.compile(r'[A-Za-z0-9_]{3,16}\Z')
+HEX = re.compile(r'[0-9a-f]{8,64}\Z')
+
+class AdminError(Exception):
+    pass
+
+def lower_priority():
+    try: os.nice(10)
+    except OSError: pass
+    try: subprocess.run(['/usr/bin/ionice','-c','3','-p',str(os.getpid())],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    except (OSError,subprocess.TimeoutExpired): pass
+
+def directories():
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    META.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+def atomic(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.n20-', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def read(path, default=''):
+    try: return path.read_text(encoding='utf-8').strip()
+    except OSError: return default
+
+def set_error(text):
+    atomic(ERR, ' '.join(str(text).split())[:230] + '\n')
+
+def set_operation(text):
+    atomic(OP, text + '\n')
+    try: make_state()
+    except (OSError, ValueError): pass
+
+def pid_running():
+    try:
+        p = int(read(PID, '0'))
+        if p <= 1: return False
+        os.kill(p, 0)
+        return True
+    except (ValueError, OSError): return False
+
+def vi(num):
+    out = bytearray()
+    while num > 127:
+        out.append((num & 127) | 128); num >>= 7
+    out.append(num)
+    return bytes(out)
+
+def vi_from_sock(sock):
+    result = 0
+    for i in range(5):
+        b = sock.recv(1)
+        if not b: raise EOFError('status connection closed')
+        result |= (b[0] & 127) << (i * 7)
+        if not b[0] & 128: return result
+    raise ValueError('invalid varint')
+
+def mc_status():
+    host = b'127.0.0.1'
+    handshake = vi(0) + vi(777) + vi(len(host)) + host + struct.pack('>H', 25565) + vi(1)
+    with socket.create_connection(('127.0.0.1', 25565), timeout=0.7) as s:
+        s.settimeout(0.7)
+        s.sendall(vi(len(handshake)) + handshake + b'\x01\x00')
+        total = vi_from_sock(s)
+        if total > 1024 * 1024: raise ValueError('status response too large')
+        data = bytearray()
+        while len(data) < total:
+            chunk = s.recv(total - len(data))
+            if not chunk: raise EOFError('status response incomplete')
+            data.extend(chunk)
+    if not data or data[0] != 0: raise ValueError('invalid status response')
+    p, size, shift = 1, 0, 0
+    while True:
+        b = data[p]; p += 1; size |= (b & 127) << shift
+        if not b & 128: break
+        shift += 7
+        if shift > 28: raise ValueError('invalid status length')
+    if size != len(data) - p: raise ValueError('invalid status length')
+    return json.loads(data[p:].decode('utf-8'))
+
+def send_console(command):
+    if '\n' in command or '\r' in command: raise AdminError('Invalid console command')
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try: os.write(fd, (command + '\n').encode('ascii'))
+        finally: os.close(fd)
+    except OSError as exc: raise AdminError('Server console unavailable') from exc
+
+def stop_for_snapshot(require_idle=False):
+    # Serialize the transition with supervisor startup so a world cannot be
+    # copied while a new server process is just starting.
+    directories()
+    with open(RUN / 'server-transition.lock', 'a+') as transition:
+        fcntl.flock(transition, fcntl.LOCK_EX)
+        had_stop = STOP.exists()
+        was_running = pid_running()
+        if require_idle:
+            if not was_running:
+                raise AdminError('Server is offline; automatic backup postponed')
+            try: current = mc_status()
+            except (OSError, ValueError, EOFError, IndexError) as exc:
+                raise AdminError('Cannot verify player count; automatic backup postponed') from exc
+            if current.get('players', {}).get('online') != 0:
+                raise AdminError('Players online; automatic backup postponed')
+        STOP.touch(mode=0o600, exist_ok=True)
+        try:
+            # A second query narrows, but cannot eliminate, the player-join race.
+            if require_idle and mc_status().get('players', {}).get('online') != 0:
+                raise AdminError('Player joined; automatic backup postponed')
+            if was_running:
+                send_console('stop')
+                deadline = time.monotonic() + 120
+                while pid_running() and time.monotonic() < deadline: time.sleep(0.5)
+                if pid_running(): raise AdminError('Server did not stop; backup aborted')
+            return was_running, had_stop
+        except BaseException:
+            if not had_stop: STOP.unlink(missing_ok=True)
+            raise
+
+def ensure_repo():
+    if not shutil.which('restic'): raise AdminError('Restic is not installed')
+    REPO.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not PASS.exists():
+        if (REPO / 'config').exists(): raise AdminError('Backup password missing; existing repository preserved')
+        fd = os.open(PASS, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(secrets.token_hex(32) + '\n'); f.flush(); os.fsync(f.fileno())
+    if not (REPO / 'config').exists():
+        run_restic(['init'], timeout=120)
+
+def run_restic(args, timeout=1800):
+    cmd = ['/usr/bin/ionice', '-c', '3', '/usr/bin/nice', '-n', '10', RESTIC, '-r', str(REPO), '--password-file', str(PASS), '--no-cache'] + args
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or 'unknown error').strip().splitlines()
+        raise AdminError('Backup tool: ' + (detail[-1][:160] if detail else 'unknown error'))
+    return result.stdout
+
+def repo_size():
+    total = 0
+    for root, dirs, files in os.walk(REPO):
+        for name in files:
+            try: total += (Path(root) / name).stat().st_size
+            except OSError: pass
+    return total
+
+def snapshots():
+    raw = run_restic(['snapshots', '--json'], timeout=120)
+    entries = json.loads(raw or '[]')
+    valid = [x for x in entries if any(p in (str(WORLD), str(STAGE_WORLD)) for p in x.get('paths', []))]
+    valid.sort(key=lambda x: x.get('time', ''), reverse=True)
+    return valid
+
+def refresh_cache():
+    items = snapshots()
+    atomic(CACHE, json.dumps(items, separators=(',', ':')) + '\n')
+    return items
+
+def world_signature():
+    result = {}
+    if not WORLD.is_dir(): raise AdminError('World directory is unavailable')
+    for base, dirs, files in os.walk(WORLD, followlinks=False):
+        dirs.sort(); files.sort()
+        for name in files:
+            if name == 'session.lock': continue
+            path = Path(base) / name
+            try:
+                st = path.lstat()
+                result[str(path.relative_to(WORLD))] = [st.st_size, st.st_mtime_ns, stat.S_IFMT(st.st_mode)]
+            except FileNotFoundError:
+                raise AdminError('World changed during scan; backup postponed')
+    return result
+
+def changed_files(before, after):
+    return sum(1 for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+
+def prepare_stage():
+    if STAGE.is_symlink(): raise AdminError('Unsafe staging path; backup aborted')
+    if STAGE.exists():
+        if read(STAGE / '.n20-managed') != 'n20-backup-staging-v1':
+            raise AdminError('Unknown data at backup staging path; backup aborted')
+        shutil.rmtree(STAGE)
+    STAGE.mkdir(mode=0o700, parents=True)
+    atomic(STAGE / '.n20-managed', 'n20-backup-staging-v1\n')
+    STAGE_WORLD.mkdir(mode=0o700)
+
+def clear_stage():
+    if STAGE.exists() and not STAGE.is_symlink() and read(STAGE / '.n20-managed') == 'n20-backup-staging-v1':
+        shutil.rmtree(STAGE)
+
+def create_snapshot(tag, source=None, live=False):
+    if source is None: source=WORLD
+    if not (source / 'level.dat').is_file(): raise AdminError('World level.dat is missing; snapshot aborted')
+    if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; backup postponed')
+    ensure_repo()
+    if repo_size() >= MAX_REPO: raise AdminError('Backup repository reached 20 GiB; review retention')
+    set_operation('Saving snapshot in background')
+    args=['backup', '--tag', tag]
+    if live: args += ['--tag', 'live']
+    args += ['--exclude', 'session.lock', str(source)]
+    run_restic(args)
+    return refresh_cache()
+
+def copy_quiescent_world():
+    # A natural save notification can precede completion of queued disk writes.
+    # Require a quiet interval and reject the copy if any source file changes.
+    set_operation('Waiting for disk writes to settle')
+    previous = world_signature(); stable = 0; deadline = time.monotonic() + 35
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        current = world_signature()
+        if current == previous: stable += 1
+        else: stable = 0
+        if stable >= 3: break
+        previous = current
+    else: raise AdminError('World files stayed busy; backup postponed')
+    total = sum(v[0] for v in current.values() if v[2] == stat.S_IFREG)
+    if shutil.disk_usage('/srv').free < MIN_FREE + total:
+        raise AdminError('Not enough free space for temporary backup copy')
+    prepare_stage()
+    set_operation('Copying saved files in background')
+    cmd=['/usr/bin/ionice','-c','3','/usr/bin/nice','-n','10','/usr/bin/rsync','-aS',
+         '--bwlimit=8192','--exclude=/session.lock',str(WORLD)+'/',str(STAGE_WORLD)+'/']
+    result=subprocess.run(cmd,capture_output=True,text=True,timeout=300)
+    if result.returncode: raise AdminError('World copy failed or changed during backup')
+    after=world_signature()
+    if current != after: raise AdminError('World files changed during copy; backup postponed')
+    if not (STAGE_WORLD / 'level.dat').is_file(): raise AdminError('Copied world is incomplete')
+    return after
+
+def retention(allow_prune):
+    # Automatic snapshots span both older offline and new live source paths.
+    set_operation('Cleaning old snapshots')
+    for tag,args in [('auto',['--keep-last','24','--keep-daily','14','--keep-weekly','8']),
+                     ('manual',['--keep-last','24']),('pre-restore',['--keep-last','5'])]:
+        run_restic(['forget','--tag',tag,'--group-by','host']+args,timeout=1200)
+    try: last_prune=int(read(PRUNE,'0'))
+    except ValueError: last_prune=0
+    if allow_prune and time.time()-last_prune >= 24*3600:
+        run_restic(['prune'],timeout=3600)
+        atomic(PRUNE,str(int(time.time()))+'\n')
+    refresh_cache()
+
+def backup(scheduled=False):
+    lower_priority()
+    if HOLD.exists(): raise AdminError('Restore recovery is required; backup not started')
+    if LOW.exists(): raise AdminError('Battery low; backup postponed')
+    if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; backup postponed')
+    started=time.monotonic()
+    try:
+        copied_signature=copy_quiescent_world()
+        create_snapshot('auto' if scheduled else 'manual', STAGE_WORLD, live=True)
+        atomic(LAST,str(int(time.time()))+'\n')
+        atomic(LAST_SIG,json.dumps(copied_signature,separators=(',',':'))+'\n')
+        atomic(META/'last-backup-seconds',str(round(time.monotonic()-started,2))+'\n')
+    finally:
+        clear_stage()
+    # Never force a player disconnect; defer expensive pruning until no players are online.
+    try:
+        try: count=mc_status().get('players',{}).get('online') if pid_running() else 0
+        except (OSError,ValueError,EOFError,IndexError): count=None
+        retention(allow_prune=(count==0))
+    except (AdminError,subprocess.TimeoutExpired) as exc: set_error('Snapshot saved; cleanup failed: '+str(exc))
+
+def restore(snapshot_id):
+    if not HEX.fullmatch(snapshot_id): raise AdminError('Invalid backup ID')
+    if HOLD.exists(): raise AdminError('An interrupted restore needs attention first')
+    if LOW.exists(): raise AdminError('Battery low; restore postponed until charging')
+    ensure_repo()
+    entries = snapshots()
+    matches = [s for s in entries if s.get('id', '').startswith(snapshot_id)]
+    if len(matches) != 1: raise AdminError('Backup ID is missing or ambiguous')
+    full_id = matches[0]['id']
+    if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; restore aborted')
+    set_operation('Stopping server for restore')
+    was_running, had_stop = stop_for_snapshot()
+    # Persist a hold before any world-directory mutations; init must honor it after power loss.
+    atomic(HOLD, json.dumps({'snapshot': full_id, 'phase': 'preparing', 'created': time.time()}) + '\n')
+    os.sync()
+    stage = Path(tempfile.mkdtemp(prefix='.n20-restore-', dir=ROOT))
+    old_world = ROOT / ('.world-before-' + dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3))
+    moved = False
+    try:
+        set_operation('Saving pre-restore checkpoint')
+        create_snapshot('pre-restore')
+        set_operation('Preparing selected backup')
+        run_restic(['restore', full_id, '--target', str(stage)])
+        source_paths=[Path(x) for x in matches[0].get('paths',[]) if x in (str(WORLD),str(STAGE_WORLD))]
+        if len(source_paths)!=1: raise AdminError('Backup world path is invalid')
+        replacement = stage / source_paths[0].relative_to('/')
+        if not (replacement / 'level.dat').is_file() or (replacement / 'level.dat').stat().st_size == 0:
+            raise AdminError('Restored world failed validation; original retained')
+        # Minecraft must own the restored world; restic restores recorded ownership.
+        uid = WORLD.stat().st_uid; gid = WORLD.stat().st_gid
+        for base, dirs, files in os.walk(replacement):
+            os.chown(base, uid, gid)
+            for name in dirs + files:
+                p = Path(base) / name
+                if not p.is_symlink(): os.chown(p, uid, gid)
+        atomic(HOLD, json.dumps({'snapshot': full_id, 'phase': 'swapping', 'old': str(old_world), 'stage': str(stage)}) + '\n')
+        os.sync()
+        os.rename(WORLD, old_world); moved = True
+        try: os.rename(replacement, WORLD)
+        except BaseException:
+            os.rename(old_world, WORLD); moved = False
+            raise
+        os.sync()
+        atomic(HOLD, json.dumps({'snapshot': full_id, 'phase': 'complete', 'old': str(old_world)}) + '\n')
+        os.sync()
+        HOLD.unlink()
+        os.sync()
+        STOP.unlink(missing_ok=True)
+        set_operation('Restore complete; starting server')
+    except BaseException:
+        # If the original is still in place, no recovery transaction is needed.
+        if not moved and WORLD.exists():
+            HOLD.unlink(missing_ok=True)
+            if not had_stop: STOP.unlink(missing_ok=True)
+        raise
+    # Keep the previous world directory and the pre-restore snapshot as rollback safeguards.
+    finally:
+        if stage.exists() and not HOLD.exists(): shutil.rmtree(stage)
+
+def props():
+    out = {}
+    try:
+        for line in (ROOT / 'server.properties').read_text(encoding='utf-8').splitlines():
+            if line and not line.startswith(('#', '!')) and '=' in line:
+                k,v = line.split('=', 1); out[k.strip()] = v.strip()
+    except OSError: pass
+    return out
+
+def set_property(key, value):
+    file = ROOT / 'server.properties'
+    st = file.stat()
+    lines = file.read_text(encoding='utf-8').splitlines()
+    found = False
+    for i, line in enumerate(lines):
+        if not line.startswith(('#', '!')) and '=' in line and line.split('=', 1)[0].strip() == key:
+            lines[i] = key + '=' + value; found = True
+    if not found: lines.append(key + '=' + value)
+    fd, tmp = tempfile.mkstemp(prefix='.properties-', dir=ROOT)
+    try:
+        os.fchmod(fd, stat.S_IMODE(st.st_mode))
+        os.fchown(fd, st.st_uid, st.st_gid)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n'); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, file)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def whitelist_entries():
+    try:
+        data=json.loads((ROOT/'whitelist.json').read_text(encoding='utf-8'))
+        return [str(x['name']) for x in data if isinstance(x,dict) and NAME.fullmatch(str(x.get('name','')))]
+    except (OSError, ValueError, TypeError): return []
+
+def mutate(command, value):
+    if command in ('whitelist-add','whitelist-remove'):
+        if not NAME.fullmatch(value): raise AdminError('Player name must be 3-16 letters, digits, or underscores')
+        if not pid_running(): raise AdminError('Start the server to change the whitelist')
+        verb='add' if command=='whitelist-add' else 'remove'
+        send_console('whitelist ' + verb + ' ' + value)
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            present=any(x.lower()==value.lower() for x in whitelist_entries())
+            if present == (verb=='add'): return
+            time.sleep(0.5)
+        raise AdminError('Whitelist change was not confirmed; check the server log')
+    if command=='whitelist-set':
+        if value not in ('on','off'): raise AdminError('Invalid whitelist setting')
+        if not pid_running(): raise AdminError('Start the server to change the whitelist')
+        send_console('whitelist ' + value)
+        deadline=time.monotonic()+10
+        desired='true' if value=='on' else 'false'
+        while time.monotonic()<deadline:
+            if props().get('white-list')==desired: return
+            time.sleep(0.5)
+        raise AdminError('Whitelist change was not confirmed; check the server log')
+    if command=='difficulty':
+        if value not in ('peaceful','easy','normal','hard'): raise AdminError('Invalid difficulty')
+        if pid_running(): send_console('difficulty ' + value)
+        set_property('difficulty',value); return
+    limits={'max-players':(1,20),'view-distance':(2,12),'simulation-distance':(2,12)}
+    if command in limits:
+        if not value.isascii() or not value.isdigit(): raise AdminError('Invalid setting value')
+        lo,hi=limits[command]; number=int(value)
+        if not lo<=number<=hi: raise AdminError('Setting is outside allowed range')
+        set_property(command,str(number))
+        if pid_running(): atomic(META/'settings-pending',read(Path('/proc/sys/kernel/random/boot_id'))+' '+read(PID,'0')+'\n')
+        return
+    raise AdminError('Unknown command')
+
+def make_state():
+    directories(); p=props(); active=pid_running()
+    pending=read(META/'settings-pending')
+    if pending and active and pending != read(Path('/proc/sys/kernel/random/boot_id'))+' '+read(PID,'0'):
+        (META/'settings-pending').unlink(missing_ok=True); pending=''
+    operation=read(OP)
+    if operation:
+        with open(LOCK,'a+') as lock:
+            try:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                OP.unlink(missing_ok=True); operation=''
+            except BlockingIOError: pass
+    lines={'server':'offline','players':'0','player_count':'0','allow_count':'0','backup_count':'0',
+           'whitelist':'on' if p.get('white-list')=='true' else 'off',
+           'difficulty':p.get('difficulty','unknown'),'max_players':p.get('max-players','?'),
+           'view_distance':p.get('view-distance','?'),'simulation_distance':p.get('simulation-distance','?'),
+           'settings_pending':'1' if pending else '0',
+           'operation':operation, 'error':read(ERR), 'updated_unix':str(int(time.time()))}
+    if HOLD.exists(): lines['error']='Interrupted restore: server held for recovery'; lines['server']='recovery'
+    elif LOW.exists(): lines['error']='Battery low: waiting for charge'; lines['server']='offline'
+    elif not active and time.time()<1704067200:
+        lines['server']='starting'; lines['error']='Waiting for the PC to provide the time'
+    elif active:
+        try:
+            data=mc_status(); users=data.get('players',{}); lines['server']='online'
+            lines['players']=str(users.get('online',0))
+            names=[str(x.get('name','')) for x in users.get('sample',[]) if NAME.fullmatch(str(x.get('name','')))]
+            try:
+                manager=json.loads(read(RUN/'players.json','{}'))
+                if manager.get('server_pid')==int(read(PID,'0')) and time.time()-float(manager.get('time',0))<90:
+                    managed=[str(x) for x in manager.get('players',[]) if NAME.fullmatch(str(x))]
+                    if len(managed)==int(lines['players']): names=managed
+            except (ValueError,TypeError): pass
+            lines['player_count']=str(len(names))
+            for i,name in enumerate(names[:20]): lines[f'player_{i}']=name
+        except (OSError, ValueError, EOFError, IndexError, json.JSONDecodeError): lines['server']='starting'
+    allowed=whitelist_entries()[:128]; lines['allow_count']=str(len(allowed))
+    for i,name in enumerate(allowed): lines[f'allow_{i}']=name
+    try:
+        items=json.loads(read(CACHE,'[]'))[:64]
+        lines['backup_count']=str(len(items))
+        for i,item in enumerate(items):
+            iso=item.get('time','')[:16].replace('T',' ')
+            tags=','.join(item.get('tags',[]))
+            lines[f'backup_{i}']=iso+' UTC '+tags
+            lines[f'backup_id_{i}']=item['id'][:12]
+    except (ValueError,KeyError,TypeError): lines['error']='Backup index unavailable'
+    safe=[]
+    for key,value in lines.items(): safe.append(key+'='+str(value).replace('\n',' ').replace('\r',' ')[:240])
+    atomic(RUN/'state','\n'.join(safe)+'\n')
+
+def locked(action):
+    directories()
+    with open(LOCK,'a+') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise AdminError('Another operation is in progress')
+        ERR.unlink(missing_ok=True)
+        try: action()
+        finally: OP.unlink(missing_ok=True)
+
+def scheduler(once=False):
+    lower_priority()
+    directories()
+    last_event_seen=0
+    while True:
+        try:
+            if time.time() > 1704067200 and not HOLD.exists() and not LOW.exists():
+                try: event=json.loads(read(SAVE_EVENT,'{}')); event_time=float(event.get('time',0))
+                except (ValueError,TypeError): event={}; event_time=0
+                if (event_time > last_event_seen and -5 <= time.time()-event_time <= 120
+                    and event.get('server_pid')==int(read(PID,'0'))):
+                    # The notification can precede asynchronous writes. Allow them
+                    # to settle, then back up only if the on-disk world changed.
+                    last_event_seen=event_time
+                    try: last=int(read(LAST,'0'))
+                    except ValueError: last=0
+                    try: old=json.loads(read(LAST_SIG,'{}'))
+                    except (ValueError,TypeError): old={}
+                    current=world_signature()
+                    changes=changed_files(old,current)
+                    try: online=mc_status().get('players',{}).get('online')
+                    except (OSError,ValueError,EOFError,IndexError): online=None
+                    # At least 8 changed files signals heavier write activity.
+                    interval=BUSY_INTERVAL if changes>=8 else NORMAL_INTERVAL
+                    if online==0 and changes>0: interval=60
+                    if changes>0 and event_time>last and time.time()-last>=interval:
+                        try: locked(lambda:backup(scheduled=True))
+                        except AdminError as exc: set_error(exc)
+        except Exception as exc: set_error('Backup scheduler: '+str(exc))
+        if once: return
+        time.sleep(20)
+
+def low_battery_pause():
+    if HOLD.exists() or LOW.exists() or not pid_running() or STOP.exists(): return
+    set_operation('Saving world: low battery')
+    atomic(LOW, json.dumps({'reason':'battery-low','time':time.time()})+'\n')
+    os.sync()
+    try:
+        try: send_console('say Battery low: saving and stopping the server until charging.')
+        except AdminError: pass
+        was_running, had_stop=stop_for_snapshot()
+        if had_stop or not was_running:
+            LOW.unlink(missing_ok=True)
+        os.sync()
+    except BaseException:
+        # Preserve the hold after failure, so a reboot cannot start unexpectedly.
+        raise
+
+def low_battery_resume():
+    if not LOW.exists() or HOLD.exists(): return
+    set_operation('Battery charged; starting server')
+    LOW.unlink()
+    STOP.unlink(missing_ok=True)
+    os.sync()
+
+def powerguard():
+    directories(); low_samples=0
+    while True:
+        try:
+            status=read(Path('/sys/class/power_supply/battery/status'),'unknown').lower()
+            try: capacity=int(read(Path('/sys/class/power_supply/battery/capacity'),'-1'))
+            except ValueError: capacity=-1
+            low_samples = low_samples + 1 if status=='discharging' and 0<=capacity<=8 else 0
+            if low_samples>=3 and not LOW.exists():
+                try: locked(low_battery_pause)
+                except AdminError as exc:
+                    if 'in progress' not in str(exc): set_error(exc)
+            if LOW.exists() and status in ('charging','full') and capacity>=10:
+                try: locked(low_battery_resume)
+                except AdminError as exc:
+                    if 'in progress' not in str(exc): set_error(exc)
+        except Exception as exc: set_error('Battery protection: '+str(exc))
+        time.sleep(15)
+
+def main():
+    directories()
+    if len(sys.argv)<2: raise AdminError('Usage: n20-admin state|backup|restore ID|scheduler|setting VALUE')
+    command=sys.argv[1]
+    if command=='state': make_state(); return
+    if command=='scheduler': scheduler(); return
+    if command=='powerguard': powerguard(); return
+    if command=='backup' and len(sys.argv)==2: locked(lambda:backup(False)); return
+    if command=='restore' and len(sys.argv)==3: locked(lambda:restore(sys.argv[2])); return
+    if len(sys.argv)==3: locked(lambda:mutate(command,sys.argv[2])); return
+    raise AdminError('Invalid command arguments')
+
+if __name__=='__main__':
+    try: main()
+    except (AdminError,OSError,ValueError,subprocess.TimeoutExpired) as exc:
+        try: directories(); set_error(exc)
+        except OSError: pass
+        print(str(exc),file=sys.stderr); sys.exit(1)
