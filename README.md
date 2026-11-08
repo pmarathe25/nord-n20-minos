@@ -8,19 +8,19 @@ The phone uses boot slot B and a reformatted userdata partition. Its bootloader 
 
 - `runtime/` contains the current installed service scripts and MTP configuration, with their paths relative to the phone's Debian root. `minecraft-supervisor` starts them; this system does not use systemd as PID 1.
 - `dashboard/` contains the DRM/FreeType touchscreen UI and framebuffer capture source.
-- `radio/` and `third_party/` contain the custom Android compatibility stub and modified Qualcomm service sources. Their original license files are retained.
+- `radio/` and `third_party/` contain the Android compatibility stub, Qualcomm service sources, boot tools, and the BusyBox build input and source. Their original license files are retained.
 - `boot/` contains the persistent initramfs init and a deterministic builder. Its filesystem UUID and USB configuration are specific to this device.
 - `tools/` has non-installing builds, screen capture, and a Minecraft status probe; `tests/` exercises administration and backup behavior in temporary directories.
 - [Device and development notes](docs/device.md) describe dependencies, firmware, deployment, boot-image inputs, and known limitations.
-- `local/` is a Git-ignored, private archive on the original workstation. [Local materials](docs/local-materials.md) lists its contents and explains how to reproduce public build inputs.
+- `local/` holds Git-ignored device inputs and credentials on the original workstation. [Local materials](docs/local-materials.md) lists its contents and explains how to reproduce public build inputs.
 
-The working phone at capture time had Wi-Fi `10.0.0.160`; its dashboard displays the current DHCP address. Minecraft uses port 25565 and SSH port 22. USB networking uses `192.168.137.2`. On the original workstation the private key is in ignored `local/original-downloads/experiment/n20_usb_key`; from Windows:
+The working phone at capture time had Wi-Fi `10.0.0.160`; its dashboard displays the current DHCP address. Minecraft uses port 25565 and SSH port 22. USB networking uses `192.168.137.2`. On the original workstation the private key is in ignored `local/secrets/n20_usb_key`; from Windows:
 
 ```powershell
 ssh -i <path-to-private-key> root@<phone-ip>
 ```
 
-The dashboard's Settings > Wi-Fi page scans and connects to open and WPA2-PSK networks. The screen wakes on touch. With USB connected, File Explorer > This PC > Minecraft Server > Minecraft Server Files exposes `/srv` read-only. Stop Minecraft before copying the live world for a consistent copy. The local Restic history also requires its separate password; neither it nor that password is included here. Direct Google Drive backups are not yet implemented.
+The dashboard's Tools > Wi-Fi page scans and connects to open and WPA2-PSK networks. The screen wakes on touch. With USB connected, File Explorer > This PC > Minecraft Server > Minecraft Server Files exposes `/srv` read-only. Stop Minecraft before copying the live world for a consistent copy. The local Restic history also requires its separate password; neither it nor that password is included here. Direct Google Drive backups are not yet implemented.
 
 ## Develop
 
@@ -45,4 +45,4 @@ From Windows, build the dashboard on the existing phone without installing it:
 
 Add `-Install` to replace the installed dashboard binary; it starts on the next phone boot. Capture the current framebuffer with `tools/capture-screen.ps1` and the same arguments. Review the changes and avoid overwriting the phone's credentials, configuration, or world data when deploying other components.
 
-Git excludes firmware and vendor binaries, boot images, Wi-Fi and SSH credentials, management secrets, world data, and backup keys. The original workstation keeps them in restricted `local/`; they are not included in clones. Keep separate backups of unique files and do not commit them. See [local materials](docs/local-materials.md) and [device notes](docs/device.md) before attempting a rebuild or deployment.
+Git excludes vendor firmware and binaries, boot images, credentials, world data, and backup keys. The original workstation keeps necessary vendor inputs and private device files in restricted `local/`; the world and backup repository stay on the phone. Git LFS stores the redistributable BusyBox build input and source; run `git lfs pull` after cloning. See [local materials](docs/local-materials.md) and [device notes](docs/device.md) before attempting a rebuild or deployment.

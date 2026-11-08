@@ -5,3 +5,7 @@
 *.sh text eol=lf
 runtime/** text eol=lf
 boot/persistent-init text eol=lf
+/third_party/busybox/*.apk filter=lfs diff=lfs merge=lfs -text
+/third_party/busybox/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+/third_party/busybox/*.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+/third_party/qbootctl/** -whitespace

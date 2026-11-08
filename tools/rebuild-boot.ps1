@@ -1,17 +1,17 @@
 param(
     [Parameter(Mandatory = $true)][string]$PythonPath,
-    [string]$Archive = (Join-Path $PSScriptRoot '..\local\original-downloads')
+    [string]$FirmwareDir = (Join-Path $PSScriptRoot '..\local\firmware\c24'),
+    [string]$BusyBoxApk = (Join-Path $PSScriptRoot '..\third_party\busybox\busybox-static-1.37.0-r20.apk')
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'build'
-$apk = Join-Path $Archive 'busybox-static-1.37.0-r20.apk'
-$vendor = Join-Path $Archive 'c24-ota-research\vendor-unpacked\vendor_ramdisk'
-$kernel = Join-Path $Archive 'c24-ota-research\unpacked\kernel'
+$vendor = Join-Path $FirmwareDir 'vendor_ramdisk'
+$kernel = Join-Path $FirmwareDir 'kernel'
 $ramdisk = Join-Path $build 'persistent-initramfs.cpio.gz'
 $image = Join-Path $build 'n20-boot.img'
 New-Item -ItemType Directory -Force -Path $build | Out-Null
-& $PythonPath (Join-Path $root 'boot\build_initramfs.py') --busybox-apk $apk --vendor-ramdisk $vendor --output $ramdisk
+& $PythonPath (Join-Path $root 'boot\build_initramfs.py') --busybox-apk $BusyBoxApk --vendor-ramdisk $vendor --output $ramdisk
 if ($LASTEXITCODE -ne 0) { throw 'Initramfs build failed.' }
 & $PythonPath (Join-Path $root 'third_party\mkbootimg\mkbootimg.py') --header_version 3 --os_version 12.0.0 --os_patch_level 2024-10 --kernel $kernel --ramdisk $ramdisk --output $image
 if ($LASTEXITCODE -ne 0) { throw 'Boot image build failed.' }

@@ -9,6 +9,8 @@ __pycache__/
 *.cpio.gz
 *.tar.gz
 *.ko
+!third_party/busybox/*.apk
+!third_party/busybox/*.tar.gz
 *.pem
 *.key
 *token*.json

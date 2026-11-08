@@ -36,7 +36,7 @@ The existing installation stores the built helpers and extracted vendor files in
 
 ## Rebuild the initramfs and boot image
 
-The builder expects the exact Alpine aarch64 `busybox-static-1.37.0-r20.apk` SHA-256 `ee469aee2958feffd7f64dd96655704025ff60af614f77a1d7323dc237c34da2` and a C.24 `vendor_ramdisk` SHA-256 `8dd5faeefde663f7037540c07c3bce6a6e0452afdb3b995a08c2bc5b98c3eea9`. They are not in Git. With local copies:
+The builder expects the exact Alpine aarch64 `busybox-static-1.37.0-r20.apk` SHA-256 `ee469aee2958feffd7f64dd96655704025ff60af614f77a1d7323dc237c34da2` and a C.24 `vendor_ramdisk` SHA-256 `8dd5faeefde663f7037540c07c3bce6a6e0452afdb3b995a08c2bc5b98c3eea9`. The BusyBox APK is in Git LFS; the vendor ramdisk is kept locally. With these inputs:
 
 ```sh
 python3 boot/build_initramfs.py --busybox-apk /path/to/busybox-static.apk \
