@@ -49,6 +49,17 @@ Check SHA-256 before copying the extracted files to `local/firmware/c24/`:
 
 Payload-manifest hash checks do not independently verify the OTA's signature. This C.24 package is not a complete recovery image for the phone's original C.37 Android build.
 
+The preserved compressed partition copies decompress to these SHA-256 hashes:
+
+| C.24 partition image | SHA-256 of decompressed image |
+| --- | --- |
+| `vendor_boot.img` | `44369277a066493c0d88e1d812f19db926651c1c7c3f23e1a3b89ab06274331e` |
+| `dtbo.img` | `40f616541f1504797a190a7d4cbdca1f565c4016c41a7766c1791de00da01dd8` |
+| `vbmeta.img` | `06ccd6ad99cd17964b37c3d11c4b4722418434fdded425415f181affdd78d8d` |
+| `modem.img` | `5785bb1c48452f7ab71e595b8403313ba44736ca6e43e098d253015b43c1667a` |
+
+Extract these partitions from the same OTA with `payload-dumper ... -p vendor_boot dtbo vbmeta modem -o extracted-c24`, check their hashes, then compress them locally if desired. Their presence is not a tested recovery procedure.
+
 The radio archive includes `/usr/local/lib/n20-radio`, IPA firmware, and the two WLAN configuration files. It does not include private modem calibration partitions or Wi-Fi credentials. While the configured phone is reachable, it can be recreated using PowerShell with `$key` set to the private SSH key and `$phone` to its current address:
 
 ```powershell
