@@ -46,11 +46,13 @@ python3 boot/build_initramfs.py --busybox-apk /path/to/busybox-static.apk \
 With the originally used inputs, the generated initramfs SHA-256 was `4b34faebfa1a4711e2766a16774a8a392e4a2c28ffb9b2f8dfb7b7d5db4745f0`. To reproduce the original boot image, use the matching C.24 kernel and AOSP `mkbootimg.py` at commit `d2bb0af5ba6d3198a3e99529c97eda1be0b5a093`:
 
 ```sh
-python3 /path/to/mkbootimg.py --header_version 3 --os_version 12.0.0 \
+python3 third_party/mkbootimg/mkbootimg.py --header_version 3 --os_version 12.0.0 \
   --os_patch_level 2024-10 --kernel /path/to/c24/kernel \
   --ramdisk build/persistent-initramfs.cpio.gz --output build/n20-boot.img
 ```
 
 The previously installed image SHA-256 was `7f1791ec2faea02d2193657432f4c92d20dbd65477ba80b87032a28abd11c64f`. This describes the existing device, not an instruction to flash. A recovery path and full reinstall process are not verified.
+
+The original workstation's exact inputs and a verified Windows rebuild command are described in [local materials](local-materials.md). The matching AOSP `mkbootimg.py` and `unpack_bootimg.py` are included under `third_party/mkbootimg/`.
 
 The C.24 OTA used for research was [this OnePlus package](https://android.googleapis.com/packages/ota-api/package/c9df99a58a0a6b3d447f6703c33d424872d3778e.zip). Selected extracted components were checked against its payload manifest, which is a corruption check rather than independent package-signature verification. Third-party helper bases were Debian `rmtfs` 1.1-4, `protection-domain-mapper` 1.0-7, and `tqftpserv` 1.1-4 with device-specific modifications; their licenses are in their source directories.

@@ -1,5 +1,6 @@
 # Local build products and device-specific material must remain outside Git.
 /build/
+/local/
 __pycache__/
 *.py[cod]
 *.o

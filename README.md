@@ -12,8 +12,9 @@ The phone uses boot slot B and a reformatted userdata partition. Its bootloader 
 - `boot/` contains the persistent initramfs init and a deterministic builder. Its filesystem UUID and USB configuration are specific to this device.
 - `tools/` has non-installing builds, screen capture, and a Minecraft status probe; `tests/` exercises administration and backup behavior in temporary directories.
 - [Device and development notes](docs/device.md) describe dependencies, firmware, deployment, boot-image inputs, and known limitations.
+- `local/` is a Git-ignored, private archive on the original workstation. [Local materials](docs/local-materials.md) lists its contents and explains how to reproduce public build inputs.
 
-The working phone at capture time had Wi-Fi `10.0.0.160`; its dashboard displays the current DHCP address. Minecraft uses port 25565 and SSH port 22. USB networking uses `192.168.137.2`. From Windows with the existing private key kept outside this repository:
+The working phone at capture time had Wi-Fi `10.0.0.160`; its dashboard displays the current DHCP address. Minecraft uses port 25565 and SSH port 22. USB networking uses `192.168.137.2`. On the original workstation the private key is in ignored `local/original-downloads/experiment/n20_usb_key`; from Windows:
 
 ```powershell
 ssh -i <path-to-private-key> root@<phone-ip>
@@ -44,4 +45,4 @@ From Windows, build the dashboard on the existing phone without installing it:
 
 Add `-Install` to replace the installed dashboard binary; it starts on the next phone boot. Capture the current framebuffer with `tools/capture-screen.ps1` and the same arguments. Review the changes and avoid overwriting the phone's credentials, configuration, or world data when deploying other components.
 
-This repository excludes firmware and vendor binaries, boot images, Wi-Fi and SSH credentials, management secrets, world data, and backup keys. Keep them separately and do not commit them. See [device notes](docs/device.md) before attempting a rebuild or deployment.
+Git excludes firmware and vendor binaries, boot images, Wi-Fi and SSH credentials, management secrets, world data, and backup keys. The original workstation keeps them in restricted `local/`; they are not included in clones. Keep separate backups of unique files and do not commit them. See [local materials](docs/local-materials.md) and [device notes](docs/device.md) before attempting a rebuild or deployment.
