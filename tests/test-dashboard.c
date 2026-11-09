@@ -72,12 +72,12 @@ static void check_state_watch(void){
     assert(rename(tmp,dst)==0);struct pollfd p={state_watch_fd,POLLIN,0};assert(poll(&p,1,1000)==1);
     drain_state_watch();assert(state_read_due==0);assert(unlink(dst)==0);
     snprintf(dst,sizeof(dst),"%s/wifi-state",dir);f=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);assert(f>=0);close(f);
-    assert(rename(tmp,dst)==0);page=WIFI;last_draw=12345;drain_state_watch();assert(last_draw==0);
+    assert(rename(tmp,dst)==0);page=DEVICE_SETTINGS;last_draw=12345;drain_state_watch();assert(last_draw==0);
     stop_state_watch();assert(state_watch_fd<0);assert(unlink(dst)==0);assert(rmdir(dir)==0);
 }
 static void check_poll_deadlines(void){
     assert(input_poll_failed(POLLERR)&&input_poll_failed(POLLHUP)&&input_poll_failed(POLLNVAL));assert(!input_poll_failed(POLLIN));
-    long long now=1000;awake=1;page=SERVER_SETTINGS;last_draw=1000;last_activity=1000;idle_seconds=120;
+    long long now=1000;awake=1;page=PLAYERS;last_draw=1000;last_activity=1000;idle_seconds=120;
     state_read_due=10000;helper_due=11000;helper_pid=0;display_save_due=0;display_save_pid=0;message_until=0;
     assert(poll_timeout(now)==5000);state_read_due=1300;assert(poll_timeout(now)==300);
     display_save_due=1100;assert(poll_timeout(now)==100);display_save_pid=123;assert(poll_timeout(now)==300);
@@ -184,14 +184,19 @@ static void check_redesign(void){
     State saved=state;state.valid=1;state.updated=(long)time(NULL);state.error[0]=state.operation[0]=0;
     strcpy(state.server,"online");strcpy(state.whitelist,"on");message_until=0;confirm=keyboard_open=difficulty_open=notice_open=0;
     state.allow_count=128;state.players=64;state.backup_count=64;
+    /* Inline difficulty choices send the existing command without a submenu. */
+    page=HOME;strcpy(state.difficulty,"normal");draw();Hit direct=find_action(A_DIFFICULTY,0);
+    helper_pid=12345;helper_mutation=0;activate(&direct);
+    assert(!difficulty_open&&!strcmp(queued_command,"difficulty")&&!strcmp(queued_arg,"peaceful"));
+    helper_pid=0;queued_command[0]=queued_arg[0]=0;message_until=0;
     for(int i=0;i<128;i++)snprintf(state.allow[i],sizeof(state.allow[i]),"Player_%09d",i);
     for(int i=0;i<64;i++){snprintf(state.player[i],sizeof(state.player[i]),"Player_%09d",i);snprintf(state.backup_id[i],sizeof(state.backup_id[i]),"%064x",i+1);strcpy(state.backup[i],"2026-11-09 10:30:00");}
-    const int pages[]={HOME,PLAYERS,LOGS,BACKUPS,WIFI,SERVER_SETTINGS,DEVICE_SETTINGS};
+    const int pages[]={HOME,PLAYERS,LOGS,BACKUPS,DEVICE_SETTINGS};
     for(size_t p=0;p<sizeof(pages)/sizeof(pages[0]);p++){
         page=pages[p];list_mode=1;list_offset=0;draw();check_layout();
         find_action(A_PAGE,HOME);find_action(A_PAGE,BACKUPS);find_action(A_PAGE,DEVICE_SETTINGS);
-        if(page==PLAYERS||page==LOGS||page==SERVER_SETTINGS)assert(page_section(page)==HOME);
-        if(page==WIFI)assert(page_section(page)==DEVICE_SETTINGS);
+        assert(page_section(page)==(page==LOGS?HOME:page));
+        if(page==DEVICE_SETTINGS)assert(page_section(page)==DEVICE_SETTINGS);
     }
     page=HOME;draw();Hit hit=find_action(A_PAGE,PLAYERS);activate(&hit);draw();assert(page==PLAYERS);
     hit=find_action(A_LIST,1);activate(&hit);draw();assert(list_mode==1);
@@ -211,6 +216,35 @@ static void check_redesign(void){
     for(int c=1;c<=7;c++){confirm=c;draw();check_layout();}confirm=0;
     state=saved;list_mode=list_offset=0;page=HOME;
 }
+static void check_indicators(void){
+    void *reference=malloc(map_size);assert(reference);
+    awake=1;page=PLAYERS;confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;
+    indicators_due=0;draw();assert(indicators.battery==54&&indicators.temp==286&&indicators.wifi==1);
+    memcpy(reference,canvas,map_size);
+    const int pages[]={HOME,PLAYERS,BACKUPS,DEVICE_SETTINGS,LOGS};
+    for(size_t i=0;i<sizeof(pages)/sizeof(pages[0]);i++){
+        page=pages[i];draw();assert(!memcmp((char *)reference+50*pitch,(char *)canvas+50*pitch,130*pitch));
+    }
+    for(int i=1;i<=4;i++){
+        keyboard_open=i<3?i:0;confirm=i==3?5:0;notice_open=i==4;
+        draw();assert(!memcmp((char *)reference+50*pitch,(char *)canvas+50*pitch,130*pitch));
+    }
+    keyboard_open=confirm=notice_open=0;page=PLAYERS;draw();memcpy(reference,canvas,map_size);
+    fixture_battery=53;fixture_temp=290;fixture_charging=1;indicators_due=0;dirty_top=H;dirty_bottom=0;last_draw=now_ms();
+    assert(redraw_needed(now_ms()));assert(dirty_top==50&&dirty_bottom==180);
+    assert(indicators.battery==53&&indicators.temp==290&&indicators.charging);
+    clip_top=dirty_top;clip_bottom=dirty_bottom;draw();
+    assert(!memcmp((char *)reference+180*pitch,(char *)canvas+180*pitch,map_size-180*pitch));
+    memcpy(reference,canvas,map_size);clip_top=0;clip_bottom=H;draw();assert(!memcmp(reference,canvas,map_size));
+    /* No read, timer, or repaint is introduced while the panel is asleep. */
+    awake=0;fixture_battery=52;indicators_due=0;dirty_top=H;dirty_bottom=0;
+    refresh_indicators(now_ms());assert(indicators.battery==53&&indicators_due==0&&dirty_top==H);
+    display_save_due=0;assert(poll_timeout(now_ms())==-1);awake=1;
+    fixture_battery=101;fixture_temp=-10000;fixture_wifi_available=0;refresh_indicators(now_ms());
+    assert(indicators.battery==-1&&indicators.temp==-10000&&indicators.wifi==-1);
+    fixture_battery=54;fixture_temp=286;fixture_charging=0;fixture_wifi_available=1;indicators_due=0;draw();
+    dirty_top=0;dirty_bottom=H;free(reference);
+}
 static void save_frame(const char *path){
     FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n%d %d\n255\n",W,H);
     for(int y=0;y<H;y++)for(int x=0;x<W;x++){
@@ -219,7 +253,7 @@ static void save_frame(const char *path){
     assert(fclose(f)==0);
 }
 static void preview(const char *directory,const char *name){
-    char path[512];snprintf(path,sizeof(path),"%s/%s.ppm",directory,name);clip_top=0;clip_bottom=H;draw();check_layout();save_frame(path);
+    char path[512];snprintf(path,sizeof(path),"%s/%s.ppm",directory,name);clip_top=0;clip_bottom=H;indicators_due=0;draw();check_layout();save_frame(path);
 }
 static void screenshots(const char *directory){
     memset(&state,0,sizeof(state));state.valid=1;state.updated=(long)time(NULL);strcpy(state.server,"online");strcpy(state.whitelist,"on");strcpy(state.difficulty,"normal");
@@ -229,8 +263,8 @@ static void screenshots(const char *directory){
     confirm=keyboard_open=difficulty_open=notice_open=list_mode=list_offset=0;message_until=0;fixture_running=1;
     page=HOME;preview(directory,"server");page=BACKUPS;preview(directory,"world");page=DEVICE_SETTINGS;preview(directory,"phone");
     page=PLAYERS;preview(directory,"players");list_mode=1;preview(directory,"whitelist");
-    page=SERVER_SETTINGS;state.settings_pending=1;preview(directory,"settings");state.settings_pending=0;
-    page=WIFI;preview(directory,"wifi");page=LOGS;preview(directory,"activity");
+    page=HOME;state.settings_pending=1;preview(directory,"settings");state.settings_pending=0;
+    page=DEVICE_SETTINGS;preview(directory,"wifi");page=LOGS;preview(directory,"activity");
     keyboard_open=1;strcpy(typed_name,"Alex");preview(directory,"add-player");
     keyboard_open=2;strcpy(wifi_label,"Home");strcpy(wifi_password,"examplepass");wifi_cursor=strlen(wifi_password);preview(directory,"wifi-password");
     explicit_bzero(wifi_password,sizeof(wifi_password));keyboard_open=0;difficulty_open=1;preview(directory,"difficulty");difficulty_open=0;
@@ -238,7 +272,7 @@ static void screenshots(const char *directory){
     page=HOME;fixture_running=0;strcpy(state.server,"offline");preview(directory,"stopped");
     strcpy(state.server,"recovery");strcpy(state.error,"Restore interrupted. Retain the recovery hold and inspect the recorded recovery paths before resuming the server.");preview(directory,"recovery");notice_open=1;preview(directory,"status");notice_open=0;
     state.error[0]=0;state.updated=0;preview(directory,"unavailable");state.updated=(long)time(NULL);strcpy(state.server,"offline");state.backup_count=0;page=BACKUPS;preview(directory,"empty-world");
-    fixture_wifi_available=0;page=WIFI;preview(directory,"wifi-unavailable");fixture_wifi_available=1;
+    fixture_wifi_available=0;page=DEVICE_SETTINGS;preview(directory,"wifi-unavailable");fixture_wifi_available=1;
     fixture_running=1;
 }
 int main(int argc,char **argv){
@@ -256,12 +290,11 @@ int main(int argc,char **argv){
     /* The target's dumb buffer has 32 bytes of padding per scanline. */
     pitch=W*4+32;map_size=(size_t)pitch*H;canvas=calloc(1,map_size);assert(canvas);
     state.valid=1;state.updated=(long)time(NULL);state.max_players=10;strcpy(state.server,"online");
-    check_page(HOME);check_page(PLAYERS);check_page(SERVER_SETTINGS);check_page(DEVICE_SETTINGS);check_page(WIFI);check_page(BACKUPS);check_page(LOGS);
+    check_page(HOME);check_page(PLAYERS);check_page(DEVICE_SETTINGS);check_page(BACKUPS);check_page(LOGS);
     page=HOME;draw();assert(hit_at(70,450)<0);
-    int players_link=0,settings_link=0,activity_link=0;
-    for(int i=0;i<hit_count;i++){players_link+=hits[i].action==A_PAGE&&hits[i].value==PLAYERS;settings_link+=hits[i].action==A_PAGE&&hits[i].value==SERVER_SETTINGS;activity_link+=hits[i].action==A_PAGE&&hits[i].value==LOGS;}
-    assert(players_link==1&&settings_link==1&&activity_link==1);
-    page=SERVER_SETTINGS;draw();int max_setting=0;for(int i=0;i<hit_count;i++){max_setting+=hits[i].action==A_MAX;assert(hits[i].action!=A_BRIGHT&&hits[i].action!=A_RESTART);}assert(max_setting>0);
+    find_action(A_PAGE,PLAYERS);find_action(A_PAGE,BACKUPS);find_action(A_PAGE,DEVICE_SETTINGS);find_action(A_PAGE,LOGS);
+    for(int i=0;i<4;i++)find_action(A_DIFFICULTY,i);
+    page=HOME;draw();int max_setting=0;for(int i=0;i<hit_count;i++){max_setting+=hits[i].action==A_MAX;assert(hits[i].action!=A_BRIGHT);}assert(max_setting>0);
     page=DEVICE_SETTINGS;draw();int brightness=0;for(int i=0;i<hit_count;i++){brightness+=hits[i].action==A_BRIGHT;assert(hits[i].action!=A_MAX&&hits[i].action!=A_DIFFICULTY);}assert(brightness>0);
     page=HOME;
     strcpy(state.server,"offline");strcpy(state.error,"Server files unavailable: install protected bundle");draw();
@@ -296,7 +329,7 @@ int main(int argc,char **argv){
     Hit failed_disconnect={.action=A_WIFI_DISCONNECT};activate(&failed_disconnect);assert(strstr(message,"unavailable"));
     explicit_bzero(wifi_password,sizeof(wifi_password));keyboard_open=0;wifi_sender=wifi_send;message_until=0;
     /* Static pages and modals do not repaint merely because time passed. */
-    page=SERVER_SETTINGS;confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;draw();last_draw=1000;
+    page=PLAYERS;confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;draw();last_draw=1000;
     assert(!redraw_needed(7000));
     state.updated=0;assert(redraw_needed(7000));state.updated=(long)time(NULL);draw();last_draw=1000;
     long long test_now=now_ms();message_until=test_now+8000;draw();last_draw=test_now;assert(!redraw_needed(test_now+7000));assert(redraw_needed(test_now+9000));
@@ -305,8 +338,8 @@ int main(int argc,char **argv){
     check_partial_buttons();
     check_partial_keyboard();
     check_input();
-    page=WIFI;wifi_count=9;list_offset=0;Hit next={.action=A_SCROLL,.value=WIFI_PAGE_SIZE};activate(&next);assert(list_offset==WIFI_PAGE_SIZE);activate(&next);assert(list_offset==WIFI_PAGE_SIZE);
-    Hit prev={.action=A_SCROLL,.value=-WIFI_PAGE_SIZE};activate(&prev);assert(list_offset==0);
+    page=DEVICE_SETTINGS;wifi_count=9;list_offset=0;Hit next={.action=A_SCROLL,.value=WIFI_PAGE_SIZE};activate(&next);assert(list_offset==WIFI_PAGE_SIZE);activate(&next);assert(list_offset==2*WIFI_PAGE_SIZE);
+    Hit prev={.action=A_SCROLL,.value=-WIFI_PAGE_SIZE};activate(&prev);assert(list_offset==WIFI_PAGE_SIZE);activate(&prev);assert(list_offset==0);
     assert(!wifi_password_valid("short"));assert(wifi_password_valid("validpass"));
     assert(wifi_connected_network("COMPLETED","My network","My network"));
     assert(!wifi_connected_network("ASSOCIATING","My network","My network"));
@@ -335,10 +368,10 @@ int main(int argc,char **argv){
     wifi_password_window(wifi_password,2,tail,sizeof(tail));assert(strchr(tail,'|')&&text_width(mono,40,tail)<=650);
     explicit_bzero(wifi_password,sizeof(wifi_password));keyboard_open=0;
     keyboard_open=2;wifi_show_password=0;Hit show={.action=A_WIFI_SHOW};activate(&show);assert(wifi_show_password);Hit cancel={.action=A_CANCEL};activate(&cancel);assert(!keyboard_open&&!wifi_show_password);
-    page=SERVER_SETTINGS;Hit difficulty={.action=A_DIFFICULTY,.value=-1};activate(&difficulty);assert(difficulty_open);draw();
+    page=HOME;Hit difficulty={.action=A_DIFFICULTY,.value=-1};activate(&difficulty);assert(difficulty_open);draw();
     int choices=0;for(int i=0;i<hit_count;i++)if(hits[i].action==A_DIFFICULTY)choices++;assert(choices==4);activate(&cancel);assert(!difficulty_open);
     difficulty_open=1;draw();void *reference=malloc(map_size);assert(reference);memcpy(reference,canvas,map_size);glyph_cache_enabled=0;draw();assert(!memcmp(reference,canvas,map_size));glyph_cache_enabled=1;difficulty_open=0;free(reference);
-    state.settings_pending=1;draw();for(int i=0;i<hit_count;i++)assert(hits[i].action!=A_RESTART);state.settings_pending=0;
+    state.settings_pending=1;draw();find_action(A_RESTART,0);state.settings_pending=0;
     strcpy(state.error,"Recovery requires attention");Hit notice={.action=A_NOTICE};activate(&notice);assert(notice_open);draw();activate(&cancel);assert(!notice_open);state.error[0]=0;
     strcpy(state.whitelist,"on");Hit toggle={.action=A_ALLOW,.value=1};activate(&toggle);assert(confirm==7);activate(&cancel);assert(!confirm);
     strcpy(state.server,"recovery");page=HOME;draw();for(int i=0;i<hit_count;i++)assert(hits[i].action!=A_START&&hits[i].action!=A_RESTART&&hits[i].action!=A_STOP);
@@ -346,7 +379,7 @@ int main(int argc,char **argv){
     strcpy(state.server,"offline");strcpy(state.error,"Battery low: waiting for charge");draw();for(int i=0;i<hit_count;i++)assert(hits[i].action!=A_START&&hits[i].action!=A_RESTART&&hits[i].action!=A_STOP);state.error[0]=0;strcpy(state.server,"online");
     long fresh_time=state.updated;state.updated=0;Hit add={.action=A_ADD};activate(&add);assert(!keyboard_open);state.updated=fresh_time;
     helper_pid=12345;helper_mutation=0;assert(admin("whitelist-set","on"));assert(busy()&&!strcmp(queued_command,"whitelist-set")&&!strcmp(queued_arg,"on"));helper_pid=0;queued_command[0]=queued_arg[0]=0;
-    check_redesign();
+    check_redesign();check_indicators();
     if(argc>1&&!strcmp(argv[1],"--benchmark")){
         difficulty_open=1;for(int mode=0;mode<2;mode++){glyph_cache_enabled=mode;long long start=now_ms();for(int i=0;i<20;i++)draw();printf("%s: %.2f ms/frame\n",mode?"cached":"uncached",(now_ms()-start)/20.0);}glyph_cache_enabled=1;difficulty_open=0;
         keyboard_open=2;strcpy(wifi_password,"example-password");wifi_cursor=strlen(wifi_password);void *output=calloc(1,map_size);assert(output);

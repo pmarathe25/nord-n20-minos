@@ -4,6 +4,8 @@
 #include <string.h>
 #include <unistd.h>
 static int fixture_running=1,fixture_wifi_available=1;
+static long fixture_battery=54,fixture_temp=286;
+static int fixture_charging;
 static FILE *fixture_file(const char *contents){
     FILE *f=tmpfile();if(!f)return NULL;
     size_t length=strlen(contents);
@@ -19,9 +21,9 @@ static FILE *fixture_fopen(const char *path,const char *mode){
             "NETWORK\t4775657374\tOPEN\t-67\n"
             "NETWORK\t53747564696f\tWPA2\t-78\n"
             "NETWORK\t456e7465727072697365\tUNSUPPORTED\t-80\n"):NULL;
-        if(!strcmp(path,"/sys/class/power_supply/battery/capacity"))return fixture_file("54\n");
-        if(!strcmp(path,"/sys/class/power_supply/battery/temp"))return fixture_file("286\n");
-        if(!strcmp(path,"/sys/class/power_supply/battery/status"))return fixture_file("Not charging\n");
+        if(!strcmp(path,"/sys/class/power_supply/battery/capacity")){char value[32];snprintf(value,sizeof(value),"%ld\n",fixture_battery);return fixture_file(value);}
+        if(!strcmp(path,"/sys/class/power_supply/battery/temp")){char value[32];snprintf(value,sizeof(value),"%ld\n",fixture_temp);return fixture_file(value);}
+        if(!strcmp(path,"/sys/class/power_supply/battery/status"))return fixture_file(fixture_charging?"Charging\n":"Not charging\n");
         if(!strcmp(path,"/sys/class/power_supply/usb/online"))return fixture_file("1\n");
         if(!strcmp(path,"/sys/class/power_supply/ac/online"))return fixture_file("0\n");
         if(!strcmp(path,"/sys/class/oplus_chg/battery/mmi_charging_enable"))return fixture_file("0\n");

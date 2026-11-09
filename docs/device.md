@@ -157,19 +157,21 @@ the discrepancy but does not prove semantic equivalence. These builds used the
 phone's own compiler and libraries and are
 not an independent integrity verification of the toolchain or vendor binaries.
 
-The dashboard source uses three tabs: Server, World, and Phone. Server contains
-status, the join address, start/stop/restart, Players, Game settings, and Activity.
-World opens directly to local backup history and restore. Phone contains Wi-Fi,
-charging status, brightness, and screen sleep. Whitelist membership and
-enforcement are together under Server > Players > Whitelist; online players
-do not have an `Allow` button. The Phone battery status distinguishes external
-power, charging and non-charging states. Confirmation
-buttons recheck current data and, for stop/restart, the server process identity.
-On Wi-Fi send failure the password form stays open for correction or retry.
+The dashboard has four direct tabs: Server, Players, World, and Phone. Server
+contains status, the join address, lifecycle controls, inline game settings,
+and a Log button. Players opens the whitelist, with an Online view alongside.
+World opens backup history and restore. Phone combines Wi-Fi, brightness and
+screen sleep. A persistent top bar shows battery percentage, charging, Wi-Fi
+connection state, and battery temperature on every page and form. Its reads
+reuse the existing awake cadence and stop while the screen is off. Only changed
+indicator rows repaint on otherwise static pages. Existing display power and
+Wi-Fi power policy behavior is unchanged.
+Confirmation buttons recheck current data and, for stop/restart, the server
+process identity. On Wi-Fi send failure the password form stays open.
 On 2026-11-09, the redesigned UI was built and tested on ARM64, then installed
 by replacing and restarting only the dashboard. Minecraft's process identity,
 display preferences, and Wi-Fi power-policy processes were unchanged. Injected
-power-button and touch events exercised wake, the three main tabs, and sleep;
+power-button and touch events exercised wake, the main tabs, and sleep;
 framebuffer checks verified the selected tabs. The screen was returned to off.
 A subsequent 15-second sample recorded no dashboard CPU ticks or context
 switches, and Wi-Fi reported power saving on. This is a short activity check,

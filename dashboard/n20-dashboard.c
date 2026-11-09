@@ -47,7 +47,7 @@
 #define AMBER_DARK 0x403728
 #define PLAYER_PAGE_SIZE 6
 #define BACKUP_PAGE_SIZE 5
-#define WIFI_PAGE_SIZE 6
+#define WIFI_PAGE_SIZE 3
 
 static int drmfd=-1, touchfd=-1, powerfd=-1;
 static uint32_t crtc_id, conn_id, fb_id, handle, pitch, dpms_id;
@@ -70,7 +70,7 @@ static char message[128];
 static volatile sig_atomic_t exiting=0, sleep_requested=0;
 static int signal_pipe[2]={-1,-1};
 static int state_watch_fd=-1;
-enum { HOME, PLAYERS, LOGS, BACKUPS, WIFI, SERVER_SETTINGS, DEVICE_SETTINGS };
+enum { HOME, PLAYERS, LOGS, BACKUPS, DEVICE_SETTINGS };
 enum { A_PAGE=1, A_START, A_RESTART, A_STOP, A_CONFIRM, A_CANCEL,
     A_LIST, A_ADD, A_REMOVE, A_ALLOW, A_DIFFICULTY, A_MAX, A_VIEW, A_SIM,
     A_BRIGHT, A_TIMEOUT, A_BACKUP, A_RESTORE, A_KEY, A_ERASE, A_SUBMIT,
@@ -78,7 +78,7 @@ enum { A_PAGE=1, A_START, A_RESTART, A_STOP, A_CONFIRM, A_CANCEL,
 typedef struct { int x,y,w,h,action,value; char arg[96]; } Hit;
 static Hit hits[100], pressed_hit;
 static int hit_count, pressed_valid, down_x, down_y, drag_cancel;
-static int list_mode, list_offset, wifi_count, keyboard_open, keyboard_shift, difficulty_open, notice_open, idle_seconds=120;
+static int list_mode=1, list_offset, wifi_count, keyboard_open, keyboard_shift, difficulty_open, notice_open, idle_seconds=120;
 static char wifi_password[65], wifi_selected[65], wifi_label[80];
 static int wifi_keyboard_mode, wifi_show_password;
 static size_t wifi_cursor;
@@ -97,6 +97,9 @@ typedef struct {
     char player[64][32], allow[128][32], backup[64][96], backup_id[64][96];
 } State;
 static State state;
+typedef struct {long battery,temp;int wifi,charging;} Indicators;
+static Indicators indicators={-1,-10000,-1,0};
+static long long indicators_due;
 
 static long long now_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (long long)t.tv_sec*1000+t.tv_nsec/1000000;}
 static void signal_wakeup(void){int saved=errno;char byte=1;if(signal_pipe[1]>=0)(void)write(signal_pipe[1],&byte,1);errno=saved;}
@@ -185,7 +188,6 @@ static const char *battery_power_label(long online,const char *status,long charg
     return "Plugged in";
 }
 static int running(void){long pid=read_long("/run/minecraft.pid",0);return pid>1&&(kill((pid_t)pid,0)==0||errno==EPERM);}
-static void uptime_str(char *s,size_t n){FILE*f=fopen("/proc/uptime","r");double secs=0;if(f){(void)fscanf(f,"%lf",&secs);fclose(f);}unsigned m=(unsigned)secs/60;snprintf(s,n,"%uh %02um",m/60,m%60);}
 static void recent_logs(char lines[][160],int wanted){
     for(int i=0;i<wanted;i++)lines[i][0]=0;
     FILE*f=fopen("/var/log/minecraft.log","r");if(!f)return;fseek(f,0,SEEK_END);long len=ftell(f);if(len>24000)fseek(f,len-24000,SEEK_SET);else rewind(f);
@@ -198,6 +200,18 @@ static int wifi_status_available(void){FILE *f=fopen("/run/n20/wifi-state","r");
 static void read_wifi_connection(const char *path,char *status,size_t status_size,char *ip,size_t ip_size){
     status[0]=ip[0]=0;FILE *f=fopen(path,"r");if(!f)return;
     if(wifi_snapshot_recent(f)){char line[160];while(fgets(line,sizeof(line),f)){line[strcspn(line,"\r\n")]=0;if(!strncmp(line,"IP\t",3))snprintf(ip,ip_size,"%.79s",line+3);else if(!strncmp(line,"STATE\t",6))snprintf(status,status_size,"%.79s",line+6);}}fclose(f);
+}
+/* Reuse the awake loop's existing five-second cadence. No polling while asleep. */
+static void refresh_indicators(long long now){
+    if(!awake||now<indicators_due)return;
+    indicators_due=now+5000;
+    char status[80],ip[80],charge[32]="";
+    read_wifi_connection("/run/n20/wifi-state",status,sizeof(status),ip,sizeof(ip));
+    read_line("/sys/class/power_supply/battery/status",charge,sizeof(charge));
+    Indicators next={read_long("/sys/class/power_supply/battery/capacity",-1),read_long("/sys/class/power_supply/battery/temp",-10000),status[0]?wifi_address_valid(status,ip):-1,!strcmp(charge,"Charging")};
+    if(next.battery<0||next.battery>100)next.battery=-1;
+    if(next.temp<-500||next.temp>1500)next.temp=-10000;
+    if(next.battery!=indicators.battery||next.temp!=indicators.temp||next.wifi!=indicators.wifi||next.charging!=indicators.charging){indicators=next;invalidate_rows(50,180);}
 }
 static int fresh(void);
 static void network_addr(char*s,size_t n){char status[80],ip[80];read_wifi_connection("/run/n20/wifi-state",status,sizeof(status),ip,sizeof(ip));if(!wifi_address_valid(status,ip))snprintf(s,n,"Wi-Fi address unavailable");else if(fresh()&&!strcmp(state.server,"online")&&state.server_port>0&&state.server_port<=65535)snprintf(s,n,"Wi-Fi: %.15s:%d",ip,state.server_port);else snprintf(s,n,"Wi-Fi: %.15s",ip);}
@@ -291,7 +305,7 @@ static void drain_state_watch(void){
         for(char *p=buf;p<buf+n;){struct inotify_event *e=(struct inotify_event *)p;p+=sizeof(*e)+e->len;
             if(e->mask&(IN_Q_OVERFLOW|IN_IGNORED|IN_DELETE_SELF|IN_MOVE_SELF)){stop_state_watch();state_read_due=0;return;}
             if(e->len&&!strcmp(e->name,"state"))state_read_due=0;
-            if(e->len&&!strcmp(e->name,"wifi-state")&&(page==HOME||page==WIFI||page==DEVICE_SETTINGS))invalidate_full();
+            if(e->len&&!strcmp(e->name,"wifi-state")){indicators_due=0;invalidate_full();}
         }
     }
 }static void tick_helper(long long now){
@@ -334,13 +348,20 @@ static int confirmation_ready(int c){
     if(c==4||c==5){if(!strcmp(state.server,"recovery")||strstr(state.error,"Battery low"))return 0;if(c==5){for(int i=0;i<state.backup_count&&i<64;i++)if(!strcmp(state.backup_id[i],selected_backup))return 1;return 0;}return 1;}
     return 0;
 }
-static void heading(const char *title){text(bold,76,60,300,WHITE,title,960);}
+static void heading(const char *title){int x=page==LOGS&&!notice_open&&!confirm&&!keyboard_open&&!difficulty_open?230:60;text(bold,76,x,300,WHITE,title,W-x-60);}
 static void divider(int y){rect(60,y,960,2,BORDER);}
-static void subtitle(const char *label){text(regular,34,60,370,MUTED,label,960);}
 static void section_label(int y,const char *label){text(bold,28,60,y,DIM,label,960);}
-static void navigation_row(int y,const char *title,const char *detail,int target){
-    text(bold,44,60,y+65,WHITE,title,840);text(regular,32,60,y+120,MUTED,detail,840);
-    text(regular,48,965,y+91,MUTED,">",55);divider(y+170);add_hit(60,y,960,172,A_PAGE,target,NULL);
+static void draw_indicators(void){
+    refresh_indicators(now_ms());
+    char value[48];uint32_t color=indicators.battery>=0&&indicators.battery<=15?AMBER:MUTED;
+    rect(150,91,58,32,color);rect(208,100,6,14,color);rect(154,95,50,24,BG);
+    if(indicators.battery>=0)rect(158,99,(int)(42*indicators.battery/100),16,color);
+    if(indicators.battery<0)snprintf(value,sizeof(value),"--%%");else snprintf(value,sizeof(value),"%ld%%%s",indicators.battery,indicators.charging?" +":"");
+    text(regular,34,230,120,color,value,210);
+    color=indicators.wifi==1?GREEN:MUTED;rounded(470,98,14,14,7,color);
+    text(regular,34,505,120,color,indicators.wifi==1?"Wi-Fi":indicators.wifi==0?"Wi-Fi off":"Wi-Fi --",260);
+    if(indicators.temp==-10000)snprintf(value,sizeof(value),"-- \xc2\xb0" "C");else snprintf(value,sizeof(value),"%.1f \xc2\xb0" "C",indicators.temp/10.0);
+    text(regular,34,835,120,MUTED,value,190);
 }
 static void pagination(int y,int count,int size){
     char label[48];snprintf(label,sizeof(label),"%d / %d",list_offset/size+1,count?(count-1)/size+1:1);
@@ -397,20 +418,17 @@ static void wifi_password_window(const char *input,size_t cursor,char *out,size_
     }
     if(cap)snprintf(out,cap,"%s",candidate);
 }
-static void form_title(const char *eyebrow,const char *title,const char *description){
-    text(bold,30,60,150,MUTED,eyebrow,960);heading(title);subtitle(description);
-}
 static void form_message(void){
     if(message_until>now_ms())text(regular,30,60,2240,AMBER,message,960);
     if(state.error[0]){text(regular,27,60,2310,RED,state.error,740);control(830,2260,190,100,PANEL,AMBER,"Details",A_NOTICE,0,NULL);}
 }
 static void draw_wifi_keyboard(void){
-    form_title("WI-FI","Enter password",wifi_label);
+    heading("Wi-Fi password");text(regular,36,60,405,MUTED,wifi_label,960);
     char masked[66],visible[80],hint[128];size_t len=strlen(wifi_password);memset(masked,'*',len);masked[len]=0;
     wifi_password_window(wifi_show_password?wifi_password:masked,wifi_cursor,visible,sizeof(visible));
     card(60,550,960,170);text(mono,40,90,650,WHITE,visible,650);
     control(780,575,210,120,BG,MUTED,wifi_show_password?"Hide":"Show",A_WIFI_SHOW,0,NULL);
-    snprintf(hint,sizeof(hint),"%zu / 64  /  %s",len,len<8?"At least 8 characters":!wifi_password_valid(wifi_password)?"64 characters must be hex":"Ready to connect");
+    snprintf(hint,sizeof(hint),"%zu / 64",len);
     text(regular,28,60,780,MUTED,hint,960);
     control(60,830,465,110,PANEL,wifi_cursor?WHITE:DIM,"< Cursor",wifi_cursor?A_WIFI_LEFT:0,0,NULL);
     control(555,830,465,110,PANEL,wifi_cursor<len?WHITE:DIM,"Cursor >",wifi_cursor<len?A_WIFI_RIGHT:0,0,NULL);
@@ -429,9 +447,9 @@ static void draw_wifi_keyboard(void){
 }
 static void draw_keyboard(void){
     if(keyboard_open==2){draw_wifi_keyboard();return;}
-    form_title("WHITELIST","Add a player","Use their Minecraft Java username.");
+    heading("Add player");
     card(60,550,960,170);text(mono,45,90,650,WHITE,typed_name[0]?typed_name:"_",900);
-    text(regular,30,60,790,MUTED,"3-16 letters, numbers or underscores.",960);
+
     const char *keys=keyboard_shift?"1234567890QWERTYUIOPASDFGHJKL_ZXCVBNM":"1234567890qwertyuiopasdfghjkl_zxcvbnm";
     for(int i=0;keys[i];i++){char key[2]={keys[i],0};control(36+(i%10)*102,1000+(i/10)*150,90,132,PANEL,WHITE,key,A_KEY,keys[i],NULL);}
     control(60,1620,465,130,PANEL,WHITE,keyboard_shift?"Lowercase":"Uppercase",A_SHIFT,0,NULL);
@@ -440,15 +458,14 @@ static void draw_keyboard(void){
     form_message();
 }
 static void draw_confirmation(void){
-    const char *title=confirm==1?"Restart server?":confirm==2?"Stop server?":confirm==3?"Remove access?":confirm==4?"Back up now?":confirm==6?"Block all players?":confirm==7?"Open access?":"Restore this world?";
-    form_title("CONFIRM ACTION",title,confirm==5?"This replaces the current world.":"Take a moment to review.");
-    card(60,490,960,570);
-    if(confirm==3){text(bold,44,96,590,WHITE,selected_name,888);text(regular,34,96,685,MUTED,"Their name will leave the whitelist.",888);text(regular,32,96,760,MUTED,"You can add them again later.",888);}
-    else if(confirm==6){text(bold,38,96,590,AMBER,"Your whitelist is empty.",888);text(regular,32,96,685,MUTED,"Turning it on will block everyone.",888);text(regular,32,96,760,MUTED,"Cancel to add players first.",888);}
-    else if(confirm==7){text(bold,38,96,590,AMBER,"The whitelist will be turned off.",888);text(regular,32,96,685,MUTED,"Anyone who can reach this server",888);text(regular,32,96,745,MUTED,"may try to join.",888);}
-    else if(confirm==5){text(bold,38,96,580,RED,"Players will be disconnected.",888);text(regular,32,96,650,MUTED,"The server will restart with this backup.",888);text(regular,30,96,760,MUTED,"Selected backup",888);text(regular,34,96,825,WHITE,selected_backup_label,888);char short_id[32];snprintf(short_id,sizeof(short_id),"Backup %.12s",selected_backup);text(mono,28,96,890,DIM,short_id,888);text(regular,30,96,990,MUTED,"Review the date before replacing your world.",888);}
-    else if(confirm==4){text(bold,38,96,590,WHITE,"The server keeps running.",888);text(regular,32,96,685,MUTED,"Only files already saved to disk are copied.",888);text(regular,32,96,755,MUTED,"Unsaved changes may not be included.",888);text(regular,32,96,825,MUTED,"A changing world may copy inconsistently.",888);text(regular,30,96,990,MUTED,"This backup stays on the phone.",888);}
-    else{ text(bold,38,96,590,WHITE,"The world will be saved first.",888);text(regular,32,96,685,MUTED,"Players will be disconnected.",888);text(regular,32,96,760,MUTED,confirm==1?"They can rejoin after the server restarts.":"Start the server again when you are ready.",888);}
+    const char *title=confirm==1?"Restart server?":confirm==2?"Stop server?":confirm==3?"Remove access?":confirm==4?"Back up now?":confirm==6?"Block all players?":confirm==7?"Open access?":"Restore world?";
+    heading(title);card(60,490,960,350);
+    if(confirm==3)text(bold,44,96,610,WHITE,selected_name,888);
+    else if(confirm==6)text(regular,36,96,610,AMBER,"Empty whitelist: all players blocked.",888);
+    else if(confirm==7)text(regular,36,96,610,AMBER,"Anyone may join.",888);
+    else if(confirm==5){text(regular,36,96,585,RED,"Replaces the world and disconnects players.",888);text(regular,34,96,680,WHITE,selected_backup_label,888);char id[20];snprintf(id,sizeof(id),"%.12s",selected_backup);text(mono,28,96,755,DIM,id,888);}
+    else if(confirm==4){text(regular,36,96,585,WHITE,"Saved files only.",888);text(regular,32,96,680,MUTED,"Live copies may be incomplete.",888);}
+    else text(regular,36,96,610,MUTED,"Saves the world; disconnects players.",888);
     int ready=confirmation_ready(confirm),destructive=confirm!=1&&confirm!=4;
     if(!ready)text(regular,30,60,1620,AMBER,!fresh()?"Waiting for current server data.":busy()?"Waiting for the current operation.":"State changed. Cancel and review again.",960);
     const char *label=confirm==7?"Turn off whitelist":confirm==6?"Turn on empty whitelist":confirm==5?"Replace world and restart":confirm==4?"Back up saved files":confirm==3?"Remove player access":confirm==1?"Restart server":"Save and stop server";
@@ -457,13 +474,13 @@ static void draw_confirmation(void){
 }
 static void draw_difficulty(void){
     static const char *levels[]={"Peaceful","Easy","Normal","Hard"};static const char *values[]={"peaceful","easy","normal","hard"};
-    static const char *details[]={"No hostile mobs","A gentler challenge","The standard challenge","For experienced players"};
-    form_title("GAME SETTINGS","Difficulty","Choose the challenge for your world.");
+
+    heading("Difficulty");
     for(int i=0;i<4;i++){
         int y=500+i*260,selected=!strcmp(state.difficulty,values[i]),enabled=fresh()&&!busy();
         rounded(60,y,960,215,28,selected?GREEN_DARK:PANEL);
         text(bold,44,96,y+80,enabled?(selected?GREEN:WHITE):DIM,levels[i],700);
-        text(regular,32,96,y+145,MUTED,details[i],750);
+
         if(selected)text(bold,28,840,y+85,GREEN,"Current",150);
         add_hit(60,y,960,215,enabled?A_DIFFICULTY:0,i,NULL);
     }
@@ -486,7 +503,7 @@ static void wrapped_notice(const char *s,int y,uint32_t color){
     }
 }
 static void draw_notice(void){
-    form_title("MINOS","Status details","What is happening right now.");int y=520;
+    heading("Status");int y=520;
     if(state.error[0]){text(bold,28,60,y,RED,"NEEDS ATTENTION",960);wrapped_notice(state.error,y+75,WHITE);y=1050;}
     if(state.operation[0]){text(bold,28,60,y,GREEN,"IN PROGRESS",960);wrapped_notice(state.operation,y+75,MUTED);}
     if(message_until>now_ms()&&(state.error[0]||state.operation[0])){text(bold,28,60,1550,AMBER,"LAST ACTION",960);text(regular,30,60,1625,WHITE,message,960);}
@@ -494,33 +511,34 @@ static void draw_notice(void){
     control(60,1940,960,140,PANEL,WHITE,"Close",A_CANCEL,0,NULL);
 }
 static void draw_home(int active){
-    heading("Server");subtitle("Minecraft controls and player access.");
+    heading("Server");control(800,205,220,120,PANEL,MUTED,"Log",A_PAGE,LOGS,NULL);
     int online=fresh()&&!strcmp(state.server,"online");
-    const char *title=!fresh()?"Checking status":online?"Ready to play":!strcmp(state.server,"recovery")?"Recovery needed":strstr(state.error,"Battery low")?"Waiting for charge":strstr(state.error,"Clock invalid")?"Waiting for time":strstr(state.error,"Server files unavailable")?"Setup needed":!strcmp(state.server,"starting")?"Starting up":"Server stopped";
-    const char *detail=!fresh()?"Controls return when status is available.":online?"Your world is open.":!strcmp(state.server,"recovery")?"Review the alert before continuing.":strstr(state.error,"Battery low")?"Connect the phone to power.":strstr(state.error,"Clock invalid")?"Trusted time is needed before starting.":strstr(state.error,"Server files unavailable")?"Protected server files are unavailable.":!strcmp(state.server,"starting")?"This can take a little while.":"Start the server when you are ready.";
-    uint32_t accent=online?GREEN:AMBER;
-    card(60,440,960,480);rounded(96,490,18,18,9,accent);
-    text(bold,28,132,510,accent,online?"ONLINE":!fresh()?"STATUS UNAVAILABLE":"NOT READY",810);
-    text(bold,62,96,615,WHITE,title,888);text(regular,32,96,680,MUTED,detail,888);
-    rect(96,735,888,2,BORDER);text(regular,28,96,795,DIM,online&&state.server_port>0&&state.server_port<=65535?"JOIN ADDRESS":"WI-FI ADDRESS",888);
+    const char *title=!fresh()?"Unavailable":online?"Online":!strcmp(state.server,"recovery")?"Recovery needed":strstr(state.error,"Battery low")?"Waiting for charge":strstr(state.error,"Clock invalid")?"Waiting for time":strstr(state.error,"Server files unavailable")?"Files unavailable":!strcmp(state.server,"starting")?"Starting":"Stopped";
+    card(60,405,960,265);rounded(96,452,18,18,9,online?GREEN:AMBER);
+    text(bold,48,138,480,WHITE,title,810);
     char address[100];network_addr(address,sizeof(address));const char *value=!strncmp(address,"Wi-Fi: ",7)?address+7:address;
-    text(mono,40,96,860,WHITE,value,888);
+    text(mono,38,96,595,MUTED,value,888);
     if(fresh()&&(!strcmp(state.server,"recovery")||strstr(state.error,"Battery low")||strstr(state.error,"Clock invalid")||strstr(state.error,"Server files unavailable")))
-        control(60,970,960,144,PANEL,AMBER,"Review status",A_NOTICE,0,NULL);
+        control(60,720,960,135,PANEL,AMBER,"Status",A_NOTICE,0,NULL);
     else if(active){
-        action_button(60,970,465,144,"Restart",A_RESTART,0,NULL);
-        control(555,970,465,144,PANEL,(!fresh()||busy())?DIM:RED,"Stop server",(!fresh()||busy())?0:A_STOP,0,NULL);
+        action_button(60,720,465,135,"Restart",A_RESTART,0,NULL);
+        control(555,720,465,135,PANEL,(!fresh()||busy())?DIM:RED,"Stop",(!fresh()||busy())?0:A_STOP,0,NULL);
     }else{
-        int ready=start_ready();control(60,970,960,144,ready?GREEN:PANEL,ready?BG:DIM,ready?"Start server":busy()?"Working...":online?"Checking process...":"Please wait",ready?A_START:0,0,NULL);
+        int ready=start_ready();control(60,720,960,135,ready?GREEN:PANEL,ready?BG:DIM,ready?"Start":busy()?"Working...":"Unavailable",ready?A_START:0,0,NULL);
     }
-    section_label(1235,"MANAGE");
-    char players[120];if(online)snprintf(players,sizeof(players),"%d online  /  %s",state.players,!strcmp(state.whitelist,"on")?"Whitelist on":!strcmp(state.whitelist,"off")?"Whitelist off":"Access status unavailable");else copy_value(players,sizeof(players),"Online players and whitelist access");
-    navigation_row(1280,"Players",players,PLAYERS);
-    navigation_row(1500,"Game settings",state.settings_pending?"Restart needed to apply changes":"Difficulty, capacity and view distance",SERVER_SETTINGS);
-    navigation_row(1720,"Activity","Recent server messages",LOGS);
+    text(regular,40,60,965,WHITE,"Difficulty",960);
+    static const char *labels[]={"Peaceful","Easy","Normal","Hard"};static const char *values[]={"peaceful","easy","normal","hard"};
+    for(int i=0;i<4;i++){
+        int selected=!strcmp(state.difficulty,values[i]),enabled=fresh()&&!busy();
+        control(60+i*245,1010,225,125,selected?GREEN_DARK:PANEL,enabled?(selected?GREEN:WHITE):DIM,labels[i],enabled?A_DIFFICULTY:0,i,NULL);
+    }
+    stepper(1210,"Player limit",state.max_players,A_MAX,NULL);
+    stepper(1440,"View distance",state.view_distance,A_VIEW," chunks");
+    stepper(1670,"Simulation distance",state.simulation_distance,A_SIM," chunks");
+    if(state.settings_pending)text(regular,32,60,1980,AMBER,"Restart required",960);
 }
 static void draw_players(void){
-    heading("Players");subtitle("See who is here. Choose who can join.");
+    heading("Players");
     control(60,430,465,130,list_mode?PANEL:GREEN_DARK,list_mode?MUTED:GREEN,"Online",A_LIST,0,NULL);
     control(555,430,465,130,list_mode?GREEN_DARK:PANEL,list_mode?GREEN:MUTED,"Whitelist",A_LIST,1,NULL);
     int available=fresh()&&(list_mode?state.allow_count>=0:!strcmp(state.server,"online"));
@@ -530,15 +548,14 @@ static void draw_players(void){
         card(60,600,960,180);
         const char *label=!fresh()?"Access status unavailable":!strcmp(state.whitelist,"on")?"Whitelist on":!strcmp(state.whitelist,"off")?"Whitelist off":"Access status unavailable";
         text(bold,36,90,665,WHITE,label,630);
-        text(regular,28,90,724,MUTED,!fresh()?"Waiting for current data.":!strcmp(state.whitelist,"on")?"Only listed players may join.":!strcmp(state.whitelist,"off")?"Anyone may try to join.":"Waiting for current data.",630);
         int toggle=access_editable()&&(!strcmp(state.whitelist,"on")||!strcmp(state.whitelist,"off"));
         control(750,625,240,130,BG,toggle?GREEN:DIM,!strcmp(state.whitelist,"on")?"Turn off":"Turn on",toggle?A_ALLOW:0,1,NULL);
     }else{
         char label[80];snprintf(label,sizeof(label),"%d %s",count,count==1?"player online":"players online");
         text(bold,44,60,700,WHITE,available?label:"Player status unavailable",960);
     }
-    if(!available)text(regular,34,60,920,MUTED,list_mode?"Waiting for the whitelist.":"Start the server to see online players.",960);
-    else if(!count){text(bold,44,60,940,WHITE,list_mode?"Make room for friends.":"A quiet world.",960);text(regular,32,60,1005,MUTED,list_mode?"Add a Minecraft username below.":"Players will appear here when they join.",960);}
+    if(!available)text(regular,34,60,920,MUTED,list_mode?"Whitelist unavailable":"Players unavailable",960);
+    else if(!count)text(regular,36,60,940,MUTED,list_mode?"No players added":"No players online",960);
     else for(int i=list_offset;i<count&&i<list_offset+PLAYER_PAGE_SIZE;i++){
         const char *name=list_mode?state.allow[i]:state.player[i];
         if(!name[0]){text(regular,32,60,930+(i-list_offset)*150,MUTED,"Player names unavailable",960);break;}
@@ -551,38 +568,7 @@ static void draw_players(void){
     }
 }
 static void draw_phone(void){
-    heading("Phone");subtitle("Connection, power and display.");
-    char status[80],ip[80];read_wifi_connection("/run/n20/wifi-state",status,sizeof(status),ip,sizeof(ip));
-    navigation_row(440,"Wi-Fi",wifi_address_valid(status,ip)?ip:"Connect to a network",WIFI);
-    long bat=read_long("/sys/class/power_supply/battery/capacity",-1),temp=read_long("/sys/class/power_supply/battery/temp",-1);
-    long usb=read_power_flag("/sys/class/power_supply/usb/online"),ac=read_power_flag("/sys/class/power_supply/ac/online"),charge_enabled=read_power_flag("/sys/class/oplus_chg/battery/mmi_charging_enable");
-    char charge[32]="",label[120];read_line("/sys/class/power_supply/battery/status",charge,sizeof(charge));
-    card(60,690,960,410);text(bold,28,96,760,MUTED,"BATTERY",888);
-    if(bat>=0&&bat<=100)snprintf(label,sizeof(label),"%ld%%",bat);else copy_value(label,sizeof(label),"Unavailable");
-    text(bold,76,96,870,WHITE,label,888);
-    text(regular,32,96,940,MUTED,battery_power_label(external_power(usb,ac),charge,charge_enabled),888);
-    if(fresh()&&state.charge_resume>=0&&state.charge_stop<=100&&state.charge_resume<state.charge_stop)snprintf(label,sizeof(label),"Charge limit %d%%  /  resumes at %d%%",state.charge_stop,state.charge_resume);
-    else copy_value(label,sizeof(label),"Charge limit unavailable");
-    text(regular,30,96,1020,MUTED,label,888);
-    section_label(1210,"DISPLAY");stepper(1270,"Brightness",bounded(saved_brightness*100/4095,1,100),A_BRIGHT,"%");
-    stepper(1490,"Screen sleeps after",idle_seconds,A_TIMEOUT,NULL);
-    text(regular,30,60,1765,MUTED,"Press the power button to wake the screen.",960);
-    char uptime[40];uptime_str(uptime,sizeof(uptime));
-    snprintf(label,sizeof(label),"Uptime %s",uptime);text(regular,30,60,1940,DIM,label,960);
-    if(temp>=0){snprintf(label,sizeof(label),"Battery temperature %.1f C",temp/10.0);text(regular,30,60,2000,DIM,label,960);}
-}
-static void draw_settings(void){
-    heading("Game settings");subtitle("Tune the world to fit your players.");
-    text(regular,40,60,500,WHITE,"Difficulty",530);
-    action_button(600,445,420,135,state.difficulty[0]?state.difficulty:"Unavailable",A_DIFFICULTY,-1,NULL);divider(620);
-    stepper(700,"Player limit",state.max_players,A_MAX,NULL);
-    stepper(940,"View distance",state.view_distance,A_VIEW," chunks");
-    stepper(1180,"Simulation distance",state.simulation_distance,A_SIM," chunks");
-    text(regular,31,60,1475,MUTED,"Shorter distances reduce the phone's workload.",960);
-    if(state.settings_pending){card(60,1630,960,240);text(bold,38,96,1710,AMBER,"Changes saved",888);text(regular,32,96,1775,MUTED,"Restart from Server to apply them.",888);}
-}
-static void draw_wifi(void){
-    heading("Wi-Fi");subtitle("Connect the phone to your network.");
+    heading("Phone");
     FILE *f=fopen("/run/n20/wifi-state","r");char line[512],status[80]="Starting",ip[64]="",current[80]="",note[120]="";
     int count=0,shown=0,available=f&&wifi_snapshot_recent(f);
     /* Read connection fields before networks: the file's record order is not UI state. */
@@ -595,48 +581,46 @@ static void draw_wifi(void){
         else if(!strcmp(type,"NETWORK"))count++;
     }rewind(f);}
     wifi_count=count;list_offset=page_offset(list_offset,count,WIFI_PAGE_SIZE);
-    card(60,430,960,240);text(bold,40,90,505,WHITE,available?(current[0]?current:"Not connected"):"Wi-Fi unavailable",900);
-    text(regular,30,90,565,MUTED,available?(note[0]?note:status):"Waiting for the Wi-Fi service.",900);
-    if(wifi_address_valid(status,ip))text(mono,30,90,620,MUTED,ip,900);
-    control(60,710,465,125,PANEL,WHITE,"Scan again",A_WIFI_SCAN,0,NULL);
-    control(555,710,465,125,PANEL,current[0]?MUTED:DIM,"Disconnect",current[0]?A_WIFI_DISCONNECT:0,0,NULL);
+    card(60,405,960,220);text(bold,40,90,475,WHITE,available?(current[0]?current:"Not connected"):"Wi-Fi unavailable",900);
+    text(regular,30,90,530,MUTED,available?(note[0]?note:status):"Unavailable",900);
+    if(wifi_address_valid(status,ip))text(mono,30,90,585,MUTED,ip,900);
+    control(60,665,465,125,PANEL,WHITE,"Scan",A_WIFI_SCAN,0,NULL);
+    control(555,665,465,125,PANEL,current[0]?MUTED:DIM,"Disconnect",current[0]?A_WIFI_DISCONNECT:0,0,NULL);
     if(available){int idx=0;while(fgets(line,sizeof(line),f)){
         line[strcspn(line,"\r\n")]=0;char *cursor=line,*type=strsep(&cursor,"\t"),*value=strsep(&cursor,"\t");
         if(!value||strcmp(type,"NETWORK"))continue;
         int index=idx++;if(index<list_offset||shown>=WIFI_PAGE_SIZE)continue;
         char *kind=strsep(&cursor,"\t"),*signal=strsep(&cursor,"\t"),name[80],detail[100];if(!kind||!signal||!hex_decode(value,name,sizeof(name)))continue;
-        int y=900+shown*150,supported=!strcmp(kind,"OPEN")?1:!strcmp(kind,"WPA2")?2:0,connected=wifi_connected_network(status,current,name);
+        int y=830+shown*150,supported=!strcmp(kind,"OPEN")?1:!strcmp(kind,"WPA2")?2:0,connected=wifi_connected_network(status,current,name);
         text(bold,36,60,y+49,WHITE,name,655);
-        snprintf(detail,sizeof(detail),"%s  /  %s",connected?"Connected":supported==1?"Open network":supported==2?"Password required":"Unsupported security",atoi(signal)>=-60?"Strong signal":atoi(signal)>=-75?"Good signal":"Weak signal");
+        snprintf(detail,sizeof(detail),"%s  /  %s",connected?"Connected":supported==1?"Open":supported==2?"WPA2":"Unsupported",atoi(signal)>=-60?"Strong":atoi(signal)>=-75?"Good":"Weak");
         text(regular,27,60,y+101,MUTED,detail,675);
         control(765,y+5,255,120,PANEL,connected?GREEN:supported?WHITE:DIM,connected?"Joined":supported?"Connect":"Unavailable",supported&&!connected?A_WIFI_SELECT:0,supported,value);divider(y+138);shown++;
     }}if(f)fclose(f);
-    if(!count)text(regular,34,60,1000,MUTED,!available?"Waiting for networks.":strstr(note,"Scanning")?"Looking for networks...":"No networks found. Try scanning again.",960);
-    pagination(1830,count,WIFI_PAGE_SIZE);
-    char ssh[120];wifi_ssh_label(status,ip,ssh,sizeof(ssh));char label[160];snprintf(label,sizeof(label),"SSH  %s",ssh);text(mono,28,60,2025,DIM,label,960);
+    if(!count)text(regular,34,60,920,MUTED,!available?"Unavailable":strstr(note,"Scanning")?"Scanning...":"No networks",960);
+    pagination(1300,count,WIFI_PAGE_SIZE);stepper(1490,"Brightness",bounded(saved_brightness*100/4095,1,100),A_BRIGHT,"%");stepper(1720,"Screen sleep",idle_seconds,A_TIMEOUT,NULL);
+    char ssh[120];wifi_ssh_label(status,ip,ssh,sizeof(ssh));char label[160];snprintf(label,sizeof(label),"SSH  %s",ssh);text(mono,28,60,1995,DIM,label,960);
     int auto_power=wifi_power_policy_alive("/run/n20/wifi-power-policy.heartbeat",time(NULL));
-    text(regular,27,60,2080,DIM,auto_power?"Automatic Wi-Fi power policy active":"Wi-Fi power policy unavailable",960);
+    char charge[32]="";read_line("/sys/class/power_supply/battery/status",charge,sizeof(charge));
+    long power=external_power(read_power_flag("/sys/class/power_supply/usb/online"),read_power_flag("/sys/class/power_supply/ac/online"));
+    text(regular,27,60,2070,auto_power?DIM:AMBER,auto_power?battery_power_label(power,charge,read_power_flag("/sys/class/oplus_chg/battery/mmi_charging_enable")):"Wi-Fi power policy unavailable",960);
 }
 static void draw_backups(void){
-    heading("World");subtitle("Backups and restore.");
-    card(60,430,960,300);text(bold,42,96,510,WHITE,"Local backups",888);
-    text(regular,32,96,575,MUTED,"Copies saved files while the server runs.",888);
-    text(regular,32,96,630,MUTED,"Live copies may be incomplete.",888);
-    text(regular,28,96,690,DIM,"Stored on this phone. Cloud backup is not set up.",888);
-    int ready=confirmation_ready(4);control(60,775,960,140,ready?GREEN:PANEL,ready?BG:DIM,"Back up now",ready?A_BACKUP:0,0,NULL);
+    heading("World");
+    int ready=confirmation_ready(4);control(60,405,960,140,ready?GREEN:PANEL,ready?BG:DIM,"Back up now",ready?A_BACKUP:0,0,NULL);
     int count=fresh()?bounded(state.backup_count,0,64):0;list_offset=page_offset(list_offset,count,BACKUP_PAGE_SIZE);
-    section_label(1010,"SAVED WORLDS");
-    if(!fresh()||state.backup_count<0)text(regular,34,60,1140,MUTED,"Waiting for backup history.",960);
-    else if(!count){text(bold,44,60,1160,WHITE,"Your history starts here.",960);text(regular,32,60,1225,MUTED,"Create a backup of your saved world.",960);}
+    section_label(660,"LOCAL BACKUPS");
+    if(!fresh()||state.backup_count<0)text(regular,34,60,790,MUTED,"Backups unavailable",960);
+    else if(!count)text(regular,36,60,790,MUTED,"No backups",960);
     else for(int i=list_offset;i<count&&i<list_offset+BACKUP_PAGE_SIZE;i++){
-        int y=1060+(i-list_offset)*150;char id[48];snprintf(id,sizeof(id),"%s%.12s",i==0?"Latest  /  ":"",state.backup_id[i]);
+        int y=710+(i-list_offset)*200;char id[48];snprintf(id,sizeof(id),"%s%.12s",i==0?"Latest  /  ":"",state.backup_id[i]);
         text(regular,34,60,y+50,WHITE,state.backup[i],680);text(mono,26,60,y+100,MUTED,id,680);
         int restore=ready&&valid_backup_id(state.backup_id[i]);control(765,y+5,255,120,PANEL,restore?WHITE:DIM,"Restore",restore?A_RESTORE:0,0,state.backup_id[i]);divider(y+138);
     }
     pagination(1850,count,BACKUP_PAGE_SIZE);char space[80];backup_space_label("/srv",space,sizeof(space));text(regular,28,60,2050,DIM,space,960);
 }
 static void draw_logs(void){
-    heading("Activity");subtitle("The latest messages from your server.");
+    heading("Activity");
     char logs[12][160];recent_logs(logs,8);int any=0;
     for(int i=0;i<8;i++){
         if(!logs[i][0])continue;
@@ -645,31 +629,28 @@ static void draw_logs(void){
         while(*cursor){const char *next=cursor;next_codepoint(&next);size_t n=(size_t)(next-cursor);if(len+n>=sizeof(first))break;memcpy(first+len,cursor,n);first[len+n]=0;if(text_width(mono,30,first)>960)break;len+=n;cursor=next;}
         first[len]=0;text(mono,30,60,y,WHITE,first,960);if(*cursor)text(mono,28,60,y+53,MUTED,cursor,960);divider(y+112);
     }
-    if(!any){text(bold,44,60,570,WHITE,"Nothing to show yet.",960);text(regular,32,60,635,MUTED,"Server messages will appear here.",960);}
+    if(!any)text(regular,36,60,570,MUTED,"No activity",960);
 }
-static int page_section(int target){return target==BACKUPS?BACKUPS:(target==DEVICE_SETTINGS||target==WIFI)?DEVICE_SETTINGS:HOME;}
+static int page_section(int target){return target==LOGS?HOME:target;}
 static void draw_navigation(void){
-    static const char *labels[]={"Server","World","Phone"};static const int targets[]={HOME,BACKUPS,DEVICE_SETTINGS};
+    static const char *labels[]={"Server","Players","World","Phone"};static const int targets[]={HOME,PLAYERS,BACKUPS,DEVICE_SETTINGS};
     rect(0,2210,W,190,BG);rect(60,2210,960,2,BORDER);
-    for(int i=0;i<3;i++){
-        int x=30+i*350,selected=page_section(page)==targets[i];
-        if(selected)rounded(x+30,2240,290,120,28,GREEN_DARK);
-        centered(selected?bold:regular,39,x,2315,350,selected?GREEN:MUTED,labels[i]);
-        add_hit(x,2230,350,150,A_PAGE,targets[i],NULL);
+    for(int i=0;i<4;i++){
+        int x=20+i*265,selected=page_section(page)==targets[i];
+        if(selected)rounded(x+10,2240,245,120,28,GREEN_DARK);
+        centered(selected?bold:regular,36,x,2315,265,selected?GREEN:MUTED,labels[i]);
+        add_hit(x,2230,265,150,A_PAGE,targets[i],NULL);
     }
 }
 static void draw(void){
     int active=running();last_server=active;last_fresh=fresh();last_message_visible=message_until>now_ms();hit_count=0;rect(0,0,W,H,BG);
+    draw_indicators();
     if(notice_open){draw_notice();return;}if(confirm){draw_confirmation();return;}if(keyboard_open){draw_keyboard();return;}if(difficulty_open){draw_difficulty();return;}
-    int child=page==PLAYERS||page==SERVER_SETTINGS||page==LOGS||page==WIFI;
-    if(child)control(60,75,300,110,PANEL,MUTED,page==WIFI?"< Phone":"< Server",A_PAGE,page==WIFI?DEVICE_SETTINGS:HOME,NULL);
-    else{text(bold,34,60,150,WHITE,"MinOS",650);text(regular,28,770,150,DIM,"NORD N20",250);}
+    if(page==LOGS)control(60,205,130,120,PANEL,MUTED,"<",A_PAGE,HOME,NULL);
     switch(page){
         case HOME:draw_home(active);break;
         case PLAYERS:draw_players();break;
         case DEVICE_SETTINGS:draw_phone();break;
-        case SERVER_SETTINGS:draw_settings();break;
-        case WIFI:draw_wifi();break;
         case BACKUPS:draw_backups();break;
         default:draw_logs();break;
     }
@@ -677,13 +658,14 @@ static void draw(void){
     if(*notice){rounded(60,2115,960,80,18,AMBER_DARK);text(regular,28,84,2166,AMBER,notice,750);text(bold,27,855,2166,AMBER,"Details",145);add_hit(60,2115,960,80,A_NOTICE,0,NULL);}
     draw_navigation();
 }
-/* External telemetry on these pages changes without a backend state update.
-   Other pages redraw only for input, state, freshness, or message changes. */
+/* Page content needing periodic refresh, in addition to the shared status bar. */
 static int periodic_page(void){
     if(notice_open||confirm||keyboard_open||difficulty_open)return 0;
-    return page==HOME||page==WIFI||page==BACKUPS||page==LOGS||page==DEVICE_SETTINGS;
+    return page==HOME||page==BACKUPS||page==LOGS||page==DEVICE_SETTINGS;
 }
 static int redraw_needed(long long now){
+    int periodic=last_draw&&periodic_page()&&now-last_draw>=5000;
+    refresh_indicators(now);if(periodic)invalidate_full();
     return !last_draw || last_fresh!=fresh() || last_message_visible!=(message_until>now) ||
            last_server!=running() || (periodic_page() && now-last_draw>=5000);
 }/* Cap awake waits at five seconds for process status and stale-state checks. */
@@ -712,7 +694,7 @@ static void activate(const Hit *hit){
     if(a==A_CANCEL){if(notice_open){notice_open=0;return;}confirm=0;keyboard_open=0;difficulty_open=0;wifi_show_password=0;wifi_cursor=0;explicit_bzero(wifi_password,sizeof(wifi_password));return;}
     if(a==A_NOTICE){notice_open=1;return;}
     if(a==A_LIST){list_mode=v;list_offset=0;return;}
-    if(a==A_SCROLL&&page==WIFI){list_offset=page_offset(list_offset+v,wifi_count,WIFI_PAGE_SIZE);return;}
+    if(a==A_SCROLL&&page==DEVICE_SETTINGS){list_offset=page_offset(list_offset+v,wifi_count,WIFI_PAGE_SIZE);return;}
     if(a==A_SCROLL){int count=page==BACKUPS?bounded(state.backup_count,0,64):list_mode?bounded(state.allow_count,0,128):bounded(state.players,0,64);int step=page==BACKUPS?BACKUP_PAGE_SIZE:PLAYER_PAGE_SIZE;list_offset=page_offset(list_offset+v,count,step);return;}
     if(a==A_KEY){char *target=keyboard_open==2?wifi_password:typed_name;size_t max=keyboard_open==2?64:16,len=strlen(target);if(len<max){size_t at=keyboard_open==2?wifi_cursor:len;if(at>len)at=len;memmove(target+at+1,target+at,len-at+1);target[at]=(char)v;if(keyboard_open==2)wifi_cursor=at+1;}return;}
     if(a==A_WIFI_SPACE&&keyboard_open==2){size_t len=strlen(wifi_password);if(len<64){size_t at=wifi_cursor>len?len:wifi_cursor;memmove(wifi_password+at+1,wifi_password+at,len-at+1);wifi_password[at]=' ';wifi_cursor=at+1;}return;}
@@ -744,7 +726,7 @@ static void activate(const Hit *hit){
     if(a==A_REMOVE){if(!access_editable()){msg(access_unavailable_reason());return;}copy_value(selected_name,sizeof(selected_name),arg);confirm=3;return;}
     if(a==A_ALLOW){if(!access_editable()||(strcmp(state.whitelist,"on")&&strcmp(state.whitelist,"off"))){msg("Whitelist state unavailable.");return;}if(v){if(!strcmp(state.whitelist,"on")){confirm=7;return;}if(state.allow_count==0){confirm=6;return;}admin("whitelist-set","on");}else admin("whitelist-add",arg);return;}
     if(a==A_SUBMIT){if(!access_editable()){msg(access_unavailable_reason());return;}if(strlen(typed_name)<3){msg("Use a username with 3 to 16 characters.");return;}if(admin("whitelist-add",typed_name))keyboard_open=0;return;}
-    if(a==A_DIFFICULTY){const char *levels[]={"peaceful","easy","normal","hard"};if(v<0){difficulty_open=1;return;}if(v<4&&difficulty_open){if(!strcmp(state.difficulty,levels[v])||admin("difficulty",levels[v]))difficulty_open=0;}return;}
+    if(a==A_DIFFICULTY){const char *levels[]={"peaceful","easy","normal","hard"};if(v<0){difficulty_open=1;return;}if(v<4&&(difficulty_open||page==HOME)){if(!strcmp(state.difficulty,levels[v])||admin("difficulty",levels[v]))difficulty_open=0;}return;}
     if(a==A_MAX||a==A_VIEW||a==A_SIM){int old=a==A_MAX?state.max_players:a==A_VIEW?state.view_distance:state.simulation_distance;int lo=a==A_MAX?1:2,hi=a==A_MAX?20:12;if(old<lo||old>hi||(v!=-1&&v!=1)||(v<0&&old==lo)||(v>0&&old==hi)){msg("Setting changed; refresh and try again.");helper_due=0;return;}snprintf(n,sizeof(n),"%d",old+v);admin(a==A_MAX?"max-players":a==A_VIEW?"view-distance":"simulation-distance",n);return;}
     if(a==A_BACKUP){confirm=4;return;}if(a==A_RESTORE&&valid_backup_id(arg)){copy_value(selected_backup,sizeof(selected_backup),arg);selected_backup_label[0]=0;for(int i=0;i<state.backup_count;i++)if(!strcmp(state.backup_id[i],arg)){copy_value(selected_backup_label,sizeof(selected_backup_label),state.backup[i]);break;}confirm=5;return;}
 }
