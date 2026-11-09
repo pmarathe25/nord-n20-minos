@@ -1,10 +1,43 @@
 #!/bin/sh
 set -u
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+services=1
+if [ "$#" -eq 1 ] && [ "$1" = --server-only ]; then services=0
+elif [ "$#" -ne 0 ]; then echo 'Invalid supervisor argument' >&2; exit 2
+fi
+usb_time() {
+    /usr/local/bin/busybox ip route get "$1" 2>/dev/null | grep -Eq '(^| )dev usb0( |$)' || return 1
+    /usr/local/bin/busybox wget -T 2 -qO - "http://$1:18888/time" 2>/dev/null
+}
+credible_time() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1704067200 ] 2>/dev/null && [ "$1" -le 4102444800 ] 2>/dev/null || return 1
+    floor=
+    if [ -r /var/lib/n20/trusted-time ]; then IFS= read -r floor < /var/lib/n20/trusted-time || :; fi
+    case "$floor" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$floor" -ge 1704067200 ] 2>/dev/null && [ "$floor" -le 4102444800 ] 2>/dev/null; then
+        [ "$1" -ge "$((floor-86400))" ]
+    fi
+}
 mkdir -p /run /var/log /srv/minecraft
+# Create the shared runtime directory before launching any services. The MTP
+# sandbox requires a root-owned directory that other users cannot write.
+if [ -L /run/n20 ]; then echo 'Unsafe runtime directory' >&2; exit 1; fi
+mkdir -m 700 -p /run/n20 || exit 1
+[ -d /run/n20 ] && [ "$(stat -c '%u' /run/n20)" = 0 ] || { echo 'Unsafe runtime directory' >&2; exit 1; }
+chmod 700 /run/n20 || exit 1
+# Prevent accounts other than the Minecraft owner from replacing entries.
+# Root-run management must still treat game-owned directory entries as untrusted.
+chmod go-w /srv/minecraft || exit 1
+if [ "$services" -eq 1 ]; then
+[ -x /usr/local/sbin/n20-security-sysctls ] || { echo 'Missing filesystem protection helper' >&2; exit 1; }
+/usr/local/sbin/n20-security-sysctls || exit 1
 # n20-wifi-start
 /usr/local/bin/busybox setsid /usr/local/sbin/n20-radio-start >>/var/log/n20-radio.log 2>&1 </dev/null &
 /usr/local/bin/busybox setsid /usr/local/sbin/n20-wifi-manager >>/var/log/n20-wifi.log 2>&1 </dev/null &
+if [ -x /usr/local/sbin/n20-wifi-power-policy ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-wifi-power-policy >>/var/log/n20-wifi-power.log 2>&1 </dev/null &
+fi
 /usr/local/bin/busybox setsid /usr/local/sbin/n20-mtp-start >>/var/log/n20-mtp-start.log 2>&1 </dev/null &
 if [ ! -x /usr/local/sbin/n20-dashboard ] && [ -x /usr/local/sbin/n20-display-watch-start ]; then
     /usr/local/bin/busybox setsid /usr/local/sbin/n20-display-watch-start >>/var/log/n20-display-watch.log 2>&1 </dev/null &
@@ -20,51 +53,87 @@ if [ -x /usr/local/sbin/n20-save-events ]; then
 fi
 if [ -x /usr/local/sbin/n20-admin ]; then
     /usr/local/bin/busybox setsid /usr/local/sbin/n20-admin scheduler >>/var/log/n20-scheduler.log 2>&1 </dev/null &
-    /usr/local/bin/busybox setsid /usr/local/sbin/n20-admin powerguard >>/var/log/n20-powerguard.log 2>&1 </dev/null &
+    # Restart the guard after an unexpected exit, permitting charging while it
+    # is down so a crashed limiter cannot leave the battery unable to recover.
+    /usr/local/bin/busybox setsid /bin/sh -c 'while :; do /usr/local/sbin/n20-admin powerguard; [ ! -w /sys/class/oplus_chg/battery/mmi_charging_enable ] || printf "1\n" > /sys/class/oplus_chg/battery/mmi_charging_enable; sleep 2; done' >>/var/log/n20-powerguard.log 2>&1 </dev/null &
 fi
 if [ -x /usr/sbin/sshd ] && [ -f /etc/ssh/sshd_config_n20 ]; then
     mkdir -p /run/sshd
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config_n20 && /usr/sbin/sshd -f /etc/ssh/sshd_config_n20
 fi
+fi
 cd /srv/minecraft || exit 1
-rm -f /run/minecraft-console
-mkfifo /run/minecraft-console || exit 1
-chown minecraft:minecraft /run/minecraft-console
-chmod 600 /run/minecraft-console
+if [ "$services" -eq 0 ]; then
+    # A maintenance takeover shares the existing FIFO until the old
+    # supervisor exits; never replace an open console behind its back.
+    [ -p /run/minecraft-console ] && [ "$(stat -c '%F %a %U %G' /run/minecraft-console)" = 'fifo 600 minecraft minecraft' ] || {
+        echo 'Existing Minecraft console is missing or unsafe' >&2; exit 1;
+    }
+else
+    rm -f /run/minecraft-console
+    mkfifo /run/minecraft-console || exit 1
+    chown minecraft:minecraft /run/minecraft-console
+    chmod 600 /run/minecraft-console
+fi
 exec 3<>/run/minecraft-console
-mkdir -p /run/n20
 exec 4>/run/n20/server-transition.lock
 while :; do
-    if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then
+    if [ -e /run/minecraft-stop ] || { [ -e /var/lib/n20/restore-hold ] || [ -L /var/lib/n20/restore-hold ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -L /srv/minecraft/.n20-restore-hold ]; } || { [ -e /var/lib/n20/low-battery-hold ] || [ -L /var/lib/n20/low-battery-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ] || [ -L /srv/minecraft/.n20-low-battery-hold ]; }; then
         sleep 5
         continue
     fi
-    if [ ! -f server.jar ] || ! grep -q '^eula=true' eula.txt 2>/dev/null; then
+    # Executable code is root-controlled; the game still owns its world and
+    # configuration in /srv/minecraft. Never fall back to its writable JAR.
+    bundle=/opt/n20-minecraft/current
+    # EULA is in the game-owned directory; read it without root privileges
+    # and bound the wait if a compromised game replaces it with a FIFO.
+    if [ ! -f "$bundle/server.jar" ] || [ ! -d "$bundle/repo" ] || ! /usr/local/bin/busybox timeout 2 setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups grep -q '^eula=true' eula.txt 2>/dev/null; then
         sleep 10
         continue
     fi
-    n=0
-    while [ "$n" -lt 30 ]; do
-        now=$(/usr/local/bin/busybox wget -T 2 -qO - http://192.168.137.1:18888/time 2>/dev/null || /usr/local/bin/busybox wget -T 2 -qO - http://169.254.187.170:18888/time 2>/dev/null || true)
-        case "$now" in
-            ''|*[!0-9]*) sleep 2; n=$((n + 1)) ;;
-            *) /usr/local/bin/busybox date -u -s "@$now" >/dev/null; break ;;
-        esac
-    done
+    # Seed only a new installation; never override an existing operator choice.
+    # Create as the game user with noclobber to avoid privileged symlink writes.
+    if [ -L server.properties ] && [ ! -e server.properties ]; then
+        echo 'Dangling server.properties link; startup postponed' >> /var/log/minecraft.log
+        sleep 10
+        continue
+    fi
+    if [ ! -e server.properties ] && [ ! -L server.properties ]; then
+        if ! setpriv --reuid=minecraft --regid=minecraft --clear-groups /bin/sh -c 'umask 077; set -C; printf "online-mode=true\nwhite-list=true\nenforce-whitelist=true\n" > server.properties'; then
+            echo 'Could not create secure server defaults; startup postponed' >> /var/log/minecraft.log
+            sleep 10
+            continue
+        fi
+    fi
+    clock=$(/usr/local/bin/busybox date -u +%s 2>/dev/null || true)
+    if ! credible_time "$clock"; then
+        n=0
+        while [ "$n" -lt 30 ]; do
+            clock=$(/usr/local/bin/busybox date -u +%s 2>/dev/null || true)
+            credible_time "$clock" && break
+            now=$(usb_time 192.168.137.1 || usb_time 169.254.187.170 || true)
+            clock=$(/usr/local/bin/busybox date -u +%s 2>/dev/null || true)
+            credible_time "$clock" && break
+            if credible_time "$now" && /usr/local/bin/busybox date -u -s "@$now" >/dev/null; then break; fi
+            sleep 2; n=$((n + 1))
+        done
+    fi
     # A dead battery can reset the clock to 1970. Wait for a credible time;
     # the background timekeeper retries while the USB host is unavailable.
-    while [ "$(date -u +%s)" -lt 1704067200 ]; do
-        if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then break; fi
+    while ! credible_time "$(date -u +%s 2>/dev/null || true)"; do
+        if [ -e /run/minecraft-stop ] || { [ -e /var/lib/n20/restore-hold ] || [ -L /var/lib/n20/restore-hold ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -L /srv/minecraft/.n20-restore-hold ]; } || { [ -e /var/lib/n20/low-battery-hold ] || [ -L /var/lib/n20/low-battery-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ] || [ -L /srv/minecraft/.n20-low-battery-hold ]; }; then break; fi
         sleep 5
     done
-    if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then continue; fi
+    if [ -e /run/minecraft-stop ] || { [ -e /var/lib/n20/restore-hold ] || [ -L /var/lib/n20/restore-hold ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -L /srv/minecraft/.n20-restore-hold ]; } || { [ -e /var/lib/n20/low-battery-hold ] || [ -L /var/lib/n20/low-battery-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ] || [ -L /srv/minecraft/.n20-low-battery-hold ]; }; then continue; fi
     echo "$(date -u): starting Minecraft" >> /var/log/minecraft.log
     flock -x 4
-    if [ -e /run/minecraft-stop ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ]; then
+    if [ -e /run/minecraft-stop ] || { [ -e /var/lib/n20/restore-hold ] || [ -L /var/lib/n20/restore-hold ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -L /srv/minecraft/.n20-restore-hold ]; } || { [ -e /var/lib/n20/low-battery-hold ] || [ -L /var/lib/n20/low-battery-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ] || [ -L /srv/minecraft/.n20-low-battery-hold ]; }; then
         flock -u 4
         continue
     fi
-    setpriv --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G -jar server.jar nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
+    # Mods and server code should not gain privileges through setuid binaries
+    # or file capabilities if the game process is compromised.
+    setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G "-DbundlerRepoDir=$bundle/repo" -jar "$bundle/server.jar" nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
     pid=$!
     echo "$pid" > /run/minecraft.pid
     flock -u 4

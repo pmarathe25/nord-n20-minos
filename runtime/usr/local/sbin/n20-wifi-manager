@@ -3,6 +3,7 @@
 import hashlib
 import os
 import re
+import select
 import socket
 import subprocess
 import time
@@ -23,7 +24,7 @@ except FileNotFoundError: pass
 server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 server.bind(sockpath)
 os.chmod(sockpath, 0o600)
-server.settimeout(1)
+server.setblocking(False)
 dhcp = None
 supp = None
 lastscan = 0
@@ -31,6 +32,7 @@ pending = None
 pending_since = 0
 message = 'Starting Wi-Fi'
 laststate = 0
+events = None
 
 def request(command):
     path = RUN + '/wpa-client'
@@ -47,6 +49,40 @@ def request(command):
         s.close()
         try: os.unlink(path)
         except FileNotFoundError: pass
+
+def event_monitor():
+    """Subscribe separately so command replies never consume event messages."""
+    path = RUN + '/wpa-events'
+    try: os.unlink(path)
+    except FileNotFoundError: pass
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.bind(path)
+        sock.settimeout(2)
+        sock.connect(CTRL)
+        sock.send(b'ATTACH')
+        if sock.recv(128).strip() != b'OK':
+            raise OSError('Could not subscribe to Wi-Fi events')
+        sock.setblocking(False)
+        return sock
+    except Exception:
+        sock.close()
+        try: os.unlink(path)
+        except FileNotFoundError: pass
+        raise
+
+def wait_for_activity(control, monitor, timeout):
+    """Return the control packet and whether a Wi-Fi event arrived."""
+    readers = [control] + ([monitor] if monitor is not None else [])
+    ready, _, _ = select.select(readers, [], [], timeout)
+    if monitor in ready:
+        # Coalesce bursts while keeping commands responsive.
+        for _ in range(32):
+            try: monitor.recv(65535)
+            except BlockingIOError: break
+    if control in ready:
+        return control.recv(2048), monitor in ready
+    return None, monitor in ready
 
 def unescape(s):
     return re.sub(rb'\\x([0-9a-fA-F]{2})', lambda m: bytes([int(m.group(1),16)]), s.encode())
@@ -96,7 +132,9 @@ def command(data):
         if kind=='OPEN': commands+=['SET_NETWORK %s key_mgmt NONE' % nid]
         else:
             psk=password.decode() if len(password)==64 else hashlib.pbkdf2_hmac('sha1',password,ssid,4096,32).hex()
-            commands+=['SET_NETWORK %s key_mgmt WPA-PSK' % nid,'SET_NETWORK %s psk %s' % (nid,psk)]
+            # The UI offers WPA2, so do not silently permit WPA1/TKIP fallback.
+            commands+=['SET_NETWORK %s key_mgmt WPA-PSK' % nid,'SET_NETWORK %s proto RSN' % nid,
+                       'SET_NETWORK %s pairwise CCMP' % nid,'SET_NETWORK %s psk %s' % (nid,psk)]
         for line in commands+['SELECT_NETWORK '+nid]:
             if request(line)!='OK': raise ValueError('Could not configure network')
         pending=nid; pending_since=time.monotonic(); message='Connecting...'
@@ -112,6 +150,9 @@ while True:
             if supp is None or supp.poll() is not None:
                 supp=subprocess.Popen(['/usr/sbin/wpa_supplicant','-i','wlan0','-c',config,'-D','nl80211'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             time.sleep(2); continue
+        if events is None:
+            try: events=event_monitor()
+            except OSError: events=None
         st=status(); connected=st.get('wpa_state')=='COMPLETED'
         if connected and pending is None and message in ('Starting Wi-Fi','Starting Wi-Fi radio','Scanning for networks'):
             message='Connected'
@@ -130,11 +171,18 @@ while True:
             request('SCAN'); lastscan=time.monotonic()
         if time.monotonic()-laststate>3:
             write_state(); laststate=time.monotonic()
-        try:
-            data=server.recv(2048)
+        # Notifications handle connection and scan changes promptly. A bounded
+        # timeout still detects DHCP exit or a lost event subscription.
+        timeout = 15 if events is not None else 3
+        if pending is not None:
+            timeout = min(timeout, max(0, 60 - (time.monotonic()-pending_since)))
+        data, event=wait_for_activity(server, events, timeout)
+        if event: laststate=0
+        if data is not None:
             try: command(data)
             except (ValueError, OSError) as e: message=str(e)[:100]
             laststate=0
-        except socket.timeout: pass
     except (OSError,ValueError):
+        if events is not None:
+            events.close(); events=None
         time.sleep(2)

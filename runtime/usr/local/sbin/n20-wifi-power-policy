@@ -1,0 +1,194 @@
+#!/usr/bin/python3
+"""Save Wi-Fi power while Minecraft has no TCP clients; fail toward low latency."""
+import fcntl
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+RUN = Path('/run/n20')
+PROPERTIES = Path('/srv/minecraft/server.properties')
+NET = Path('/proc/net')
+PROC = Path('/proc')
+PID = Path('/run/minecraft.pid')
+HEARTBEAT = RUN / 'wifi-power-policy.heartbeat'
+LOCK = RUN / 'wifi-power-policy.lock'
+IDLE_DELAY = 10.0
+INTERVAL = 0.5
+CHECK_INTERVAL = 10.0
+ACTIVE_CHECK_INTERVAL = 1.0
+stopping = False
+
+
+def server_port(path=PROPERTIES):
+    port = 25565
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024*1024:
+            raise ValueError('unsafe server properties')
+        with os.fdopen(fd, 'rb') as f:
+            fd = -1; data = f.read(1024*1024+1)
+        if len(data) > 1024*1024: raise ValueError('server properties too large')
+        lines = data.decode('utf-8').splitlines()
+    finally:
+        if fd >= 0: os.close(fd)
+    for line in lines:
+        line = line.strip()
+        if not line.startswith('server-port'): continue
+        match = re.fullmatch(r'server-port(?:\s*[=:]\s*|\s+)(\S*)', line)
+        if match:
+            text = match.group(1)
+            if not text.isascii() or not text.isdigit():
+                raise ValueError('invalid server port')
+            port = int(text)
+        elif line.startswith('server-port'):
+            raise ValueError('invalid server port')
+    if not 1 <= port <= 65535:
+        raise ValueError('invalid server port')
+    return port
+
+
+def game_socket_inodes(pid_path=PID, proc=PROC):
+    text = pid_path.read_text().strip()
+    if not text.isascii() or not text.isdigit() or int(text) <= 1:
+        raise ValueError('invalid server PID')
+    process = proc / text
+    if process.joinpath('comm').read_text().strip() != 'java':
+        raise ValueError('server process unavailable')
+    sockets = set()
+    # Avoid allocating a Path and running a regular expression for every
+    # descriptor on each 500 ms check; /proc socket inode names are ASCII.
+    with os.scandir(process / 'fd') as entries:
+        for fd in entries:
+            try: target = os.readlink(fd.path)
+            except FileNotFoundError: continue
+            if target.startswith('socket:[') and target.endswith(']'):
+                inode = target[8:-1]
+                if inode.isascii() and inode.isdigit(): sockets.add(inode)
+    return sockets
+
+
+def socket_activity(port, inodes, net=NET):
+    """Return None if no listener, otherwise whether any client is present."""
+    states = []; owned_listener = False
+    for name in ('tcp', 'tcp6'):
+        for line in (net / name).read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                raise ValueError('invalid TCP table')
+            local = fields[1].rsplit(':', 1)
+            if len(local) != 2:
+                raise ValueError('invalid TCP address')
+            if int(local[1], 16) == port:
+                states.append(fields[3])
+                if fields[3] == '0A' and fields[9] in inodes:
+                    owned_listener = True
+    if not owned_listener:
+        return None
+    return any(state != '0A' for state in states)
+
+
+class IdlePolicy:
+    def __init__(self):
+        self.idle_since = None
+
+    def power_save(self, now, activity):
+        if activity is None or activity:
+            self.idle_since = None
+            return False
+        if self.idle_since is None:
+            self.idle_since = now
+        return now - self.idle_since >= IDLE_DELAY
+
+
+def power_save_status():
+    result = subprocess.run(['iw', 'dev', 'wlan0', 'get', 'power_save'],
+                            capture_output=True, text=True, timeout=3, check=True)
+    if 'Power save: on' in result.stdout: return True
+    if 'Power save: off' in result.stdout: return False
+    raise ValueError('unrecognized Wi-Fi power state')
+
+
+def set_power_save(enabled):
+    subprocess.run(['iw', 'dev', 'wlan0', 'set', 'power_save', 'on' if enabled else 'off'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=True)
+
+
+def stop(signum, frame):
+    global stopping
+    stopping = True
+
+
+def heartbeat_fresh(path, now):
+    try: age = now - path.stat().st_mtime
+    except OSError: return False
+    return -2 <= age <= 6
+
+
+def worker(parent):
+    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+    policy = IdlePolicy(); current = None; last_check = 0.0
+    HEARTBEAT.touch(mode=0o600)
+    try:
+        while not stopping and os.getppid() == parent:
+            now = time.monotonic()
+            try: activity = socket_activity(server_port(), game_socket_inodes())
+            except (OSError, ValueError): activity = None
+            desired = policy.power_save(now, activity)
+            try:
+                interval = CHECK_INTERVAL if activity is False else ACTIVE_CHECK_INTERVAL
+                if current is None or now - last_check >= interval:
+                    current = power_save_status(); last_check = now
+                if current != desired:
+                    set_power_save(desired); current = desired
+            except (OSError, ValueError, subprocess.SubprocessError):
+                current = None
+            HEARTBEAT.touch(mode=0o600)
+            time.sleep(INTERVAL)
+    finally:
+        try: set_power_save(False)
+        except (OSError, subprocess.SubprocessError): pass
+        else: HEARTBEAT.unlink(missing_ok=True)
+    return 0
+
+
+def main():
+    os.umask(0o077)
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with LOCK.open('a+') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: return 1
+        signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+        while not stopping:
+            try: set_power_save(False)
+            except (OSError, subprocess.SubprocessError): pass
+            HEARTBEAT.unlink(missing_ok=True)
+            child = subprocess.Popen([sys.executable, __file__, '--worker', str(os.getpid())])
+            started = time.monotonic()
+            try:
+                while not stopping and child.poll() is None:
+                    if time.monotonic() - started > 8 and not heartbeat_fresh(HEARTBEAT, time.time()):
+                        break
+                    time.sleep(1)
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    try: child.wait(timeout=3)
+                    except subprocess.TimeoutExpired: child.kill(); child.wait()
+                try: set_power_save(False)
+                except (OSError, subprocess.SubprocessError): pass
+                else: HEARTBEAT.unlink(missing_ok=True)
+            if not stopping: time.sleep(3)
+    return 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == '--worker' and sys.argv[2].isdigit():
+        raise SystemExit(worker(int(sys.argv[2])))
+    if len(sys.argv) != 1: raise SystemExit(2)
+    raise SystemExit(main())

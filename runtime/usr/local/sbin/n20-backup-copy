@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+"""Bind pinned backup directories inside a private mount namespace."""
+import ctypes
+import os
+import subprocess
+import sys
+
+if len(sys.argv) != 8:
+    raise SystemExit(2)
+source_path, target_path, base = sys.argv[1:4]
+expected_source = tuple(int(x) for x in sys.argv[4:6])
+expected_target = tuple(int(x) for x in sys.argv[6:8])
+if not all(os.path.isabs(x) for x in (source_path, target_path, base)) or not os.path.basename(base).startswith('n20-backup-mount-'):
+    raise SystemExit(2)
+flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+source_fd = os.open(source_path, flags)
+target_fd = os.open(target_path, flags)
+for fd, expected in ((source_fd, expected_source), (target_fd, expected_target)):
+    st = os.fstat(fd)
+    if (st.st_dev, st.st_ino) != expected:
+        raise SystemExit('Backup directory changed before copy')
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
+def mount(source, target, flags):
+    if libc.mount(os.fsencode(source) if source else None, os.fsencode(target), None, flags, None):
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+source = os.path.join(base, 'source')
+target = os.path.join(base, 'target')
+MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC = 1, 2, 4, 8
+MS_REMOUNT, MS_BIND = 32, 4096
+mount('/proc/self/fd/' + str(source_fd), source, MS_BIND)
+mount(None, source, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC)
+mount('/proc/self/fd/' + str(target_fd), target, MS_BIND)
+os.execv('/usr/bin/setpriv', ['/usr/bin/setpriv','--no-new-privs','--bounding-set=-all',
+    '--reuid=minecraft','--regid=minecraft','--clear-groups','/usr/bin/rsync',
+    '-aS','--no-owner','--no-group','--bwlimit=8192','--exclude=/session.lock',
+    source + '/', target + '/'])

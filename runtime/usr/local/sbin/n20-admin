@@ -2,10 +2,13 @@
 """Local, root-only administration and consistent world snapshots for the N20."""
 import datetime as dt
 import fcntl
+import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
+import signal
 import shutil
 import socket
 import stat
@@ -17,6 +20,7 @@ import time
 from pathlib import Path
 
 ROOT = Path('/srv/minecraft')
+BUNDLE = Path('/opt/n20-minecraft/current')
 WORLD = ROOT / 'world'
 REPO = Path('/srv/backups/world-history')
 PASS = Path('/etc/n20-backup.pass')
@@ -25,8 +29,10 @@ META = Path('/var/lib/n20')
 STOP = Path('/run/minecraft-stop')
 PID = Path('/run/minecraft.pid')
 FIFO = Path('/run/minecraft-console')
-HOLD = ROOT / '.n20-restore-hold'
-LOW = ROOT / '.n20-low-battery-hold'
+HOLD = META / 'restore-hold'
+LEGACY_HOLD = ROOT / '.n20-restore-hold'
+LOW = META / 'low-battery-hold'
+LEGACY_LOW = ROOT / '.n20-low-battery-hold'
 LOCK = RUN / 'operation.lock'
 OP = RUN / 'operation'
 ERR = META / 'error'
@@ -38,6 +44,12 @@ STAGE = Path('/srv/backups/.n20-staging')
 STAGE_WORLD = STAGE / 'world'
 SAVE_EVENT = RUN / 'save-event.json'
 RESTIC = '/usr/bin/restic'
+COPY_HELPER = '/usr/local/sbin/n20-backup-copy'
+CHARGE_SWITCH = Path('/sys/class/oplus_chg/battery/mmi_charging_enable')
+USB_ONLINE = Path('/sys/class/power_supply/usb/online')
+AC_ONLINE = Path('/sys/class/power_supply/ac/online')
+CHARGE_STOP = 55
+CHARGE_RESUME = 50
 MIN_FREE = 10 * 1024**3
 MAX_REPO = 20 * 1024**3
 NORMAL_INTERVAL = 15 * 60
@@ -47,6 +59,21 @@ HEX = re.compile(r'[0-9a-f]{8,64}\Z')
 
 class AdminError(Exception):
     pass
+
+def restore_held():
+    # A legacy hold must remain effective until an operator resolves it.
+    return os.path.lexists(HOLD) or os.path.lexists(LEGACY_HOLD)
+
+def low_battery_held():
+    return os.path.lexists(LOW) or os.path.lexists(LEGACY_LOW)
+
+def secure_hold_directory():
+    try:
+        info = HOLD.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            raise AdminError('Restore hold directory is not private; restore aborted')
+    except OSError as exc:
+        raise AdminError('Cannot validate restore hold directory; restore aborted') from exc
 
 def lower_priority():
     try: os.nice(10)
@@ -75,6 +102,17 @@ def read(path, default=''):
     try: return path.read_text(encoding='utf-8').strip()
     except OSError: return default
 
+def credible_clock(now):
+    # Match the supervisor's time gate, including the persisted rollback floor.
+    if not 1704067200 <= now <= 4102444800:
+        return False
+    floor = read(META / 'trusted-time')
+    if len(floor) <= 10 and floor.isascii() and floor.isdigit():
+        value = int(floor)
+        if 1704067200 <= value <= 4102444800 and now < value - 86400:
+            return False
+    return True
+
 def set_error(text):
     atomic(ERR, ' '.join(str(text).split())[:230] + '\n')
 
@@ -98,37 +136,106 @@ def vi(num):
     out.append(num)
     return bytes(out)
 
-def vi_from_sock(sock):
+def status_recv(sock, size, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0: raise socket.timeout('status response deadline exceeded')
+    sock.settimeout(min(0.7, remaining))
+    return sock.recv(size)
+
+def vi_from_sock(sock, deadline=None):
     result = 0
     for i in range(5):
-        b = sock.recv(1)
+        b = sock.recv(1) if deadline is None else status_recv(sock, 1, deadline)
         if not b: raise EOFError('status connection closed')
         result |= (b[0] & 127) << (i * 7)
         if not b[0] & 128: return result
     raise ValueError('invalid varint')
 
+def bounded_json(text, max_depth=64):
+    depth = 0; quoted = False; escaped = False
+    for ch in text:
+        if quoted:
+            if escaped: escaped = False
+            elif ch == '\\': escaped = True
+            elif ch == '"': quoted = False
+        elif ch == '"': quoted = True
+        elif ch in '[{':
+            depth += 1
+            if depth > max_depth: raise ValueError('JSON nested too deeply')
+        elif ch in ']}':
+            depth -= 1
+            if depth < 0: raise ValueError('invalid JSON nesting')
+    try: return json.loads(text)
+    except RecursionError as exc: raise ValueError('JSON nested too deeply') from exc
+
+def configured_server_port():
+    content, _ = read_server_file('server.properties')
+    port = 25565
+    for line in content.splitlines():
+        line = line.strip()
+        if not line.startswith('server-port'): continue
+        match = re.fullmatch(r'server-port(?:\s*[=:]\s*|\s+)(\S*)', line)
+        if not match or not match.group(1).isascii() or not match.group(1).isdigit(): raise ValueError('invalid server port')
+        port = int(match.group(1))
+    if not 1 <= port <= 65535: raise ValueError('invalid server port')
+    return port
+
+def status_endpoint(proc=Path('/proc'), net=Path('/proc/net')):
+    port=configured_server_port()
+    text=read(PID)
+    if not text.isascii() or not text.isdigit() or int(text)<=1: raise ValueError('invalid server PID')
+    process=proc/text
+    if process.joinpath('comm').read_text().strip()!='java': raise ValueError('server process unavailable')
+    inodes=set()
+    with os.scandir(process/'fd') as entries:
+        for entry in entries:
+            try: target=os.readlink(entry.path)
+            except FileNotFoundError: continue
+            if target.startswith('socket:[') and target.endswith(']'): inodes.add(target[8:-1])
+    for name in ('tcp','tcp6'):
+        for line in (net/name).read_text().splitlines()[1:]:
+            fields=line.split()
+            if len(fields)<10: raise ValueError('invalid TCP table')
+            encoded,encoded_port=fields[1].rsplit(':',1)
+            if fields[3]!='0A' or int(encoded_port,16)!=port or fields[9] not in inodes: continue
+            if name=='tcp': address=ipaddress.IPv4Address(bytes.fromhex(encoded)[::-1])
+            else: address=ipaddress.IPv6Address(b''.join(bytes.fromhex(encoded[i:i+8])[::-1] for i in range(0,32,8)))
+            if name=='tcp' and (address.is_unspecified or address==ipaddress.IPv4Address('127.0.0.1')): return ('127.0.0.1',port)
+            if name=='tcp6' and (address.is_unspecified or address==ipaddress.IPv6Address('::1')): return ('::1',port)
+            if name=='tcp6' and address.ipv4_mapped==ipaddress.IPv4Address('127.0.0.1'): return ('127.0.0.1',port)
+    raise ValueError('server listener unavailable')
+
 def mc_status():
-    host = b'127.0.0.1'
-    handshake = vi(0) + vi(777) + vi(len(host)) + host + struct.pack('>H', 25565) + vi(1)
-    with socket.create_connection(('127.0.0.1', 25565), timeout=0.7) as s:
+    endpoint,port=status_endpoint()
+    host = endpoint.encode('ascii')
+    handshake = vi(0) + vi(777) + vi(len(host)) + host + struct.pack('>H', port) + vi(1)
+    with socket.create_connection((endpoint, port), timeout=0.7) as s:
         s.settimeout(0.7)
         s.sendall(vi(len(handshake)) + handshake + b'\x01\x00')
-        total = vi_from_sock(s)
+        deadline = time.monotonic() + 2.0
+        total = vi_from_sock(s, deadline)
         if total > 1024 * 1024: raise ValueError('status response too large')
         data = bytearray()
         while len(data) < total:
-            chunk = s.recv(total - len(data))
+            chunk = status_recv(s, total - len(data), deadline)
             if not chunk: raise EOFError('status response incomplete')
             data.extend(chunk)
     if not data or data[0] != 0: raise ValueError('invalid status response')
     p, size, shift = 1, 0, 0
     while True:
+        if p >= len(data): raise ValueError('truncated status length')
         b = data[p]; p += 1; size |= (b & 127) << shift
         if not b & 128: break
         shift += 7
         if shift > 28: raise ValueError('invalid status length')
     if size != len(data) - p: raise ValueError('invalid status length')
-    return json.loads(data[p:].decode('utf-8'))
+    return bounded_json(data[p:].decode('utf-8'))
+
+def online_count(data):
+    if not isinstance(data,dict) or not isinstance(data.get('players'),dict): raise ValueError('invalid player status')
+    count=data['players'].get('online')
+    if type(count) is not int or not 0<=count<=10000: raise ValueError('invalid player status')
+    return count
 
 def send_console(command):
     if '\n' in command or '\r' in command: raise AdminError('Invalid console command')
@@ -152,12 +259,14 @@ def stop_for_snapshot(require_idle=False):
             try: current = mc_status()
             except (OSError, ValueError, EOFError, IndexError) as exc:
                 raise AdminError('Cannot verify player count; automatic backup postponed') from exc
-            if current.get('players', {}).get('online') != 0:
+            try: count=online_count(current)
+            except ValueError as exc: raise AdminError('Cannot verify player count; automatic backup postponed') from exc
+            if count != 0:
                 raise AdminError('Players online; automatic backup postponed')
         STOP.touch(mode=0o600, exist_ok=True)
         try:
             # A second query narrows, but cannot eliminate, the player-join race.
-            if require_idle and mc_status().get('players', {}).get('online') != 0:
+            if require_idle and online_count(mc_status()) != 0:
                 raise AdminError('Player joined; automatic backup postponed')
             if was_running:
                 send_console('stop')
@@ -208,21 +317,44 @@ def refresh_cache():
     atomic(CACHE, json.dumps(items, separators=(',', ':')) + '\n')
     return items
 
+def open_world():
+    try:
+        return os.open(WORLD, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise AdminError('World directory is unavailable or unsafe') from exc
+
+def same_world(fd):
+    try:
+        current = WORLD.lstat()
+        pinned = os.fstat(fd)
+        return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino)
+    except OSError:
+        return False
+
 def world_signature():
     result = {}
-    if not WORLD.is_dir(): raise AdminError('World directory is unavailable')
-    for base, dirs, files in os.walk(WORLD, followlinks=False):
-        dirs.sort(); files.sort()
-        for name in files:
-            if name == 'session.lock': continue
-            path = Path(base) / name
-            try:
-                st = path.lstat()
-                result[str(path.relative_to(WORLD))] = [st.st_size, st.st_mtime_ns, stat.S_IFMT(st.st_mode)]
-            except FileNotFoundError:
-                raise AdminError('World changed during scan; backup postponed')
-    return result
-
+    fd = open_world()
+    def failed(exc):
+        raise AdminError('World changed during scan; backup postponed') from exc
+    try:
+        # fwalk checks directory identity before descending, preventing a
+        # game-controlled directory-to-symlink swap from redirecting a root scan.
+        for base, dirs, files, directory_fd in os.fwalk('.', dir_fd=fd, follow_symlinks=False, onerror=failed):
+            dirs.sort(); files.sort()
+            # Record directories and symlinks as well as files: otherwise a
+            # replaced directory link or a new empty directory is invisible.
+            for name in dirs + files:
+                if name == 'session.lock': continue
+                try:
+                    st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    result[str(Path(base) / name)] = [st.st_size, st.st_mtime_ns, stat.S_IFMT(st.st_mode),
+                                                           st.st_ctime_ns, st.st_mode, st.st_dev, st.st_ino]
+                except OSError as exc:
+                    raise AdminError('World changed during scan; backup postponed') from exc
+        if not same_world(fd): raise AdminError('World changed during scan; backup postponed')
+        return result
+    finally:
+        os.close(fd)
 def changed_files(before, after):
     return sum(1 for key in before.keys() | after.keys() if before.get(key) != after.get(key))
 
@@ -240,9 +372,14 @@ def clear_stage():
     if STAGE.exists() and not STAGE.is_symlink() and read(STAGE / '.n20-managed') == 'n20-backup-staging-v1':
         shutil.rmtree(STAGE)
 
+def valid_world_marker(source):
+    try: marker = (source / 'level.dat').lstat()
+    except OSError: return False
+    return stat.S_ISREG(marker.st_mode) and marker.st_size > 0
+
 def create_snapshot(tag, source=None, live=False):
     if source is None: source=WORLD
-    if not (source / 'level.dat').is_file(): raise AdminError('World level.dat is missing; snapshot aborted')
+    if not valid_world_marker(source): raise AdminError('World level.dat is invalid; snapshot aborted')
     if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; backup postponed')
     ensure_repo()
     if repo_size() >= MAX_REPO: raise AdminError('Backup repository reached 20 GiB; review retention')
@@ -253,6 +390,19 @@ def create_snapshot(tag, source=None, live=False):
     run_restic(args)
     return refresh_cache()
 
+def run_backup_copy(cmd, timeout=300):
+    # Terminate the entire private namespace's process group on timeout before
+    # the caller removes staging; rsync can have multiple child processes.
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True, cwd='/')
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except BaseException:
+        try: os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, process.returncode, out, err)
 def copy_quiescent_world():
     # A natural save notification can precede completion of queued disk writes.
     # Require a quiet interval and reject the copy if any source file changes.
@@ -271,13 +421,38 @@ def copy_quiescent_world():
         raise AdminError('Not enough free space for temporary backup copy')
     prepare_stage()
     set_operation('Copying saved files in background')
-    cmd=['/usr/bin/ionice','-c','3','/usr/bin/nice','-n','10','/usr/bin/rsync','-aS',
-         '--bwlimit=8192','--exclude=/session.lock',str(WORLD)+'/',str(STAGE_WORLD)+'/']
-    result=subprocess.run(cmd,capture_output=True,text=True,timeout=300)
-    if result.returncode: raise AdminError('World copy failed or changed during backup')
+    source_fd = open_world()
+    target_fd = None
+    mounts = None
+    try:
+        game = pwd.getpwnam('minecraft')
+        os.chown(STAGE_WORLD, game.pw_uid, game.pw_gid, follow_symlinks=False)
+        target_fd = os.open(STAGE_WORLD, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        mounts = Path(tempfile.mkdtemp(prefix='n20-backup-mount-', dir='/tmp'))
+        mounts.chmod(0o755)
+        (mounts / 'source').mkdir(mode=0o755)
+        (mounts / 'target').mkdir(mode=0o755)
+        # Bind both pinned directories only in a private namespace, then drop
+        # privileges before reading any world content or writing the copy.
+        cmd=['/usr/bin/ionice','-c','3','/usr/bin/nice','-n','10',
+             '/usr/bin/unshare','--mount','--propagation','private',
+             '/usr/bin/python3',COPY_HELPER,str(WORLD),str(STAGE_WORLD),str(mounts)]
+        source_stat, target_stat = os.fstat(source_fd), os.fstat(target_fd)
+        cmd.extend(map(str, (source_stat.st_dev, source_stat.st_ino, target_stat.st_dev, target_stat.st_ino)))
+        result=run_backup_copy(cmd)
+        if result.returncode or not same_world(source_fd):
+            raise AdminError('World copy failed or changed during backup')
+    finally:
+        if target_fd is not None: os.close(target_fd)
+        os.close(source_fd)
+        if mounts is not None:
+            for name in ('source','target'):
+                try: (mounts / name).rmdir()
+                except FileNotFoundError: pass
+            mounts.rmdir()
     after=world_signature()
     if current != after: raise AdminError('World files changed during copy; backup postponed')
-    if not (STAGE_WORLD / 'level.dat').is_file(): raise AdminError('Copied world is incomplete')
+    if not valid_world_marker(STAGE_WORLD): raise AdminError('Copied world is incomplete')
     return after
 
 def retention(allow_prune):
@@ -295,8 +470,8 @@ def retention(allow_prune):
 
 def backup(scheduled=False):
     lower_priority()
-    if HOLD.exists(): raise AdminError('Restore recovery is required; backup not started')
-    if LOW.exists(): raise AdminError('Battery low; backup postponed')
+    if restore_held(): raise AdminError('Restore recovery is required; backup not started')
+    if low_battery_held(): raise AdminError('Battery low; backup postponed')
     if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; backup postponed')
     started=time.monotonic()
     try:
@@ -309,39 +484,76 @@ def backup(scheduled=False):
         clear_stage()
     # Never force a player disconnect; defer expensive pruning until no players are online.
     try:
-        try: count=mc_status().get('players',{}).get('online') if pid_running() else 0
+        try: count=online_count(mc_status()) if pid_running() else 0
         except (OSError,ValueError,EOFError,IndexError): count=None
         retention(allow_prune=(count==0))
     except (AdminError,subprocess.TimeoutExpired) as exc: set_error('Snapshot saved; cleanup failed: '+str(exc))
 
+def secure_restore_area():
+    """Keep restore artifacts outside the game-writable server directory."""
+    parent = REPO.parent
+    area = parent / '.n20-restore'
+    try:
+        directory = parent.lstat()
+        world = WORLD.lstat()
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or directory.st_mode & 0o022:
+            raise AdminError('Backup directory is not root-controlled; restore aborted')
+        if not stat.S_ISDIR(world.st_mode) or directory.st_dev != world.st_dev:
+            raise AdminError('World and backup directory must be on the same filesystem; restore aborted')
+        area.mkdir(mode=0o700, exist_ok=True)
+        directory = area.lstat()
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or directory.st_mode & 0o077:
+            raise AdminError('Restore directory is not private; restore aborted')
+        if directory.st_dev != world.st_dev:
+            raise AdminError('Restore directory must be on the world filesystem; restore aborted')
+    except OSError as exc:
+        raise AdminError('Cannot validate restore directory; restore aborted') from exc
+    return area
+def validate_restored_world(stage, source):
+    # Snapshots are untrusted: never follow a restored symlink while checking
+    # the world path or its marker. The stage itself is root-private.
+    replacement = stage
+    for part in source.relative_to('/').parts:
+        replacement = replacement / part
+        try: info = replacement.lstat()
+        except OSError as exc: raise AdminError('Restored world path is invalid') from exc
+        if not stat.S_ISDIR(info.st_mode): raise AdminError('Restored world path is invalid')
+    if not valid_world_marker(replacement):
+        raise AdminError('Restored world failed validation; original retained')
+    return replacement
+
 def restore(snapshot_id):
     if not HEX.fullmatch(snapshot_id): raise AdminError('Invalid backup ID')
-    if HOLD.exists(): raise AdminError('An interrupted restore needs attention first')
-    if LOW.exists(): raise AdminError('Battery low; restore postponed until charging')
+    if restore_held(): raise AdminError('An interrupted restore needs attention first')
+    if low_battery_held(): raise AdminError('Battery low; restore postponed until charging')
     ensure_repo()
     entries = snapshots()
     matches = [s for s in entries if s.get('id', '').startswith(snapshot_id)]
     if len(matches) != 1: raise AdminError('Backup ID is missing or ambiguous')
     full_id = matches[0]['id']
     if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; restore aborted')
+    secure_hold_directory()
+    restore_area = secure_restore_area()
     set_operation('Stopping server for restore')
     was_running, had_stop = stop_for_snapshot()
     # Persist a hold before any world-directory mutations; init must honor it after power loss.
     atomic(HOLD, json.dumps({'snapshot': full_id, 'phase': 'preparing', 'created': time.time()}) + '\n')
     os.sync()
-    stage = Path(tempfile.mkdtemp(prefix='.n20-restore-', dir=ROOT))
-    old_world = ROOT / ('.world-before-' + dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3))
+    stage = Path(tempfile.mkdtemp(prefix='.n20-restore-', dir=restore_area))
+    old_world = restore_area / ('.world-before-' + dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3))
     moved = False
     try:
         set_operation('Saving pre-restore checkpoint')
-        create_snapshot('pre-restore')
+        try:
+            copy_quiescent_world()
+            create_snapshot('pre-restore', STAGE_WORLD)
+        finally:
+            clear_stage()
         set_operation('Preparing selected backup')
         run_restic(['restore', full_id, '--target', str(stage)])
         source_paths=[Path(x) for x in matches[0].get('paths',[]) if x in (str(WORLD),str(STAGE_WORLD))]
         if len(source_paths)!=1: raise AdminError('Backup world path is invalid')
-        replacement = stage / source_paths[0].relative_to('/')
-        if not (replacement / 'level.dat').is_file() or (replacement / 'level.dat').stat().st_size == 0:
-            raise AdminError('Restored world failed validation; original retained')
+        replacement = validate_restored_world(stage, source_paths[0])
         # Minecraft must own the restored world; restic restores recorded ownership.
         uid = WORLD.stat().st_uid; gid = WORLD.stat().st_gid
         for base, dirs, files in os.walk(replacement):
@@ -371,21 +583,39 @@ def restore(snapshot_id):
         raise
     # Keep the previous world directory and the pre-restore snapshot as rollback safeguards.
     finally:
-        if stage.exists() and not HOLD.exists(): shutil.rmtree(stage)
+        if stage.exists() and not restore_held(): shutil.rmtree(stage)
+
+def read_server_file(name, limit=1024*1024):
+    # The Minecraft account owns ROOT and can replace entries there. Never
+    # follow a game-controlled symlink or block on a FIFO when running as root.
+    fd = os.open(ROOT / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+            raise OSError('Invalid server file')
+        with os.fdopen(fd, 'rb') as f:
+            fd = -1
+            data = f.read(limit + 1)
+        if len(data) > limit: raise OSError('Server file too large')
+        return data.decode('utf-8'), info
+    finally:
+        if fd >= 0: os.close(fd)
 
 def props():
     out = {}
     try:
-        for line in (ROOT / 'server.properties').read_text(encoding='utf-8').splitlines():
+        content, _ = read_server_file('server.properties')
+        for line in content.splitlines():
             if line and not line.startswith(('#', '!')) and '=' in line:
                 k,v = line.split('=', 1); out[k.strip()] = v.strip()
-    except OSError: pass
+    except (OSError, UnicodeError): pass
     return out
 
 def set_property(key, value):
     file = ROOT / 'server.properties'
-    st = file.stat()
-    lines = file.read_text(encoding='utf-8').splitlines()
+    try: content, st = read_server_file('server.properties')
+    except (OSError, UnicodeError) as exc: raise AdminError('Cannot safely read server settings') from exc
+    lines = content.splitlines()
     found = False
     for i, line in enumerate(lines):
         if not line.startswith(('#', '!')) and '=' in line and line.split('=', 1)[0].strip() == key:
@@ -403,9 +633,11 @@ def set_property(key, value):
 
 def whitelist_entries():
     try:
-        data=json.loads((ROOT/'whitelist.json').read_text(encoding='utf-8'))
-        return [str(x['name']) for x in data if isinstance(x,dict) and NAME.fullmatch(str(x.get('name','')))]
-    except (OSError, ValueError, TypeError): return []
+        content, _ = read_server_file('whitelist.json')
+        data=bounded_json(content)
+        if not isinstance(data,list) or any(not isinstance(x,dict) or not isinstance(x.get('name'),str) or not NAME.fullmatch(x['name']) for x in data): return None
+        return [x['name'] for x in data]
+    except (OSError, ValueError, TypeError, UnicodeError, RecursionError): return None
 
 def mutate(command, value):
     if command in ('whitelist-add','whitelist-remove'):
@@ -415,8 +647,10 @@ def mutate(command, value):
         send_console('whitelist ' + verb + ' ' + value)
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:
-            present=any(x.lower()==value.lower() for x in whitelist_entries())
-            if present == (verb=='add'): return
+            entries=whitelist_entries()
+            if entries is not None:
+                present=any(x.lower()==value.lower() for x in entries)
+                if present == (verb=='add'): return
             time.sleep(0.5)
         raise AdminError('Whitelist change was not confirmed; check the server log')
     if command=='whitelist-set':
@@ -443,6 +677,13 @@ def mutate(command, value):
         return
     raise AdminError('Unknown command')
 
+def snapshot_time(value):
+    try:
+        stamp=dt.datetime.fromisoformat(value.replace('Z','+00:00'))
+        if stamp.tzinfo is None: return 'Time unavailable'
+        return stamp.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    except (ValueError,AttributeError): return 'Time unavailable'
+
 def make_state():
     directories(); p=props(); active=pid_running()
     pending=read(META/'settings-pending')
@@ -455,41 +696,56 @@ def make_state():
                 fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 OP.unlink(missing_ok=True); operation=''
             except BlockingIOError: pass
-    lines={'server':'offline','players':'0','player_count':'0','allow_count':'0','backup_count':'0',
-           'whitelist':'on' if p.get('white-list')=='true' else 'off',
+    lines={'server':'offline','players':'0','player_count':'0','allow_count':'0','backup_count':'-1',
+           'server_port':'-1','charge_stop':str(CHARGE_STOP),'charge_resume':str(CHARGE_RESUME),
+           'whitelist':{'true':'on','false':'off'}.get(p.get('white-list'),'unknown'),
            'difficulty':p.get('difficulty','unknown'),'max_players':p.get('max-players','?'),
            'view_distance':p.get('view-distance','?'),'simulation_distance':p.get('simulation-distance','?'),
            'settings_pending':'1' if pending else '0',
            'operation':operation, 'error':read(ERR), 'updated_unix':str(int(time.time()))}
-    if HOLD.exists(): lines['error']='Interrupted restore: server held for recovery'; lines['server']='recovery'
-    elif LOW.exists(): lines['error']='Battery low: waiting for charge'; lines['server']='offline'
-    elif not active and time.time()<1704067200:
-        lines['server']='starting'; lines['error']='Waiting for the PC to provide the time'
+    try: lines['server_port']=str(configured_server_port())
+    except (OSError, ValueError, UnicodeError): pass
+    if restore_held(): lines['error']='Interrupted restore: server held for recovery'; lines['server']='recovery'
+    elif low_battery_held(): lines['error']='Battery low: waiting for charge'; lines['server']='offline'
+    elif not active and (not (BUNDLE/'server.jar').is_file() or not (BUNDLE/'repo').is_dir()):
+        lines['server']='offline'; lines['error']='Server files unavailable: install protected bundle'
+    elif not active and not credible_clock(time.time()):
+        lines['server']='starting'; lines['error']='Clock invalid: set time using USB or SSH'
     elif active:
         try:
-            data=mc_status(); users=data.get('players',{}); lines['server']='online'
-            lines['players']=str(users.get('online',0))
-            names=[str(x.get('name','')) for x in users.get('sample',[]) if NAME.fullmatch(str(x.get('name','')))]
+            data=mc_status()
+            online=online_count(data); users=data['players']; sample=users.get('sample',[])
+            if not isinstance(sample,list): raise ValueError('invalid player status')
+            lines['server']='online'; lines['players']=str(online)
+            names=[str(x.get('name','')) for x in sample if isinstance(x,dict) and NAME.fullmatch(str(x.get('name','')))]
             try:
                 manager=json.loads(read(RUN/'players.json','{}'))
-                if manager.get('server_pid')==int(read(PID,'0')) and time.time()-float(manager.get('time',0))<90:
+                if isinstance(manager,dict) and isinstance(manager.get('players'),list) and manager.get('server_pid')==int(read(PID,'0')) and 0<=time.time()-float(manager.get('time',0))<90:
                     managed=[str(x) for x in manager.get('players',[]) if NAME.fullmatch(str(x))]
                     if len(managed)==int(lines['players']): names=managed
             except (ValueError,TypeError): pass
             lines['player_count']=str(len(names))
             for i,name in enumerate(names[:20]): lines[f'player_{i}']=name
         except (OSError, ValueError, EOFError, IndexError, json.JSONDecodeError): lines['server']='starting'
-    allowed=whitelist_entries()[:128]; lines['allow_count']=str(len(allowed))
+    allowed=whitelist_entries()
+    if allowed is None: lines['allow_count']='-1'; allowed=[]
+    else: allowed=allowed[:128]; lines['allow_count']=str(len(allowed))
     for i,name in enumerate(allowed): lines[f'allow_{i}']=name
     try:
-        items=json.loads(read(CACHE,'[]'))[:64]
+        items=json.loads(read(CACHE))
+        if not isinstance(items,list): raise ValueError('invalid backup index')
+        items=items[:64]
+        if any(not isinstance(item,dict) or not isinstance(item.get('id'),str) or not HEX.fullmatch(item['id']) or not isinstance(item.get('tags',[]),list) or any(not isinstance(tag,str) for tag in item.get('tags',[])) for item in items):
+            raise ValueError('invalid backup index')
         lines['backup_count']=str(len(items))
         for i,item in enumerate(items):
-            iso=item.get('time','')[:16].replace('T',' ')
+            iso=snapshot_time(item.get('time',''))
             tags=','.join(item.get('tags',[]))
-            lines[f'backup_{i}']=iso+' UTC '+tags
-            lines[f'backup_id_{i}']=item['id'][:12]
-    except (ValueError,KeyError,TypeError): lines['error']='Backup index unavailable'
+            lines[f'backup_{i}']=iso+' '+tags
+            lines[f'backup_id_{i}']=item['id']
+    except (ValueError,KeyError,TypeError,UnicodeError,RecursionError):
+        lines['backup_count']='-1'
+        if not lines['error']: lines['error']='Backup index unavailable'
     safe=[]
     for key,value in lines.items(): safe.append(key+'='+str(value).replace('\n',' ').replace('\r',' ')[:240])
     atomic(RUN/'state','\n'.join(safe)+'\n')
@@ -509,7 +765,7 @@ def scheduler(once=False):
     last_event_seen=0
     while True:
         try:
-            if time.time() > 1704067200 and not HOLD.exists() and not LOW.exists():
+            if time.time() > 1704067200 and not restore_held() and not low_battery_held():
                 try: event=json.loads(read(SAVE_EVENT,'{}')); event_time=float(event.get('time',0))
                 except (ValueError,TypeError): event={}; event_time=0
                 if (event_time > last_event_seen and -5 <= time.time()-event_time <= 120
@@ -523,7 +779,7 @@ def scheduler(once=False):
                     except (ValueError,TypeError): old={}
                     current=world_signature()
                     changes=changed_files(old,current)
-                    try: online=mc_status().get('players',{}).get('online')
+                    try: online=online_count(mc_status())
                     except (OSError,ValueError,EOFError,IndexError): online=None
                     # At least 8 changed files signals heavier write activity.
                     interval=BUSY_INTERVAL if changes>=8 else NORMAL_INTERVAL
@@ -536,7 +792,8 @@ def scheduler(once=False):
         time.sleep(20)
 
 def low_battery_pause():
-    if HOLD.exists() or LOW.exists() or not pid_running() or STOP.exists(): return
+    if restore_held() or low_battery_held() or not pid_running() or STOP.exists(): return
+    secure_hold_directory()
     set_operation('Saving world: low battery')
     atomic(LOW, json.dumps({'reason':'battery-low','time':time.time()})+'\n')
     os.sync()
@@ -552,11 +809,37 @@ def low_battery_pause():
         raise
 
 def low_battery_resume():
-    if not LOW.exists() or HOLD.exists(): return
+    if not low_battery_held() or restore_held(): return
     set_operation('Battery charged; starting server')
-    LOW.unlink()
+    LOW.unlink(missing_ok=True)
+    LEGACY_LOW.unlink(missing_ok=True)
     STOP.unlink(missing_ok=True)
     os.sync()
+
+def low_battery_sample(status,capacity):
+    # The device can report "Not charging" while operating on its battery.
+    return status in ('discharging','not charging') and 0<=capacity<=8
+
+def external_power(usb, ac):
+    if '1' in (usb, ac): return '1'
+    if usb == '0' and ac == '0': return '0'
+    return 'unknown'
+
+def apply_charge_limit(capacity, online):
+    """Control the tested N20 charger with hysteresis; fail open on bad readings."""
+    if not CHARGE_SWITCH.exists(): return
+    current = read(CHARGE_SWITCH)
+    if current not in ('0','1'): raise AdminError('Charge control state unavailable')
+    if online != '1' or not 0 <= capacity <= 100 or capacity <= CHARGE_RESUME:
+        wanted = '1'
+    elif capacity >= CHARGE_STOP:
+        wanted = '0'
+    else:
+        wanted = current
+    if current != wanted:
+        CHARGE_SWITCH.write_text(wanted + '\n', encoding='ascii')
+        if read(CHARGE_SWITCH) != wanted:
+            raise AdminError('Charge control did not accept setting')
 
 def powerguard():
     directories(); low_samples=0
@@ -565,12 +848,13 @@ def powerguard():
             status=read(Path('/sys/class/power_supply/battery/status'),'unknown').lower()
             try: capacity=int(read(Path('/sys/class/power_supply/battery/capacity'),'-1'))
             except ValueError: capacity=-1
-            low_samples = low_samples + 1 if status=='discharging' and 0<=capacity<=8 else 0
-            if low_samples>=3 and not LOW.exists():
+            apply_charge_limit(capacity,external_power(read(USB_ONLINE),read(AC_ONLINE)))
+            low_samples = low_samples + 1 if low_battery_sample(status,capacity) else 0
+            if low_samples>=3 and not low_battery_held():
                 try: locked(low_battery_pause)
                 except AdminError as exc:
                     if 'in progress' not in str(exc): set_error(exc)
-            if LOW.exists() and status in ('charging','full') and capacity>=10:
+            if low_battery_held() and status in ('charging','full') and capacity>=10:
                 try: locked(low_battery_resume)
                 except AdminError as exc:
                     if 'in progress' not in str(exc): set_error(exc)

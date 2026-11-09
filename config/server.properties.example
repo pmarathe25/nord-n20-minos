@@ -2,9 +2,12 @@
 server-ip=
 server-port=25565
 online-mode=true
+white-list=true
+enforce-whitelist=true
 enable-rcon=false
 view-distance=6
 simulation-distance=4
+pause-when-empty-seconds=60
 management-server-enabled=true
 management-server-host=127.0.0.1
 management-server-port=25585

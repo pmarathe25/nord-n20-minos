@@ -1,0 +1,49 @@
+#!/bin/sh
+# Re-enumerate MTP after a world-directory replacement. The live world is
+# never modified here; while it is absent, leave USB networking available.
+set -u
+mode=${1:-restart}
+case "$mode" in restart|--disconnect-only) ;; *) echo 'Invalid MTP refresh mode'; exit 2 ;; esac
+g=/proc/1/root/sys/kernel/config/usb_gadget/n20
+udc=4e00000.dwc3
+B=/usr/local/bin/busybox
+restore_usb_network() {
+  i=0
+  while [ ! -e /sys/class/net/usb0 ]; do i=$((i+1)); [ "$i" -lt 10 ] || return 1; sleep 1; done
+  $B ip link set usb0 up
+  $B ip addr add 192.168.137.2/24 dev usb0 2>/dev/null || :
+  $B ip addr add 169.254.77.2/16 dev usb0 2>/dev/null || :
+  $B ip route add default via 192.168.137.1 dev usb0 metric 100 2>/dev/null || :
+}
+# If interrupted while the gadget is unbound, prefer recovering the original
+# USB network without MTP over leaving the device disconnected.
+(
+  sleep 35
+  if [ -z "$(cat "$g/UDC")" ]; then
+    rm -f "$g/configs/c.1/ffs.mtp"
+    printf '%s' "$udc" > "$g/UDC" || :
+    restore_usb_network || :
+  fi
+) </dev/null >/dev/null 2>&1 &
+watchdog=$!
+if ! { printf '\n' > "$g/UDC"; } 2>/dev/null; then
+  [ -z "$(cat "$g/UDC")" ] || { echo 'MTP refresh could not unbind USB'; exit 1; }
+fi
+rm -f "$g/configs/c.1/ffs.mtp"
+unmounted=1
+if grep -q ' /dev/ffs-mtp ' /proc/mounts && ! umount /dev/ffs-mtp; then unmounted=0; fi
+if ! { printf '%s' "$udc" > "$g/UDC"; } 2>/dev/null && [ "$(cat "$g/UDC")" != "$udc" ]; then
+  echo 'MTP refresh could not restore USB; watchdog will retry'
+  exit 1
+fi
+restore_usb_network || :
+kill "$watchdog" 2>/dev/null || :
+[ "$unmounted" -eq 1 ] || { echo 'MTP refresh could not reset FunctionFS'; exit 1; }
+[ "$mode" = restart ] || { echo 'MTP stopped; USB network preserved'; exit 0; }
+i=0
+while [ ! -d /srv/minecraft/world ] || [ -L /srv/minecraft/world ]; do
+  i=$((i+1)); [ "$i" -lt 60 ] || { echo 'MTP refresh: safe world unavailable'; exit 1; }
+  sleep 1
+done
+echo 'Reconnecting MTP after world replacement'
+exec /usr/local/sbin/n20-mtp-start

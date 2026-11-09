@@ -42,6 +42,8 @@
 static const char *input_buf;
 static int input_pos;
 static int input_len;
+static int input_can_unput;
+static unsigned int parse_depth;
 
 static int json_parse_array(struct json_value *array);
 static int json_parse_object(struct json_value *object);
@@ -49,15 +51,20 @@ static int json_parse_property(struct json_value *value);
 
 static int input(void)
 {
-	if (input_pos >= input_len)
+	if (input_pos >= input_len) {
+		input_can_unput = 0;
 		return 0;
+	}
 
-	return input_buf[input_pos++];
+	input_can_unput = 1;
+	return (unsigned char)input_buf[input_pos++];
 }
 
 static void unput(void)
 {
-	input_pos--;
+	if (input_can_unput && input_pos > 0)
+		input_pos--;
+	input_can_unput = 0;
 }
 
 static void json_skip_whitespace(void)
@@ -81,15 +88,20 @@ static int json_parse_string(struct json_value *value)
 		return 0;
 	}
 
-	while ((ch = input()) && ch != '"' && b - buf < sizeof(buf) - 1)
+	while ((ch = input()) && ch != '"') {
+		if ((size_t)(b - buf) >= sizeof(buf) - 1)
+			return -1;
 		*b++ = ch;
+	}
 	*b = '\0';
 
-	if (!ch)
+	if (ch != '"')
 		return -1;
 
 	value->type = JSON_TYPE_STRING;
 	value->u.string = strdup(buf);
+	if (!value->u.string)
+		return -1;
 
 	return 1;
 }
@@ -151,6 +163,9 @@ static int json_parse_value(struct json_value *value)
 {
 	int ret;
 
+	if (parse_depth >= 64)
+		return -1;
+	parse_depth++;
 	json_skip_whitespace();
 
 	ret = json_parse_object(value);
@@ -174,10 +189,11 @@ static int json_parse_value(struct json_value *value)
 		goto out;
 
 	fprintf(stderr, "unable to match a value\n");
-	return -1;
+	ret = -1;
 
 out:
 	json_skip_whitespace();
+	parse_depth--;
 	return ret;
 }
 
@@ -202,7 +218,7 @@ static int json_parse_array(struct json_value *array)
 
 		ret = json_parse_value(value);
 		if (ret <= 0) {
-			free(value);
+			json_free(value);
 			return -1;
 		}
 
@@ -246,7 +262,7 @@ static int json_parse_object(struct json_value *object)
 
 		ret = json_parse_property(value);
 		if (ret <= 0) {
-			free(value);
+			json_free(value);
 			return -1;
 		}
 
@@ -299,6 +315,8 @@ struct json_value *json_parse(const char *json)
 
 	input_buf = json;
 	input_pos = 0;
+	input_can_unput = 0;
+	parse_depth = 0;
 	input_len = strlen(input_buf);
 
 	root = calloc(1, sizeof(*root));
@@ -306,8 +324,8 @@ struct json_value *json_parse(const char *json)
 		return NULL;
 
 	ret = json_parse_value(root);
-	if (ret != 1) {
-		free(root);
+	if (ret != 1 || input_pos != input_len) {
+		json_free(root);
 		return NULL;
 	}
 
@@ -316,10 +334,13 @@ struct json_value *json_parse(const char *json)
 
 struct json_value *json_parse_file(const char *file)
 {
-	struct json_value *root;
+	struct json_value *root = NULL;
 	struct stat sb;
 	int ret;
 	int fd;
+	char *buffer = NULL;
+	size_t used = 0;
+	ssize_t n;
 
 	fd = open(file, O_RDONLY);
 	if (fd < 0) {
@@ -328,32 +349,39 @@ struct json_value *json_parse_file(const char *file)
 	}
 
 	ret = fstat(fd, &sb);
-	if (ret < 0)
-		return NULL;
+	if (ret < 0 || sb.st_size <= 0 || sb.st_size > 1024 * 1024)
+		goto out;
 
 	input_pos = 0;
+	input_can_unput = 0;
+	parse_depth = 0;
 	input_len = sb.st_size;
-	input_buf = malloc(sb.st_size);
-
-	ret = read(fd, (char *)input_buf, input_len);
-
-	close(fd);
-
-	if (ret != input_len) {
-		fprintf(stderr, "failed to read %d bytes form %s\n", input_len, file);
-		return NULL;
+	buffer = malloc((size_t)input_len);
+	if (!buffer)
+		goto out;
+	while (used < (size_t)input_len) {
+		n = read(fd, buffer + used, (size_t)input_len - used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out;
+		used += (size_t)n;
 	}
+	input_buf = buffer;
 
 	root = calloc(1, sizeof(*root));
 	if (!root)
-		return NULL;
+		goto out;
 
 	ret = json_parse_value(root);
-	if (ret != 1) {
+	if (ret != 1 || input_pos != input_len) {
 		json_free(root);
-		return NULL;
+		root = NULL;
 	}
-
+out:
+	close(fd);
+	free(buffer);
+	input_buf = NULL;
 	return root;
 }
 
@@ -361,7 +389,7 @@ struct json_value *json_get_child(struct json_value *object, const char *key)
 {
 	struct json_value *it;
 
-	if(object->type != JSON_TYPE_OBJECT)
+	if (!object || object->type != JSON_TYPE_OBJECT)
 		return NULL;
 
 	for (it = object->u.value; it; it = it->next) {

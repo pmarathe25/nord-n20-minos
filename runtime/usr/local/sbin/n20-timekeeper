@@ -1,16 +1,105 @@
 #!/bin/sh
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 B=/usr/local/bin/busybox
-while :; do
-    now=$($B wget -T 2 -qO - http://192.168.137.1:18888/time 2>/dev/null || true)
-    case "$now" in
-      ''|*[!0-9]*)
-        if [ -d /sys/class/net/wlan0 ] && $B ip addr show wlan0 | grep -q 'inet '; then
-          $B timeout 20 $B ntpd -n -q -p time.cloudflare.com -p time.google.com >/dev/null 2>&1 || :
+CHRONYD=/usr/sbin/chronyd
+NORMAL=/etc/n20-chrony.conf
+WLAN=/sys/class/net/wlan0
+FLOOR=/var/lib/n20/trusted-time
+
+# Test-only overrides allow exercising policy without setting the host clock.
+# The service never passes this argument and ignores the overrides otherwise.
+if [ "$#" -eq 1 ] && [ "${1:-}" = --test-once ]; then
+    B=${N20_TEST_BUSYBOX:?}; CHRONYD=${N20_TEST_CHRONYD:?}
+    NORMAL=${N20_TEST_NORMAL:?}
+    WLAN=${N20_TEST_WLAN:?}
+    FLOOR=${N20_TEST_FLOOR:?}
+elif [ "$#" -ne 0 ] && { [ "$#" -ne 1 ] || [ "${1:-}" != --once ]; }; then
+    echo 'Invalid timekeeper argument' >&2; exit 2
+fi
+
+credible_time() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1704067200 ] 2>/dev/null && [ "$1" -le 4102444800 ] 2>/dev/null
+}
+trusted_clock() {
+    credible_time "$1" || return 1
+    floor=
+    if [ -r "$FLOOR" ]; then IFS= read -r floor < "$FLOOR" || :; fi
+    if credible_time "$floor" && [ "$1" -lt "$((floor-86400))" ]; then return 1; fi
+    return 0
+}
+record_trusted_time() {
+    stamp=$($B date -u +%s 2>/dev/null || true)
+    trusted_clock "$stamp" || return 1
+    floor=
+    if [ -r "$FLOOR" ]; then IFS= read -r floor < "$FLOOR" || :; fi
+    if credible_time "$floor" && [ "$stamp" -le "$floor" ]; then return 0; fi
+    dir=${FLOOR%/*}
+    [ -d "$dir" ] || mkdir -m 700 -p "$dir" || return 1
+    tmp=$($B mktemp "$dir/.trusted-time.XXXXXX") || return 1
+    if ! (umask 077; printf '%s\n' "$stamp" > "$tmp") || ! $B sync "$tmp" || ! mv -f "$tmp" "$FLOOR"; then
+        rm -f "$tmp"; return 1
+    fi
+    $B sync "$dir"
+}
+usb_time() {
+    $B ip route get "$1" 2>/dev/null | grep -Eq '(^| )dev usb0( |$)' || return 1
+    $B wget -T 2 -qO - "http://$1:18888/time" 2>/dev/null
+}
+sync_once() {
+    now=$($B date -u +%s 2>/dev/null || true)
+    usb_synced=0
+    sync_source=
+    # Retain the physical USB recovery path after clock loss. USB serial
+    # already grants root access on this installation; do not accept this
+    # unauthenticated time when a credible clock is already available.
+    if ! trusted_clock "$now"; then
+        for host in 192.168.137.1 169.254.187.170; do
+            candidate=$(usb_time "$host" || true)
+            clock=$($B date -u +%s 2>/dev/null || true)
+            if trusted_clock "$clock"; then now=$clock; break; fi
+            if trusted_clock "$candidate" && $B date -u -s "@$candidate" >/dev/null 2>&1; then
+                now=$candidate; usb_synced=1; sync_source='USB recovery'
+                break
+            fi
+        done
+    fi
+    if [ -d "$WLAN" ] && $B ip addr show wlan0 2>/dev/null | grep -q 'inet ' && [ -x "$CHRONYD" ]; then
+        # Always validate certificate dates, even when the clock is invalid.
+        # USB recovery remains available if NTS cannot validate the server.
+        if $B timeout 45 "$CHRONYD" -q -u root -t 40 -f "$NORMAL" >/dev/null 2>&1; then
+            # A successful correction must not leave the clock outside the
+            # accepted range or below the persisted trusted-time floor.
+            corrected=$($B date -u +%s 2>/dev/null || true)
+            if ! trusted_clock "$corrected"; then
+                # The floor is only a lower bound, not a current timestamp.
+                # Restoring it after clock loss would make an old date appear
+                # credible and could let the server start without recovery.
+                previous=$now
+                case "$previous" in ''|*[!0-9]*) previous=0 ;; esac
+                $B date -u -s "@$previous" >/dev/null 2>&1 || echo 'Could not restore previous clock' >&2
+                echo 'Rejected time correction outside trusted bounds' >&2
+                return 1
+            fi
+            record_trusted_time || { echo 'Could not persist trusted time floor' >&2; return 1; }
+            sync_source=NTS
+            return 0
         fi
-        sleep 30 ;;
-      *) if [ "$now" -gt 1704067200 ] 2>/dev/null; then
-           $B date -u -s "@$now" >/dev/null 2>&1 || :; sleep 1800
-         else sleep 10; fi ;;
-    esac
+    fi
+    [ "$usb_synced" -eq 0 ] || return 0
+    return 1
+}
+
+if [ "${1:-}" = --test-once ] || [ "${1:-}" = --once ]; then sync_once; exit $?; fi
+last_result=
+while :; do
+    if sync_once; then
+        if [ "$last_result" != "$sync_source" ]; then echo "Time synchronized using $sync_source"; fi
+        last_result=$sync_source; sleep 1800
+    else
+        if [ "$last_result" != unavailable ]; then echo 'Authenticated time unavailable; retrying'; fi
+        last_result=unavailable
+        now=$($B date -u +%s 2>/dev/null || true)
+        if trusted_clock "$now"; then sleep 300; else sleep 30; fi
+    fi
 done

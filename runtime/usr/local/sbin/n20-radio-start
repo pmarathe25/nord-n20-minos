@@ -42,8 +42,12 @@ sleep 2
 kill -0 "$rpid"; kill -0 "$ppid"; kill -0 "$tpid"
 dev=$(cat /sys/class/subsys/subsys_modem/dev)
 [ -c /dev/subsys_modem ] || mknod -m 600 /dev/subsys_modem c "${dev%:*}" "${dev#*:}"
-python3 -c 'import os,time; fd=os.open("/dev/subsys_modem",os.O_RDONLY); time.sleep(315360000)' >"$base/modem.log" 2>&1 &
+# Keep the subsystem reference open without a resident Python interpreter.
+# File descriptor 9 survives exec and is closed when the holder exits.
+(exec 9</dev/subsys_modem; exec /usr/local/bin/busybox sleep 315360000) >"$base/modem.log" 2>&1 &
+mpid=$!
 sleep 3
+kill -0 "$mpid"
 env LD_LIBRARY_PATH="$tools/android" LD_PRELOAD="$tools/android/libn20-pm-stub.so" "$tools/android/linker64" "$tools/android/cnss-daemon" -n -d >"$base/cnss.log" 2>&1 &
 i=0
 while ! grep -q fwstatus_ready /sys/bus/platform/drivers/icnss2/firmware_ready 2>/dev/null; do

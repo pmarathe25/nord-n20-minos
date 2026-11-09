@@ -2,6 +2,12 @@ Port 22
 ListenAddress 0.0.0.0
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
+AuthenticationMethods publickey
+AllowUsers root
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 30
+MaxStartups 10:30:60
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM yes

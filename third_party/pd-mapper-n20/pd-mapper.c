@@ -54,14 +54,32 @@ struct pd_map {
 
 static struct pd_map *pd_maps;
 
+static int populate_domain_list(struct servreg_loc_get_domain_list_resp *resp,
+				const char *name, const struct pd_map *map)
+{
+	for (; map->service; map++) {
+		struct servreg_loc_domain_list_entry *entry;
+		size_t len;
+		if (strcmp(map->service, name))
+			continue;
+		len = strlen(map->domain);
+		if (resp->domain_list_len >= sizeof(resp->domain_list) / sizeof(resp->domain_list[0]) ||
+		    len >= sizeof(resp->domain_list[0].name))
+			return -1;
+		entry = &resp->domain_list[resp->domain_list_len++];
+		memcpy(entry->name, map->domain, len + 1);
+		entry->name_len = len;
+		entry->instance_id = map->instance;
+	}
+	return 0;
+}
+
 static void handle_get_domain_list(int sock, const struct qrtr_packet *pkt)
 {
 	struct servreg_loc_get_domain_list_resp resp = {};
 	struct servreg_loc_get_domain_list_req req = {};
-	struct servreg_loc_domain_list_entry *entry;
 	DEFINE_QRTR_PACKET(resp_buf, 256);
-	const struct pd_map *pd_map = pd_maps;
-	unsigned int txn;
+	unsigned int txn = 0;
 	ssize_t len;
 	int ret;
 
@@ -80,16 +98,11 @@ static void handle_get_domain_list(int sock, const struct qrtr_packet *pkt)
 	resp.db_revision_valid = 1;
 	resp.db_revision = 1;
 
-	while (pd_map->service) {
-		if (!strcmp(pd_map->service, req.name)) {
-			entry = &resp.domain_list[resp.domain_list_len++];
-
-			strcpy(entry->name, pd_map->domain);
-			entry->name_len = strlen(pd_map->domain);
-			entry->instance_id = pd_map->instance;
-		}
-
-		pd_map++;
+	if (populate_domain_list(&resp, req.name, pd_maps) < 0) {
+		memset(&resp, 0, sizeof(resp));
+		resp.result.result = QMI_RESULT_FAILURE;
+		resp.result.error = QMI_ERR_INTERNAL;
+		goto respond;
 	}
 
 	if (resp.domain_list_len)
@@ -146,23 +159,24 @@ static int pd_load_map(const char *file)
 	domain = json_get_string(sr_domain, "domain");
 	subdomain = json_get_string(sr_domain, "subdomain");
 	ret = json_get_number(sr_domain, "qmi_instance_id", &number);
-	if (ret)
-		return ret;
+	if (ret || number < 0 || number > INT_MAX || (double)(int)number != number)
+		goto fail;
 
 	if (!soc || !domain || !subdomain) {
 		fprintf(stderr, "failed to parse sr_domain\n");
-		return -1;
+		goto fail;
 	}
 
 	sr_service = json_get_child(root, "sr_service");
 	count = json_count_children(sr_service);
-	if (count < 0)
-		return count;
+	if (count < 0 || count > INT_MAX - num_pd_maps - 1)
+		goto fail;
 
 	newp = realloc(pd_maps, (num_pd_maps + count + 1) * sizeof(*newp));
 	if (!newp)
-		return -1;
+		goto fail;
 	pd_maps = newp;
+	pd_maps[num_pd_maps].service = NULL;
 
 	for (it = sr_service->u.value; it; it = it->next) {
 		provider = json_get_string(it, "provider");
@@ -172,18 +186,24 @@ static int pd_load_map(const char *file)
 			fprintf(stderr,
 				"failed to parse provdider or service from %s\n",
 				file);
-			return -1;
+			goto fail;
 		}
 
-		map = &pd_maps[num_pd_maps++];
+		map = &pd_maps[num_pd_maps];
 
 		map->service = malloc(strlen(provider) + strlen(service) + 2);
-		sprintf((char *)map->service, "%s/%s", provider, service);
-
 		map->domain = malloc(strlen(soc) + strlen(domain) + strlen(subdomain) + 3);
+		if (!map->service || !map->domain) {
+			free((void *)map->service);
+			free((void *)map->domain);
+			goto fail;
+		}
+		sprintf((char *)map->service, "%s/%s", provider, service);
 		sprintf((char *)map->domain, "%s/%s/%s", soc, domain, subdomain);
 
-		map->instance = number;
+		map->instance = (int)number;
+		num_pd_maps++;
+		pd_maps[num_pd_maps].service = NULL;
 	}
 
 	pd_maps[num_pd_maps].service = NULL;
@@ -191,9 +211,24 @@ static int pd_load_map(const char *file)
 	json_free(root);
 
 	return 0;
+fail:
+	json_free(root);
+	return -1;
 }
 
 #define FIRMWARE_BASE	"/lib/firmware/"
+
+static int read_firmware_value(int fd, char *value, size_t size)
+{
+	ssize_t n;
+	if (size < 2)
+		return -1;
+	n = read(fd, value, size - 1);
+	if (n <= 0 || (size_t)n == size - 1)
+		return -1;
+	value[n] = '\0';
+	return 0;
+}
 
 static int pd_enumerate_jsons(struct assoc *json_set)
 {
@@ -208,7 +243,7 @@ static int pd_enumerate_jsons(struct assoc *json_set)
 	int class_fd;
 	DIR *fw_dir;
 	size_t len;
-	size_t n;
+	int read_result;
 
 	class_fd = open("/sys/class/remoteproc", O_RDONLY | O_DIRECTORY);
 	if (class_fd < 0) {
@@ -236,13 +271,11 @@ static int pd_enumerate_jsons(struct assoc *json_set)
 		if (firmware_fd < 0)
 			continue;
 
-		n = read(firmware_fd, firmware_value, sizeof(firmware_value));
+		read_result = read_firmware_value(firmware_fd, firmware_value, sizeof(firmware_value));
 		close(firmware_fd);
-		if (n < 0) {
+		if (read_result < 0) {
 			continue;
 		}
-
-		firmware_value[n] = '\0';
 
 		if (strlen(FIRMWARE_BASE) + strlen(firmware_value) + 1 > sizeof(path))
 			continue;
@@ -251,6 +284,8 @@ static int pd_enumerate_jsons(struct assoc *json_set)
 		strcat(path, dirname(firmware_value));
 
 		fw_dir = opendir(path);
+		if (!fw_dir)
+			continue;
 		while ((fw_de = readdir(fw_dir)) != NULL) {
 			if (!strcmp(fw_de->d_name, ".") || !strcmp(fw_de->d_name, ".."))
 				continue;
@@ -300,7 +335,7 @@ static int pd_load_maps(void)
 		if (!fw_dir)
 			return -1;
 		while ((de = readdir(fw_dir)) != NULL) {
-			char path[PATH_MAX];
+			char path[PATH_MAX] = {0};
 			size_t len = strlen(de->d_name);
 			if (len < 5 || strcmp(de->d_name + len - 4, ".jsn"))
 				continue;
