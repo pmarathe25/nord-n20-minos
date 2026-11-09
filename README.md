@@ -22,11 +22,13 @@ The working phone at capture time had Wi-Fi `10.0.0.160`; its dashboard displays
 ssh -i .\local\secrets\n20_usb_key root@<phone-ip>
 ```
 
-The example server configuration enables the whitelist and enforces it; add trusted Minecraft usernames before enabling it on an existing server. The supervisor requires the server executable and bundled libraries in root-controlled `/opt/n20-minecraft/current`; see [device notes](docs/device.md) before upgrading an existing installation. The dashboard's Tools > Wi-Fi page scans and connects to open and WPA2-PSK networks. The power button turns the display off or on. The dashboard powers the panel down when idle and wakes it with the power button; touch wake remains available as a fallback if panel power-down fails. After wake, inputs are ignored for 150 ms. Wi-Fi power saving is enabled when Minecraft has no TCP clients and disabled shortly after a connection appears; the first connection can have extra latency. The repository configures USB MTP to expose `/srv/minecraft/world` read-only as Minecraft World, rather than exposing server settings and backup files. Existing installations need the updated MTP configuration and a service restart for that restriction to take effect. Stop Minecraft before copying the live world for a consistent copy. The local Restic history also requires its separate password; neither it nor that password is included here. Direct Google Drive backups are not yet implemented.
+The example server configuration enables the whitelist and enforces it; add trusted Minecraft usernames before enabling it on an existing server. The supervisor requires the server executable and bundled libraries in root-controlled `/opt/n20-minecraft/current`; see [device notes](docs/device.md) before upgrading an existing installation. The dashboard's Phone > Wi-Fi page scans and connects to open and WPA2-PSK networks. The power button turns the display off or on. The dashboard powers the panel down when idle and wakes it with the power button; touch wake remains available as a fallback if panel power-down fails. After wake, inputs are ignored for 150 ms. Wi-Fi power saving is enabled when Minecraft has no TCP clients and disabled shortly after a connection appears; the first connection can have extra latency. The repository configures USB MTP to expose `/srv/minecraft/world` read-only as Minecraft World, rather than exposing server settings and backup files. Existing installations need the updated MTP configuration and a service restart for that restriction to take effect. Stop Minecraft before copying the live world for a consistent copy. The local Restic history also requires its separate password; neither it nor that password is included here. Direct Google Drive backups are not yet implemented.
 
-The dashboard groups server and device controls under separate Settings pages.
-Home contains server start, stop, and restart; Players manages access; Tools
-contains backups, Wi-Fi, and the server log.
+The dashboard has three tabs: **Server**, **World**, and **Phone**. Server
+contains status, the join address, start/stop/restart, players, game settings,
+and activity. World opens directly to local backups and restore. Phone groups
+Wi-Fi, charging status, brightness, and screen sleep. See the
+[UI inventory and navigation](docs/ui.md) for the design and headless previews.
 
 ## Develop
 

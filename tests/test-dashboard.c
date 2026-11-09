@@ -1,7 +1,11 @@
 /* Headless checks: compile on the target with the dashboard's libraries. */
+#define _GNU_SOURCE
+#include "dashboard-fixtures.h"
+#define fopen fixture_fopen
 #define main dashboard_main
 #include "../dashboard/n20-dashboard.c"
 #undef main
+#undef fopen
 #include <assert.h>
 
 static void event_write(int fd,unsigned type,unsigned code,int value){
@@ -15,29 +19,29 @@ static void tap(int fd,int x,int y){
 static void check_input(void){
     int p[2];assert(pipe(p)==0);assert(fcntl(p[0],F_SETFL,O_NONBLOCK)==0);
     keyboard_open=1;typed_name[0]=0;awake=1;input_block_until=0;draw();
-    tap(p[1],60,680);tap(p[1],60,680);events(p[0],0);assert(!strcmp(typed_name,"11"));
-    event_write(p[1],EV_ABS,ABS_MT_POSITION_X,60);event_write(p[1],EV_ABS,ABS_MT_POSITION_Y,680);
+    tap(p[1],60,1050);tap(p[1],60,1050);events(p[0],0);assert(!strcmp(typed_name,"11"));
+    event_write(p[1],EV_ABS,ABS_MT_POSITION_X,60);event_write(p[1],EV_ABS,ABS_MT_POSITION_Y,1050);
     event_write(p[1],EV_KEY,BTN_TOUCH,1);event_write(p[1],EV_SYN,SYN_REPORT,0);
     event_write(p[1],EV_ABS,ABS_MT_POSITION_X,220);event_write(p[1],EV_SYN,SYN_REPORT,0);
     event_write(p[1],EV_KEY,BTN_TOUCH,0);event_write(p[1],EV_SYN,SYN_REPORT,0);events(p[0],0);
     assert(!strcmp(typed_name,"11"));
     /* A second contact cancels the first tap rather than moving its target. */
     event_write(p[1],EV_ABS,ABS_MT_SLOT,0);event_write(p[1],EV_ABS,ABS_MT_TRACKING_ID,101);
-    event_write(p[1],EV_ABS,ABS_MT_POSITION_X,60);event_write(p[1],EV_ABS,ABS_MT_POSITION_Y,680);
+    event_write(p[1],EV_ABS,ABS_MT_POSITION_X,60);event_write(p[1],EV_ABS,ABS_MT_POSITION_Y,1050);
     event_write(p[1],EV_KEY,BTN_TOUCH,1);event_write(p[1],EV_SYN,SYN_REPORT,0);
     event_write(p[1],EV_ABS,ABS_MT_SLOT,1);event_write(p[1],EV_ABS,ABS_MT_TRACKING_ID,102);
     event_write(p[1],EV_ABS,ABS_MT_POSITION_X,220);event_write(p[1],EV_SYN,SYN_REPORT,0);
     event_write(p[1],EV_ABS,ABS_MT_TRACKING_ID,-1);event_write(p[1],EV_ABS,ABS_MT_SLOT,0);
     event_write(p[1],EV_ABS,ABS_MT_TRACKING_ID,-1);event_write(p[1],EV_KEY,BTN_TOUCH,0);event_write(p[1],EV_SYN,SYN_REPORT,0);
     events(p[0],0);assert(!strcmp(typed_name,"11"));
-    tap(p[1],60,680);events(p[0],0);assert(!strcmp(typed_name,"111"));
+    tap(p[1],60,1050);events(p[0],0);assert(!strcmp(typed_name,"111"));
     /* Lost input cancels a press and requires release before accepting more. */
     event_write(p[1],EV_KEY,BTN_TOUCH,1);event_write(p[1],EV_SYN,SYN_REPORT,0);
     event_write(p[1],EV_SYN,SYN_DROPPED,0);event_write(p[1],EV_SYN,SYN_REPORT,0);
     event_write(p[1],EV_KEY,BTN_TOUCH,0);event_write(p[1],EV_SYN,SYN_REPORT,0);events(p[0],0);assert(!strcmp(typed_name,"111"));
-    tap(p[1],60,680);events(p[0],0);assert(!strcmp(typed_name,"1111"));
+    tap(p[1],60,1050);events(p[0],0);assert(!strcmp(typed_name,"1111"));
     /* A powered-off panel must not wake or edit text on a touch event. */
-    awake=0;panel_off=1;tap(p[1],60,680);events(p[0],0);
+    awake=0;panel_off=1;tap(p[1],60,1050);events(p[0],0);
     assert(!awake&&!strcmp(typed_name,"1111"));awake=1;panel_off=0;
     keyboard_open=0;close(p[0]);close(p[1]);
 }
@@ -73,7 +77,7 @@ static void check_state_watch(void){
 }
 static void check_poll_deadlines(void){
     assert(input_poll_failed(POLLERR)&&input_poll_failed(POLLHUP)&&input_poll_failed(POLLNVAL));assert(!input_poll_failed(POLLIN));
-    long long now=1000;awake=1;page=TOOLS;last_draw=1000;last_activity=1000;idle_seconds=120;
+    long long now=1000;awake=1;page=SERVER_SETTINGS;last_draw=1000;last_activity=1000;idle_seconds=120;
     state_read_due=10000;helper_due=11000;helper_pid=0;display_save_due=0;display_save_pid=0;message_until=0;
     assert(poll_timeout(now)==5000);state_read_due=1300;assert(poll_timeout(now)==300);
     display_save_due=1100;assert(poll_timeout(now)==100);display_save_pid=123;assert(poll_timeout(now)==300);
@@ -129,21 +133,21 @@ static void check_partial_keyboard(void){
     for(int mode=1;mode<=2;mode++){
         keyboard_open=mode;strcpy(typed_name,"abc");strcpy(wifi_password,"abc12345");wifi_cursor=strlen(wifi_password);wifi_show_password=0;
         clip_top=0;clip_bottom=H;draw();
-        Hit key={.x=48,.y=mode==2?620:660,.w=90,.h=130,.action=A_KEY,.value='1'};
+        Hit key={.x=48,.y=1000,.w=90,.h=130,.action=A_KEY,.value='1'};
         dirty_top=H;dirty_bottom=0;last_draw=1;invalidate_hit(&key,0);
         assert(dirty_top==key.y&&dirty_bottom==key.y+key.h);
         clip_top=dirty_top;clip_bottom=dirty_bottom;draw();rect(key.x,key.y,key.w,4,GREEN);rect(key.x,key.y+key.h-4,key.w,4,GREEN);
         memcpy(partial,canvas,map_size);clip_top=0;clip_bottom=H;draw();rect(key.x,key.y,key.w,4,GREEN);rect(key.x,key.y+key.h-4,key.w,4,GREEN);
         assert(!memcmp(partial,canvas,map_size));
         activate(&key);dirty_top=H;dirty_bottom=0;last_draw=1;invalidate_hit(&key,1);
-        assert(dirty_top==400&&dirty_bottom<H);
+        assert(dirty_top==550&&dirty_bottom<H);
         clip_top=dirty_top;clip_bottom=dirty_bottom;draw();memcpy(partial,canvas,map_size);
         clip_top=0;clip_bottom=H;draw();assert(!memcmp(partial,canvas,map_size));
     }
     explicit_bzero(wifi_password,sizeof(wifi_password));wifi_cursor=0;keyboard_open=0;dirty_top=0;dirty_bottom=H;free(partial);
 }static void check_partial_buttons(void){
     void *partial=malloc(map_size);assert(partial);
-    const int pages[]={PLAYERS,TOOLS,BACKUPS};
+    const int pages[]={PLAYERS,DEVICE_SETTINGS,BACKUPS};
     confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;
     for(size_t p=0;p<sizeof(pages)/sizeof(pages[0]);p++){
         page=pages[p];list_offset=0;clip_top=0;clip_bottom=H;draw();int count=hit_count;
@@ -160,15 +164,89 @@ static void check_partial_keyboard(void){
     page=target;list_offset=0;confirm=keyboard_open=0;draw();
     assert(hit_count>0 && hit_count<=100);
     for(int i=0;i<hit_count;i++){Hit *h=&hits[i];assert(h->x>=0&&h->y>=0&&h->x+h->w<=W&&h->y+h->h<=H);}
-    int found=0;for(int i=0;i<hit_count;i++)if(hits[i].action==A_PAGE&&hits[i].value==TOOLS)found=1;
+    int found=0;for(int i=0;i<hit_count;i++)if(hits[i].action==A_PAGE&&hits[i].value==DEVICE_SETTINGS)found=1;
     assert(found);
+}
+static Hit find_action(int action,int value){
+    for(int i=0;i<hit_count;i++)if(hits[i].action==action&&hits[i].value==value)return hits[i];
+    assert(!"Expected action is missing");return (Hit){0};
+}
+static void check_layout(void){
+    for(int i=0;i<hit_count;i++){
+        const Hit *a=&hits[i];assert(a->x>=0&&a->y>=0&&a->x+a->w<=W&&a->y+a->h<=H);
+        for(int j=i+1;j<hit_count;j++){
+            const Hit *b=&hits[j];
+            assert(a->x+a->w<=b->x||b->x+b->w<=a->x||a->y+a->h<=b->y||b->y+b->h<=a->y);
+        }
+    }
+}
+static void check_redesign(void){
+    State saved=state;state.valid=1;state.updated=(long)time(NULL);state.error[0]=state.operation[0]=0;
+    strcpy(state.server,"online");strcpy(state.whitelist,"on");message_until=0;confirm=keyboard_open=difficulty_open=notice_open=0;
+    state.allow_count=128;state.players=64;state.backup_count=64;
+    for(int i=0;i<128;i++)snprintf(state.allow[i],sizeof(state.allow[i]),"Player_%09d",i);
+    for(int i=0;i<64;i++){snprintf(state.player[i],sizeof(state.player[i]),"Player_%09d",i);snprintf(state.backup_id[i],sizeof(state.backup_id[i]),"%064x",i+1);strcpy(state.backup[i],"2026-11-09 10:30:00");}
+    const int pages[]={HOME,PLAYERS,LOGS,BACKUPS,WIFI,SERVER_SETTINGS,DEVICE_SETTINGS};
+    for(size_t p=0;p<sizeof(pages)/sizeof(pages[0]);p++){
+        page=pages[p];list_mode=1;list_offset=0;draw();check_layout();
+        find_action(A_PAGE,HOME);find_action(A_PAGE,BACKUPS);find_action(A_PAGE,DEVICE_SETTINGS);
+        if(page==PLAYERS||page==LOGS||page==SERVER_SETTINGS)assert(page_section(page)==HOME);
+        if(page==WIFI)assert(page_section(page)==DEVICE_SETTINGS);
+    }
+    page=HOME;draw();Hit hit=find_action(A_PAGE,PLAYERS);activate(&hit);draw();assert(page==PLAYERS);
+    hit=find_action(A_LIST,1);activate(&hit);draw();assert(list_mode==1);
+    int removed=0;for(int i=0;i<hit_count;i++)removed+=hits[i].action==A_REMOVE;assert(removed==PLAYER_PAGE_SIZE);
+    hit=find_action(A_SCROLL,PLAYER_PAGE_SIZE);activate(&hit);draw();assert(list_offset==PLAYER_PAGE_SIZE);check_layout();
+    hit=find_action(A_REMOVE,0);activate(&hit);assert(confirm==3&&!strcmp(selected_name,"Player_000000006"));
+    draw();check_layout();assert(confirmation_ready(3));state.allow_count=0;assert(!confirmation_ready(3));
+    hit=(Hit){.action=A_CANCEL};activate(&hit);assert(!confirm);
+    page=BACKUPS;list_offset=0;draw();hit=find_action(A_SCROLL,BACKUP_PAGE_SIZE);activate(&hit);draw();assert(list_offset==BACKUP_PAGE_SIZE);
+    hit=find_action(A_RESTORE,0);activate(&hit);assert(confirm==5&&!strcmp(selected_backup,state.backup_id[BACKUP_PAGE_SIZE]));
+    draw();check_layout();assert(confirmation_ready(5));state.backup_count=0;assert(!confirmation_ready(5));
+    hit=(Hit){.action=A_CANCEL};activate(&hit);
+    /* A shrinking list clamps the current page instead of trapping navigation. */
+    page=PLAYERS;list_mode=1;list_offset=120;state.allow_count=1;draw();assert(list_offset==0);check_layout();
+    state.updated=0;draw();for(int i=0;i<hit_count;i++)assert(hits[i].action!=A_REMOVE&&hits[i].action!=A_ADD&&hits[i].action!=A_ALLOW);
+    for(int mode=1;mode<=2;mode++){keyboard_open=mode;draw();check_layout();}keyboard_open=0;
+    for(int c=1;c<=7;c++){confirm=c;draw();check_layout();}confirm=0;
+    state=saved;list_mode=list_offset=0;page=HOME;
+}
+static void save_frame(const char *path){
+    FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n%d %d\n255\n",W,H);
+    for(int y=0;y<H;y++)for(int x=0;x<W;x++){
+        uint32_t c=((uint32_t *)((char *)canvas+(size_t)y*pitch))[x];unsigned char rgb[3]={(unsigned char)(c>>16),(unsigned char)(c>>8),(unsigned char)c};assert(fwrite(rgb,1,3,f)==3);
+    }
+    assert(fclose(f)==0);
+}
+static void preview(const char *directory,const char *name){
+    char path[512];snprintf(path,sizeof(path),"%s/%s.ppm",directory,name);clip_top=0;clip_bottom=H;draw();check_layout();save_frame(path);
+}
+static void screenshots(const char *directory){
+    memset(&state,0,sizeof(state));state.valid=1;state.updated=(long)time(NULL);strcpy(state.server,"online");strcpy(state.whitelist,"on");strcpy(state.difficulty,"normal");
+    state.max_players=10;state.view_distance=8;state.simulation_distance=6;state.server_port=25565;state.charge_stop=55;state.charge_resume=50;
+    state.players=2;strcpy(state.player[0],"Alex");strcpy(state.player[1],"Robin");state.allow_count=3;strcpy(state.allow[0],"Alex");strcpy(state.allow[1],"Robin");strcpy(state.allow[2],"Sam");
+    state.backup_count=3;for(int i=0;i<3;i++){snprintf(state.backup[i],sizeof(state.backup[i]),"2026-11-%02d 10:30:00 UTC",9-i);snprintf(state.backup_id[i],sizeof(state.backup_id[i]),"%08x%056x",0xa83f9c12u+(unsigned)i*0x1c87a,i+1);}
+    confirm=keyboard_open=difficulty_open=notice_open=list_mode=list_offset=0;message_until=0;fixture_running=1;
+    page=HOME;preview(directory,"server");page=BACKUPS;preview(directory,"world");page=DEVICE_SETTINGS;preview(directory,"phone");
+    page=PLAYERS;preview(directory,"players");list_mode=1;preview(directory,"whitelist");
+    page=SERVER_SETTINGS;state.settings_pending=1;preview(directory,"settings");state.settings_pending=0;
+    page=WIFI;preview(directory,"wifi");page=LOGS;preview(directory,"activity");
+    keyboard_open=1;strcpy(typed_name,"Alex");preview(directory,"add-player");
+    keyboard_open=2;strcpy(wifi_label,"Home");strcpy(wifi_password,"examplepass");wifi_cursor=strlen(wifi_password);preview(directory,"wifi-password");
+    explicit_bzero(wifi_password,sizeof(wifi_password));keyboard_open=0;difficulty_open=1;preview(directory,"difficulty");difficulty_open=0;
+    strcpy(selected_backup,state.backup_id[0]);strcpy(selected_backup_label,state.backup[0]);confirm=5;preview(directory,"restore");confirm=4;preview(directory,"backup-confirm");confirm=0;
+    page=HOME;fixture_running=0;strcpy(state.server,"offline");preview(directory,"stopped");
+    strcpy(state.server,"recovery");strcpy(state.error,"Restore interrupted. Retain the recovery hold and inspect the recorded recovery paths before resuming the server.");preview(directory,"recovery");notice_open=1;preview(directory,"status");notice_open=0;
+    state.error[0]=0;state.updated=0;preview(directory,"unavailable");state.updated=(long)time(NULL);strcpy(state.server,"offline");state.backup_count=0;page=BACKUPS;preview(directory,"empty-world");
+    fixture_wifi_available=0;page=WIFI;preview(directory,"wifi-unavailable");fixture_wifi_available=1;
+    fixture_running=1;
 }
 int main(int argc,char **argv){
     check_text();check_signal_wakeup();check_power_button();check_state_watch();check_poll_deadlines();check_display_save_failure();check_wifi_stalled_receiver();assert(FT_Init_FreeType(&ft)==0);
     assert(FT_New_Face(ft,"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",0,&regular)==0);
     assert(FT_New_Face(ft,"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",0,&bold)==0);
     assert(FT_New_Face(ft,"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",0,&mono)==0);
-    assert(text_width(bold,control_font_size(260,"REMOVE ACCESS"),"REMOVE ACCESS")<=244);
+    assert(text_width(bold,control_font_size(240,"Remove"),"Remove")<=208);
     char duration[80];sleep_duration_label(30,duration,sizeof(duration));assert(!strcmp(duration,"30 s"));
     sleep_duration_label(90,duration,sizeof(duration));assert(!strcmp(duration,"1 min 30 s"));
     sleep_duration_label(600,duration,sizeof(duration));assert(!strcmp(duration,"10 min"));
@@ -178,11 +256,11 @@ int main(int argc,char **argv){
     /* The target's dumb buffer has 32 bytes of padding per scanline. */
     pitch=W*4+32;map_size=(size_t)pitch*H;canvas=calloc(1,map_size);assert(canvas);
     state.valid=1;state.updated=(long)time(NULL);state.max_players=10;strcpy(state.server,"online");
-    check_page(HOME);check_page(PLAYERS);check_page(TOOLS);check_page(SETTINGS);check_page(SERVER_SETTINGS);check_page(DEVICE_SETTINGS);check_page(WIFI);check_page(BACKUPS);check_page(LOGS);
+    check_page(HOME);check_page(PLAYERS);check_page(SERVER_SETTINGS);check_page(DEVICE_SETTINGS);check_page(WIFI);check_page(BACKUPS);check_page(LOGS);
     page=HOME;draw();assert(hit_at(70,450)<0);
-    page=SETTINGS;draw();int server_settings=0,device_settings=0;
-    for(int i=0;i<hit_count;i++){server_settings+=hits[i].action==A_PAGE&&hits[i].value==SERVER_SETTINGS;device_settings+=hits[i].action==A_PAGE&&hits[i].value==DEVICE_SETTINGS;assert(hits[i].action!=A_BRIGHT&&hits[i].action!=A_MAX);}
-    assert(server_settings==1&&device_settings==1);
+    int players_link=0,settings_link=0,activity_link=0;
+    for(int i=0;i<hit_count;i++){players_link+=hits[i].action==A_PAGE&&hits[i].value==PLAYERS;settings_link+=hits[i].action==A_PAGE&&hits[i].value==SERVER_SETTINGS;activity_link+=hits[i].action==A_PAGE&&hits[i].value==LOGS;}
+    assert(players_link==1&&settings_link==1&&activity_link==1);
     page=SERVER_SETTINGS;draw();int max_setting=0;for(int i=0;i<hit_count;i++){max_setting+=hits[i].action==A_MAX;assert(hits[i].action!=A_BRIGHT&&hits[i].action!=A_RESTART);}assert(max_setting>0);
     page=DEVICE_SETTINGS;draw();int brightness=0;for(int i=0;i<hit_count;i++){brightness+=hits[i].action==A_BRIGHT;assert(hits[i].action!=A_MAX&&hits[i].action!=A_DIFFICULTY);}assert(brightness>0);
     page=HOME;
@@ -217,9 +295,8 @@ int main(int argc,char **argv){
     Hit failed_connect={.action=A_SUBMIT};activate(&failed_connect);assert(keyboard_open==2&&!strcmp(wifi_password,"password123"));
     Hit failed_disconnect={.action=A_WIFI_DISCONNECT};activate(&failed_disconnect);assert(strstr(message,"unavailable"));
     explicit_bzero(wifi_password,sizeof(wifi_password));keyboard_open=0;wifi_sender=wifi_send;message_until=0;
-    page=TOOLS;draw();for(int i=0;i<TOOL_COUNT&&i<4;i++){int found=0;for(int j=0;j<hit_count;j++)if(hits[j].action==A_PAGE&&hits[j].value==tool_entries[i].page){found=1;assert(hits[j].w==984&&hits[j].h==275);}assert(found);}
     /* Static pages and modals do not repaint merely because time passed. */
-    page=TOOLS;confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;draw();last_draw=1000;
+    page=SERVER_SETTINGS;confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;draw();last_draw=1000;
     assert(!redraw_needed(7000));
     state.updated=0;assert(redraw_needed(7000));state.updated=(long)time(NULL);draw();last_draw=1000;
     long long test_now=now_ms();message_until=test_now+8000;draw();last_draw=test_now;assert(!redraw_needed(test_now+7000));assert(redraw_needed(test_now+9000));
@@ -228,8 +305,8 @@ int main(int argc,char **argv){
     check_partial_buttons();
     check_partial_keyboard();
     check_input();
-    page=WIFI;wifi_count=9;list_offset=0;Hit next={.action=A_SCROLL,.value=8};activate(&next);assert(list_offset==8);activate(&next);assert(list_offset==8);
-    Hit prev={.action=A_SCROLL,.value=-8};activate(&prev);assert(list_offset==0);
+    page=WIFI;wifi_count=9;list_offset=0;Hit next={.action=A_SCROLL,.value=WIFI_PAGE_SIZE};activate(&next);assert(list_offset==WIFI_PAGE_SIZE);activate(&next);assert(list_offset==WIFI_PAGE_SIZE);
+    Hit prev={.action=A_SCROLL,.value=-WIFI_PAGE_SIZE};activate(&prev);assert(list_offset==0);
     assert(!wifi_password_valid("short"));assert(wifi_password_valid("validpass"));
     assert(wifi_connected_network("COMPLETED","My network","My network"));
     assert(!wifi_connected_network("ASSOCIATING","My network","My network"));
@@ -269,15 +346,17 @@ int main(int argc,char **argv){
     strcpy(state.server,"offline");strcpy(state.error,"Battery low: waiting for charge");draw();for(int i=0;i<hit_count;i++)assert(hits[i].action!=A_START&&hits[i].action!=A_RESTART&&hits[i].action!=A_STOP);state.error[0]=0;strcpy(state.server,"online");
     long fresh_time=state.updated;state.updated=0;Hit add={.action=A_ADD};activate(&add);assert(!keyboard_open);state.updated=fresh_time;
     helper_pid=12345;helper_mutation=0;assert(admin("whitelist-set","on"));assert(busy()&&!strcmp(queued_command,"whitelist-set")&&!strcmp(queued_arg,"on"));helper_pid=0;queued_command[0]=queued_arg[0]=0;
+    check_redesign();
     if(argc>1&&!strcmp(argv[1],"--benchmark")){
         difficulty_open=1;for(int mode=0;mode<2;mode++){glyph_cache_enabled=mode;long long start=now_ms();for(int i=0;i<20;i++)draw();printf("%s: %.2f ms/frame\n",mode?"cached":"uncached",(now_ms()-start)/20.0);}glyph_cache_enabled=1;difficulty_open=0;
         keyboard_open=2;strcpy(wifi_password,"example-password");wifi_cursor=strlen(wifi_password);void *output=calloc(1,map_size);assert(output);
         for(int mode=0;mode<2;mode++){
-            clip_top=mode?400:0;clip_bottom=mode?1480:H;long long start=now_ms();
+            clip_top=mode?550:0;clip_bottom=mode?1750:H;long long start=now_ms();
             for(int i=0;i<40;i++){draw();for(int y=clip_top;y<clip_bottom;y++)memcpy((char *)output+(size_t)y*pitch,(char *)canvas+(size_t)y*pitch,pitch);}
             printf("keyboard_%s: %.2f ms/frame; bytes_per_frame=%zu\n",mode?"partial":"full",(now_ms()-start)/40.0,(size_t)(clip_bottom-clip_top)*pitch);
         }
         clip_top=0;clip_bottom=H;keyboard_open=0;explicit_bzero(wifi_password,sizeof(wifi_password));free(output);
-    }else if(argc>1){page=argc>2?atoi(argv[2]):TOOLS;draw();FILE *f=fopen(argv[1],"wb");assert(f);fprintf(f,"P6\n%d %d\n255\n",W,H);for(int y=0;y<H;y++)for(int x=0;x<W;x++){uint32_t c=((uint32_t *)((char *)canvas+(size_t)y*pitch))[x];unsigned char rgb[3]={(unsigned char)(c>>16),(unsigned char)(c>>8),(unsigned char)c};assert(fwrite(rgb,1,3,f)==3);}assert(fclose(f)==0);}
+    }else if(argc>2&&!strcmp(argv[1],"--screenshots"))screenshots(argv[2]);
+    else if(argc>1){page=argc>2?atoi(argv[2]):HOME;draw();save_frame(argv[1]);}
     puts("dashboard headless checks passed");free(canvas);FT_Done_Face(mono);FT_Done_Face(bold);FT_Done_Face(regular);FT_Done_FreeType(ft);return 0;
 }
