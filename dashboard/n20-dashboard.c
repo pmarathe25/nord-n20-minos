@@ -48,6 +48,8 @@
 #define PLAYER_PAGE_SIZE 6
 #define BACKUP_PAGE_SIZE 5
 #define WIFI_PAGE_SIZE 3
+/* Expose the normal game configuration range, not a phone performance cap. */
+#define CHUNK_DISTANCE_MAX 32
 
 static int drmfd=-1, touchfd=-1, powerfd=-1;
 static uint32_t crtc_id, conn_id, fb_id, handle, pitch, dpms_id;
@@ -382,7 +384,7 @@ static void stepper(int y,const char *label,int value,int action,const char *suf
     text(mono,34,60,y+109,MUTED,b,640);
     int down,up;
     if(action==A_BRIGHT||action==A_TIMEOUT){down=action==A_BRIGHT?saved_brightness>205:idle_seconds>30;up=action==A_BRIGHT?saved_brightness<4095:idle_seconds<600;}
-    else{int lo=action==A_MAX?1:2,hi=action==A_MAX?20:12,enable=fresh()&&!busy()&&value>=lo&&value<=hi;down=enable&&value>lo;up=enable&&value<hi;}
+    else{int lo=action==A_MAX?1:2,hi=action==A_MAX?20:CHUNK_DISTANCE_MAX,enable=fresh()&&!busy()&&value>=lo&&value<=hi;down=enable&&value>lo;up=enable&&value<hi;}
     control(720,y,135,135,PANEL,down?WHITE:DIM,"-",down?action:0,-1,NULL);control(885,y,135,135,PANEL,up?WHITE:DIM,"+",up?action:0,1,NULL);divider(y+170);
 }
 static int valid_backup_id(const char *s){size_t n=strlen(s);if(n<8||n>80)return 0;for(;*s;s++)if(!((*s>='0'&&*s<='9')||(*s>='a'&&*s<='f')||(*s>='A'&&*s<='F')))return 0;return 1;}
@@ -727,7 +729,7 @@ static void activate(const Hit *hit){
     if(a==A_ALLOW){if(!access_editable()||(strcmp(state.whitelist,"on")&&strcmp(state.whitelist,"off"))){msg("Whitelist state unavailable.");return;}if(v){if(!strcmp(state.whitelist,"on")){confirm=7;return;}if(state.allow_count==0){confirm=6;return;}admin("whitelist-set","on");}else admin("whitelist-add",arg);return;}
     if(a==A_SUBMIT){if(!access_editable()){msg(access_unavailable_reason());return;}if(strlen(typed_name)<3){msg("Use a username with 3 to 16 characters.");return;}if(admin("whitelist-add",typed_name))keyboard_open=0;return;}
     if(a==A_DIFFICULTY){const char *levels[]={"peaceful","easy","normal","hard"};if(v<0){difficulty_open=1;return;}if(v<4&&(difficulty_open||page==HOME)){if(!strcmp(state.difficulty,levels[v])||admin("difficulty",levels[v]))difficulty_open=0;}return;}
-    if(a==A_MAX||a==A_VIEW||a==A_SIM){int old=a==A_MAX?state.max_players:a==A_VIEW?state.view_distance:state.simulation_distance;int lo=a==A_MAX?1:2,hi=a==A_MAX?20:12;if(old<lo||old>hi||(v!=-1&&v!=1)||(v<0&&old==lo)||(v>0&&old==hi)){msg("Setting changed; refresh and try again.");helper_due=0;return;}snprintf(n,sizeof(n),"%d",old+v);admin(a==A_MAX?"max-players":a==A_VIEW?"view-distance":"simulation-distance",n);return;}
+    if(a==A_MAX||a==A_VIEW||a==A_SIM){int old=a==A_MAX?state.max_players:a==A_VIEW?state.view_distance:state.simulation_distance;int lo=a==A_MAX?1:2,hi=a==A_MAX?20:CHUNK_DISTANCE_MAX;if(old<lo||old>hi||(v!=-1&&v!=1)||(v<0&&old==lo)||(v>0&&old==hi)){msg("Setting changed; refresh and try again.");helper_due=0;return;}snprintf(n,sizeof(n),"%d",old+v);admin(a==A_MAX?"max-players":a==A_VIEW?"view-distance":"simulation-distance",n);return;}
     if(a==A_BACKUP){confirm=4;return;}if(a==A_RESTORE&&valid_backup_id(arg)){copy_value(selected_backup,sizeof(selected_backup),arg);selected_backup_label[0]=0;for(int i=0;i<state.backup_count;i++)if(!strcmp(state.backup_id[i],arg)){copy_value(selected_backup_label,sizeof(selected_backup_label),state.backup[i]);break;}confirm=5;return;}
 }
 static int hit_at(int x,int y){for(int i=hit_count-1;i>=0;i--)if(x>=hits[i].x&&x<hits[i].x+hits[i].w&&y>=hits[i].y&&y<hits[i].y+hits[i].h)return i;return -1;}

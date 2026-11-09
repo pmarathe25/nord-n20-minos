@@ -245,6 +245,30 @@ static void check_indicators(void){
     fixture_battery=54;fixture_temp=286;fixture_charging=0;fixture_wifi_available=1;indicators_due=0;draw();
     dirty_top=0;dirty_bottom=H;free(reference);
 }
+static void check_distance_controls(void){
+    State saved=state;page=HOME;state.valid=1;state.updated=(long)time(NULL);
+    strcpy(state.server,"online");state.operation[0]=0;state.error[0]=0;
+    confirm=keyboard_open=difficulty_open=notice_open=0;
+    const int actions[]={A_VIEW,A_SIM};
+    for(int i=0;i<2;i++){
+        int *distance=i?&state.simulation_distance:&state.view_distance;
+        const int values[]={12,13,31};
+        for(int j=0;j<3;j++){
+            *distance=values[j];draw();Hit plus=find_action(actions[i],1);
+            helper_pid=12345;helper_mutation=0;activate(&plus);
+            char expected[16];snprintf(expected,sizeof(expected),"%d",values[j]+1);
+            assert(!strcmp(queued_command,i?"simulation-distance":"view-distance")&&!strcmp(queued_arg,expected));
+            helper_pid=0;queued_command[0]=queued_arg[0]=0;
+        }
+        *distance=32;draw();find_action(actions[i],-1);
+        for(int j=0;j<hit_count;j++)assert(hits[j].action!=actions[i]||hits[j].value!=1);
+        Hit stale={.action=actions[i],.value=1};activate(&stale);assert(!helper_pid&&!queued_command[0]);
+        *distance=2;draw();find_action(actions[i],1);
+        for(int j=0;j<hit_count;j++)assert(hits[j].action!=actions[i]||hits[j].value!=-1);
+        stale.value=-1;activate(&stale);assert(!helper_pid&&!queued_command[0]);
+    }
+    state=saved;message_until=0;
+}
 static void save_frame(const char *path){
     FILE *f=fopen(path,"wb");assert(f);fprintf(f,"P6\n%d %d\n255\n",W,H);
     for(int y=0;y<H;y++)for(int x=0;x<W;x++){
@@ -379,7 +403,7 @@ int main(int argc,char **argv){
     strcpy(state.server,"offline");strcpy(state.error,"Battery low: waiting for charge");draw();for(int i=0;i<hit_count;i++)assert(hits[i].action!=A_START&&hits[i].action!=A_RESTART&&hits[i].action!=A_STOP);state.error[0]=0;strcpy(state.server,"online");
     long fresh_time=state.updated;state.updated=0;Hit add={.action=A_ADD};activate(&add);assert(!keyboard_open);state.updated=fresh_time;
     helper_pid=12345;helper_mutation=0;assert(admin("whitelist-set","on"));assert(busy()&&!strcmp(queued_command,"whitelist-set")&&!strcmp(queued_arg,"on"));helper_pid=0;queued_command[0]=queued_arg[0]=0;
-    check_redesign();check_indicators();
+    check_redesign();check_indicators();check_distance_controls();
     if(argc>1&&!strcmp(argv[1],"--benchmark")){
         difficulty_open=1;for(int mode=0;mode<2;mode++){glyph_cache_enabled=mode;long long start=now_ms();for(int i=0;i<20;i++)draw();printf("%s: %.2f ms/frame\n",mode?"cached":"uncached",(now_ms()-start)/20.0);}glyph_cache_enabled=1;difficulty_open=0;
         keyboard_open=2;strcpy(wifi_password,"example-password");wifi_cursor=strlen(wifi_password);void *output=calloc(1,map_size);assert(output);

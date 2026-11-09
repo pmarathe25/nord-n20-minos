@@ -29,6 +29,9 @@ hidden/WPA3-only/enterprise network setup, firmware flashing, and recovery-hold
 overrides are not implemented here. USB world export remains automatic;
 consistent copies still require stopping the server first.
 
+View and simulation distance expose 2–32 chunks; there is no additional
+12-chunk phone cap. See [game limits and performance guidance](chunk-distances.md).
+
 ## Organization
 
 Four persistent bottom tabs divide tasks by subject:

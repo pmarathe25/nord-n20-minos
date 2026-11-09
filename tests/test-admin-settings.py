@@ -1,7 +1,8 @@
 import importlib.machinery,json,os,tempfile,time
 from pathlib import Path
 m=importlib.machinery.SourceFileLoader('n20_admin_ui',str(Path(__file__).resolve().parents[1] / 'runtime/usr/local/sbin/n20-admin')).load_module()
-top=Path(tempfile.mkdtemp(prefix='n20-settings-validation-',dir='/tmp'))
+workspace=tempfile.TemporaryDirectory(prefix='n20-settings-validation-',dir='/tmp')
+top=Path(workspace.name)
 m.ROOT=top/'server';m.ROOT.mkdir();m.WORLD=m.ROOT/'world';m.RUN=top/'run';m.META=top/'meta';m.PID=top/'pid';m.STOP=top/'stop';m.LEGACY_HOLD=m.ROOT/'.n20-restore-hold'; m.HOLD=m.META/'restore-hold';m.LEGACY_LOW=m.ROOT/'.n20-low-battery-hold'; m.LOW=m.META/'low-battery-hold';m.OP=m.RUN/'operation';m.LOCK=m.RUN/'operation.lock';m.ERR=m.META/'error';m.CACHE=m.META/'cache';m.directories()
 m.BUNDLE=top/'bundle';(m.BUNDLE/'repo').mkdir(parents=True);(m.BUNDLE/'server.jar').write_bytes(b'test')
 secret=top/'private';secret.write_text('difficulty=secret\n');config=m.ROOT/'server.properties'
@@ -115,6 +116,15 @@ try:
     except m.AdminError as exc:assert 'not confirmed' in str(exc)
 finally:
     m.whitelist_entries=real_entries;m.time.monotonic=real_monotonic;m.time.sleep=real_sleep
+for command in ('view-distance','simulation-distance'):
+    for value in ('2','12','13','16','31','32'):
+        m.mutate(command,value)
+        assert m.props()[command]==value
+    for value in ('1','33','1000000','-1','2.5','32\n','\uff13\uff12'):
+        before_config=config.read_bytes()
+        try:m.mutate(command,value);raise AssertionError('invalid distance accepted')
+        except m.AdminError:pass
+        assert config.read_bytes()==before_config
 for command,value in [('whitelist-add','bad name'),('max-players','999'),('view-distance','1')]:
     try:m.mutate(command,value);raise AssertionError('invalid input accepted')
     except m.AdminError:pass

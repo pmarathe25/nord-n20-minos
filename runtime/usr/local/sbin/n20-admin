@@ -667,7 +667,8 @@ def mutate(command, value):
         if value not in ('peaceful','easy','normal','hard'): raise AdminError('Invalid difficulty')
         if pid_running(): send_console('difficulty ' + value)
         set_property('difficulty',value); return
-    limits={'max-players':(1,20),'view-distance':(2,12),'simulation-distance':(2,12)}
+    # Normal game configuration range; no additional phone performance cap.
+    limits={'max-players':(1,20),'view-distance':(2,32),'simulation-distance':(2,32)}
     if command in limits:
         if not value.isascii() or not value.isdigit(): raise AdminError('Invalid setting value')
         lo,hi=limits[command]; number=int(value)
