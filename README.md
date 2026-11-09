@@ -71,6 +71,11 @@ For a read-only battery log on the phone, run `python3 tools/measure-battery.py 
 
 For a synthetic active-world heap comparison, run `python3 tools/benchmark-server-workload.py --jar /opt/n20-minecraft/current/server.jar --eula /srv/minecraft/eula.txt` as root. It creates disposable loopback-only worlds and temporarily adds substantial load; `--reverse` swaps the heap test order. Its results do not establish real-play latency or battery life.
 
+The [connected-client distance benchmark](docs/chunk-benchmark.md) compares
+loading, stationary play and new-terrain movement using disposable worlds.
+Its harness temporarily stops an idle production server and restores it on
+exit. It does not measure client rendering or calibrated electrical power.
+
 From Windows, build the dashboard on the existing phone without installing it:
 
 ```powershell

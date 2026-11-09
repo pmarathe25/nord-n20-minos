@@ -62,28 +62,40 @@ Wi-Fi power-saving policy are unchanged by the range expansion.
 
 ## Guidance for this phone
 
-For the owner's preference for wider vistas, start testing at 16 view distance
-and 8 simulation distance, then try 24 view while keeping simulation at 6–8.
-These are suggested trial settings, not validated gameplay maxima. Simulation
-does not need to equal view distance: lowering it changes distant game activity
-rather than directly shortening the visible terrain radius. A farm or another
-build that needs distant simulation may justify a different tradeoff. The
-client's own render distance must also permit the desired view.
+For the owner's preference for wider vistas, **24 view / 4 simulation** is the
+best tested starting point for one player exploring new terrain. In the
+battery-only run its P95 tick work was 48.2 ms, versus 56.9–59.9 ms for 24/8
+and 79.8 ms for 32/8. Simulation 4 reduced the raw current proxy without
+shortening the visible horizon. Use simulation 8 when distant farms or other
+activity need it. These are recommendations for the measured workload, not
+validated maxima for arbitrary worlds or multiple players.
 
-An 8–12 view / 4–6 simulation configuration is a conservative, battery-oriented
-alternative, not a universal recommendation for normal gameplay. The UI exposes
-the larger range without silently increasing or reducing the user's settings.
+View 32 remained comfortable while stationary in the test world, but increased
+new-terrain loading time, CPU use and exploration current, with terrain delivery
+falling behind movement. View 16 / simulation 4 is a lighter alternative,
+particularly for memory; a small 8–12 view is not an inherent requirement of
+this phone. The client's render distance must also permit the desired view.
+The UI exposes the larger range without silently changing existing settings.
 
-There is no measured gameplay maximum or distance-versus-power curve for this
-phone. The [existing measurements](power-baseline.md) compare heap sizes and
-idle power policies, including a 64-force-loaded-chunk synthetic workload;
-they are not a sweep of player view/simulation distances. The vendor battery
-current reading is also uncalibrated.
+The [distance benchmark](chunk-benchmark.md) now measures a simulated connected
+player, stationary play and repeated movement into new terrain. It uses
+disposable worlds and leaves production settings unchanged. Its limits matter:
+there is no rendered client, player-built base, farm, combat or multi-player
+workload, and the unplugged vendor-current comparison is a relative proxy
+without calibrated electrical units.
+It establishes neither a universal gameplay maximum nor a battery-life curve.
+The [earlier measurements](power-baseline.md) cover heap sizes and idle policies.
 
-A useful follow-up would compare 12/8, 16/8 and 24/8 with the same world, player
-count, route and screen/power state, measuring server tick-time distribution,
-memory, temperature, network traffic and externally measured energy. Include
-both an established base and new-terrain exploration, repeat in alternate
-order, and keep headroom below the 50 ms tick budget for 20 ticks per second.
-Do not infer capacity from an idle server. No such gameplay or energy benchmark
-was run as part of this UI range change.
+The benchmark also checks a server configured to 256 with the simulated client
+requesting 127. Although the server advertises 256 during login, it delivers
+the same 3,725 visible chunks at the test location as a configured distance of
+32. This agrees with the code-level clamp; editing the property is not enough
+to bypass it.
+
+For substantially longer vistas, existing software can help without writing a
+new server. [Distant Horizons](https://modrinth.com/mod/distanthorizons) supports
+256+ chunk views using simplified distant terrain. Client-only mode retains
+previously explored terrain; compatible server support can send distant terrain
+automatically. [Paper's maximum-view-distance override](https://docs.papermc.io/paper/reference/system-properties/#papermaxviewdistance)
+can raise its server-side limit, but client limits and performance must still be
+verified. Neither approach is installed by these vanilla benchmarks.
