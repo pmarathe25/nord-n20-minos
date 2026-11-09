@@ -62,13 +62,21 @@ Wi-Fi power-saving policy are unchanged by the range expansion.
 
 ## Guidance for this phone
 
-For the owner's preference for wider vistas, **24 view / 4 simulation** is the
-best tested starting point for one player exploring new terrain. In the
-battery-only run its P95 tick work was 48.2 ms, versus 56.9–59.9 ms for 24/8
-and 79.8 ms for 32/8. Simulation 4 reduced the raw current proxy without
-shortening the visible horizon. Use simulation 8 when distant farms or other
-activity need it. These are recommendations for the measured workload, not
-validated maxima for arbitrary worlds or multiple players.
+For general survival play, start with **24 view / 10 simulation**, using 8 as
+a lower-load alternative. Simulation 10 preserves the usual default radius.
+A fresh server normally starts at
+10 view / 10 simulation; the two settings serve different purposes. See the
+[server properties reference](https://docs.papermc.io/paper/reference/server-properties/).
+
+Simulation 4 is an optional exploration or lower-load setting. Its roughly
+64-block simulation radius is substantially smaller than the default's roughly
+160 blocks. A high view distance keeps terrain visible beyond this radius, but
+does not keep all distant mobs, farms and mechanisms active. Different game
+systems have additional ticking and spawning rules; distance alone is not a
+guarantee that a particular farm runs. Distant Horizons does not extend simulation.
+These are starting points, not validated maxima for arbitrary worlds or players.
+The [tuning comparison](../reports/2026-11-09-server-tuning.md) evaluates ways to
+improve the 24/10 workload without reducing simulation distance.
 
 View 32 remained comfortable while stationary in the test world, but increased
 new-terrain loading time, CPU use and exploration current, with terrain delivery
@@ -77,20 +85,18 @@ particularly for memory; a small 8–12 view is not an inherent requirement of
 this phone. The client's render distance must also permit the desired view.
 The UI exposes the larger range without silently changing existing settings.
 
-The [distance benchmark](chunk-benchmark.md) now measures a simulated connected
+The [distance benchmark](../reports/2026-11-09-chunk-distances.md) now measures a simulated connected
 player, stationary play and repeated movement into new terrain. It uses
 disposable worlds and leaves production settings unchanged. Its limits matter:
 there is no rendered client, player-built base, farm, combat or multi-player
 workload, and the unplugged vendor-current comparison is a relative proxy
 without calibrated electrical units.
 It establishes neither a universal gameplay maximum nor a battery-life curve.
-The [earlier measurements](power-baseline.md) cover heap sizes and idle policies.
+The [earlier measurements](../reports/2026-11-08-power-baseline.md) cover heap sizes and idle policies.
 
-The benchmark also checks a server configured to 256 with the simulated client
-requesting 127. Although the server advertises 256 during login, it delivers
-the same 3,725 visible chunks at the test location as a configured distance of
-32. This agrees with the code-level clamp; editing the property is not enough
-to bypass it.
+The benchmark also confirms that raising the vanilla configuration to 256
+does not bypass the effective view-distance clamp. Detailed measurements belong
+in the linked report.
 
 For substantially longer vistas, existing software can help without writing a
 new server. [Distant Horizons](https://modrinth.com/mod/distanthorizons) supports
@@ -98,4 +104,4 @@ new server. [Distant Horizons](https://modrinth.com/mod/distanthorizons) support
 previously explored terrain; compatible server support can send distant terrain
 automatically. [Paper's maximum-view-distance override](https://docs.papermc.io/paper/reference/system-properties/#papermaxviewdistance)
 can raise its server-side limit, but client limits and performance must still be
-verified. Neither approach is installed by these vanilla benchmarks.
+verified. See [server tuning](server-tuning.md) for the available controls.

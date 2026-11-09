@@ -168,15 +168,9 @@ indicator rows repaint on otherwise static pages. Existing display power and
 Wi-Fi power policy behavior is unchanged.
 Confirmation buttons recheck current data and, for stop/restart, the server
 process identity. On Wi-Fi send failure the password form stays open.
-On 2026-11-09, the redesigned UI was built and tested on ARM64, then installed
-by replacing and restarting only the dashboard. Minecraft's process identity,
-display preferences, and Wi-Fi power-policy processes were unchanged. Injected
-power-button and touch events exercised wake, the main tabs, and sleep;
-framebuffer checks verified the selected tabs. The screen was returned to off.
-A subsequent 15-second sample recorded no dashboard CPU ticks or context
-switches, and Wi-Fi reported power saving on. This is a short activity check,
-not a whole-device power measurement. Earlier live observations describe the
-previous UI. See [UI design and validation](ui.md) for navigation and fixtures.
+See [UI design and validation](ui.md) for navigation and fixtures, and the
+[dated verification report](../reports/2026-11-09-ui-verification.md) for
+deployment checks and short screen-off activity measurements.
 
 A live listener check found Minecraft's management port bound to the IPv4
 loopback address, with RCON and query disabled and online authentication and
@@ -269,7 +263,7 @@ loopback, key-only SSH enabled, and the Java process running as the Minecraft
 user with an empty capability bounding set and `no_new_privs`. This is a
 point-in-time check, not a guarantee about later configuration changes.
 
-The updated dashboard uses the power button to wake the panel after powering it down. It reopens the DRM connection to make the panel visible again; touch does not wake a powered-down panel. If power-down fails, the dashboard falls back to zero brightness with touch wake. In either case a 150 ms guard follows display wake. This version was installed and physically tested on the device; see [the power baseline](power-baseline.md). Power usage, OLED wear, multiplayer load, and fully depleted-battery startup have not been characterized. A normal reboot restored Wi-Fi, the server and USB MTP. On unplugged reboots Wi-Fi and the dashboard returned, but the clock required operator correction before the server could start; see the timekeeper notes below. Wi-Fi internet, DNS and NTP also worked with USB networking temporarily disabled.
+The updated dashboard uses the power button to wake the panel after powering it down. It reopens the DRM connection to make the panel visible again; touch does not wake a powered-down panel. If power-down fails, the dashboard falls back to zero brightness with touch wake. In either case a 150 ms guard follows display wake. This version was installed and physically tested on the device; see [the power baseline](../reports/2026-11-08-power-baseline.md). Power usage, OLED wear, multiplayer load, and fully depleted-battery startup have not been characterized. A normal reboot restored Wi-Fi, the server and USB MTP. On unplugged reboots Wi-Fi and the dashboard returned, but the clock required operator correction before the server could start; see the timekeeper notes below. Wi-Fi internet, DNS and NTP also worked with USB networking temporarily disabled.
 
 ## Development dependencies
 

@@ -98,8 +98,8 @@ drag/multitouch cancellation, power-button handling and partial repaint parity.
 Indicator tests cover every page and form, changing/unavailable telemetry,
 header-only repaint parity, and no reads or added wake deadline while asleep.
 The existing administration and Wi-Fi security tests validate the unchanged
-backend contracts. The ARM64 build, headless dashboard tests, undefined-behavior
-sanitizer run, administration settings tests and Wi-Fi security tests passed.
+backend contracts. Dated test and deployment results belong in
+[the verification report](../reports/2026-11-09-ui-verification.md).
 
 To render review frames without opening DRM, connecting to a network or running
 server commands:
@@ -111,23 +111,6 @@ mkdir -p build/ui-preview
 
 This writes PPM images for the main screens, forms, confirmations, stopped,
 recovery, empty and unavailable states. Review outputs belong under ignored
-`build/` and should be discarded when no longer needed. The redesign was built
-and visually reviewed using these native-renderer fixtures.
-
-After separate deployment on 2026-11-09, injected input events on the phone
-verified power-button wake/sleep and navigation; live framebuffer checks
-verified the active root tab. Minecraft stayed running with the same process
-identity. Display preferences and Wi-Fi power-policy processes were unchanged,
-and the display was returned to off. During a subsequent 15-second screen-off
-sample the dashboard recorded zero CPU ticks and zero context switches, and
-Wi-Fi reported power saving on. This checks the observed behavior, not total
-device power or the ergonomics of physical finger input.
-
-The subsequent minimal revision was also built and tested with the sanitizer,
-then installed by restarting only the dashboard. Live injected-input checks
-verified all four tabs, Log/back, and the three indicators on every visited
-screen. Minecraft and the power-policy processes stayed running; the screen
-was restored to off. Another 15-second sample showed zero dashboard CPU ticks
-and context switches, with Wi-Fi power saving on.
+`build/` and should be discarded when no longer needed.
 
 Building does not install, restart services, or change the live world.

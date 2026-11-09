@@ -1,4 +1,4 @@
-# Battery baseline
+# Power measurements, 2026-11-08–09
 
 On 2026-11-08, the phone was disconnected from USB power for 10 minutes with
 Minecraft running, no players connected, Wi-Fi enabled, and the display at zero

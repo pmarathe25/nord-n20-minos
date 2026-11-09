@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable vanilla 26.3 distance sweep; paired with benchmark-chunk-host.js.
+"""Disposable Minecraft 26.3 distance/tuning sweep with benchmark-chunk-host.js.
 
 Explicit --stop-production uses the installed idle-checked stop helper, and
 restores the prior running state in finally. Never edits production settings or
@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import pwd
 import select
+import shutil
 import signal
 import statistics
 import subprocess
@@ -24,6 +25,25 @@ import sys
 import zipfile
 
 REQUIRE_UNPLUGGED = False
+PROFILES = {
+    'baseline': ['-Xmx2G'],
+    'heap3g': ['-Xmx3G'],
+    'parallelgc': ['-Xmx2G', '-XX:+UseParallelGC'],
+    'cpu4': ['-Xmx2G', '-XX:ActiveProcessorCount=4'],
+    'lithium': ['-Xmx2G'],
+    'lithium-cpu4': ['-Xmx2G', '-XX:ActiveProcessorCount=4'],
+    'c2me': ['-Xmx2G'],
+    'dh': ['-Xmx2G'],
+    'dh-cpu4': ['-Xmx2G', '-XX:ActiveProcessorCount=4'],
+}
+MODS = {
+    'lithium': ['lithium.jar'],
+    'lithium-cpu4': ['lithium.jar'],
+    'c2me': ['lithium.jar', 'c2me.jar'],
+    'dh': ['lithium.jar', 'dh.jar'],
+    'dh-cpu4': ['lithium.jar', 'dh.jar'],
+}
+ASSETS = Path('/tmp/n20-tuning-assets')
 
 
 def emit(event, **values):
@@ -90,7 +110,7 @@ def verify_listener(pid):
         raise RuntimeError('unexpected benchmark listeners: ' + repr(listeners))
 
 
-def run_case(top, view, simulation, index, durations, user):
+def run_case(top, view, simulation, index, durations, user, profile='baseline', revisit=0):
     root = top / ('case-%02d-%d-%d' % (index, view, simulation))
     root.mkdir()
     os.chown(root, user.pw_uid, user.pw_gid)
@@ -106,12 +126,23 @@ def run_case(top, view, simulation, index, durations, user):
         os.chown(path, user.pw_uid, user.pw_gid)
         path.chmod(0o600)
     log = root / 'server.log'
+    jar = '/opt/n20-minecraft/current/server.jar'
+    if profile in MODS:
+        (root / 'libraries').symlink_to(ASSETS / 'fabric/libraries', target_is_directory=True)
+        (root / 'server.jar').symlink_to(jar)
+        mods = root / 'mods'
+        mods.mkdir()
+        mods.chmod(0o755)
+        for name in MODS[profile]:
+            shutil.copyfile(ASSETS / name, mods / name)
+            (mods / name).chmod(0o644)
+        jar = str(ASSETS / 'fabric/fabric-server-launch.jar')
     with log.open('wb') as output:
         proc = subprocess.Popen(['/usr/bin/setpriv', '--no-new-privs', '--bounding-set=-all',
                                  '--reuid=minecraft', '--regid=minecraft', '--clear-groups',
-                                 '/opt/java/bin/java', '-Xms512M', '-Xmx2G',
+                                 '/opt/java/bin/java', '-Xms512M', *PROFILES[profile],
                                  '-DbundlerRepoDir=/opt/n20-minecraft/current/repo',
-                                 '-jar', '/opt/n20-minecraft/current/server.jar', 'nogui'],
+                                 '-jar', jar, 'nogui'],
                                 cwd=root, stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
                                 start_new_session=True)
 
@@ -126,8 +157,19 @@ def run_case(top, view, simulation, index, durations, user):
                     raise RuntimeError('server startup failed: ' + log.read_text(errors='replace')[-1500:])
                 time.sleep(.25)
             verify_listener(proc.pid)
+            if profile in MODS:
+                loaded = log.read_text(errors='replace')
+                for name in MODS[profile]:
+                    mod_id = {'dh.jar': 'distanthorizons', 'c2me.jar': 'c2me', 'lithium.jar': 'lithium'}[name]
+                    if not any(line.strip().startswith('- ' + mod_id + ' ') for line in loaded.splitlines()):
+                        raise RuntimeError('expected mod missing from startup: ' + mod_id)
+                emit('mod_startup', case=index, profile=profile, lines=[
+                    line for line in loaded.splitlines()
+                    if any(word in line.lower() for word in
+                           ('lithium', 'c2me', 'distanthorizons', 'parallelism', '/warn', '/error'))
+                ][:50])
             command('setworldspawn 0 100 0')
-            emit('ready', case=index, view=view, simulation=simulation, startup_s=time.monotonic()-start)
+            emit('ready', case=index, profile=profile, view=view, simulation=simulation, startup_s=time.monotonic()-start)
             deadline = time.monotonic() + 30
             while 'BenchClient joined the game' not in log.read_text(errors='replace'):
                 if time.monotonic() > deadline:
@@ -139,13 +181,16 @@ def run_case(top, view, simulation, index, durations, user):
             last_chunks = -1
             last_change = time.monotonic()
             loaded = 0
-            for phase, duration in zip(('initial_load', 'stationary', 'exploration'), durations):
+            phases = list(zip(('initial_load', 'stationary', 'exploration'), durations))
+            if revisit:
+                phases.append(('revisit', revisit))
+            x = 0
+            for phase, duration in phases:
                 emit('phase', case=index, phase=phase, seconds=duration)
                 begin = time.monotonic()
                 baseline = metrics(proc.pid)
                 samples = []
                 next_move = begin + 2
-                x = 0
                 offset = log.stat().st_size
                 command('tick query')
                 while time.monotonic() - begin < duration:
@@ -174,6 +219,10 @@ def run_case(top, view, simulation, index, durations, user):
                         x += 16
                         command('tp BenchClient %d 100 0' % x)
                         next_move += 2
+                    elif phase == 'revisit' and now >= next_move:
+                        x = max(0, x - 16)
+                        command('tp BenchClient %d 100 0' % x)
+                        next_move += 2
                     samples.append(metrics(proc.pid))
                     time.sleep(min(1, max(0, duration - (time.monotonic() - begin))))
                 command('tick query')
@@ -185,7 +234,7 @@ def run_case(top, view, simulation, index, durations, user):
                     lines = captured.read().decode('utf-8', errors='replace').splitlines()
                 selected = [line.split(']: ', 1)[-1] for line in lines if any(s in line.lower() for s in ('tick rate', 'tick time', 'time per tick', 'percentile', "can't keep up", 'mspt'))]
                 currents = [float(s['current_raw']) for s in samples if s['current_raw']]
-                emit('phase_result', case=index, view=view, simulation=simulation, phase=phase,
+                emit('phase_result', case=index, profile=profile, view=view, simulation=simulation, phase=phase,
                      seconds=elapsed, cpu_cores=(final['cpu_s']-baseline['cpu_s'])/elapsed,
                      chunks_quiet_s=time.monotonic()-last_change,
                      peak_rss_mib=max(s['rss_mib'] for s in samples),
@@ -228,9 +277,21 @@ def main():
     parser.add_argument('--cases', default='12:8,16:8,24:8,32:8,256:8')
     parser.add_argument('--durations', default='240,60,90')
     parser.add_argument('--require-unplugged', action='store_true')
+    parser.add_argument('--profiles', default='baseline', help='comma-separated named tuning profiles')
+    parser.add_argument('--revisit', type=int, default=0, help='seconds retracing the generated route')
     args = parser.parse_args()
     cases = [tuple(map(int, case.split(':'))) for case in args.cases.split(',')]
     durations = list(map(int, args.durations.split(',')))
+    profiles = args.profiles.split(',')
+    if any(p not in PROFILES for p in profiles):
+        parser.error('unknown profile; choose from ' + ','.join(PROFILES))
+    if args.revisit and not 5 <= args.revisit <= 600:
+        parser.error('revisit must be zero or 5..600 seconds')
+    for profile in profiles:
+        if profile in MODS:
+            for path in [ASSETS / 'fabric/fabric-server-launch.jar', *(ASSETS / name for name in MODS[profile])]:
+                if not path.is_file():
+                    parser.error('missing prepared benchmark asset: ' + str(path))
     if any(len(c) != 2 or not all(2 <= n <= 256 for n in c) for c in cases):
         parser.error('distances must be between 2 and 256')
     if len(durations) != 3 or any(not 5 <= n <= 600 for n in durations):
@@ -259,9 +320,12 @@ def main():
             top = Path(temp)
             top.chmod(0o755)
             user = pwd.getpwnam('minecraft')
-            for index, (view, simulation) in enumerate(cases):
-                emit('case_start', case=index, view=view, simulation=simulation)
-                run_case(top, view, simulation, index, durations, user)
+            index = 0
+            for profile in profiles:
+                for view, simulation in cases:
+                    emit('case_start', case=index, profile=profile, view=view, simulation=simulation)
+                    run_case(top, view, simulation, index, durations, user, profile, args.revisit)
+                    index += 1
     finally:
         # Restore the stop marker even if validation of a replaced file fails.
         try:

@@ -1,6 +1,7 @@
 # Local build products and device-specific material must remain outside Git.
 /build/
 /docs/power-data/
+/reports/raw/
 *.log
 /local/
 __pycache__/

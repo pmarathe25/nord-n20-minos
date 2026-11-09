@@ -4,11 +4,13 @@ Measurements use this Nord N20 and the installed vanilla Minecraft Java 26.3
 server, with its usual Java 25 runtime and `-Xms512M -Xmx2G` heap settings.
 The production world and configuration are not benchmark inputs.
 
-For one player exploring new terrain, **24 view / 4 simulation** is the best
-tested starting point for a wide view with more tick-time headroom. Use
-simulation 8 if distant farms or other activity need it. View 32 was affordable
-when stationary, but more expensive and less smooth while generating terrain.
-These are workload-specific recommendations, not guaranteed limits.
+For one player exploring new terrain, **24 view / 4 simulation** provided more
+tick-time headroom with a wide view. That is an exploration-focused tradeoff:
+simulation 4 is substantially below the normal default of 10 and constrains
+distant activity. Prefer simulation 8–10 for general survival play; see the
+[current guidance](../docs/chunk-distances.md). View 32 was affordable when
+stationary, but more expensive and less smooth while generating terrain.
+These are workload-specific measurements, not guaranteed limits.
 
 ## USB performance results
 
@@ -225,33 +227,7 @@ exact causal power multiplier.
 
 ## Reproduce
 
-Run from the original Windows checkout with Node.js and OpenSSH. The private
-identity remains in ignored `local/`. This is explicitly a disruptive benchmark
-and requires an idle, running production server and the existing accepted EULA.
-Do not run it against an arbitrary server version or simultaneously with another
-benchmark. Verify enough disk space and keep the SSH connection available.
-
-```powershell
-ssh -i local/secrets/n20_usb_key root@192.168.137.2 "mkdir -m 700 /run/n20/chunk-benchmark"
-scp -i local/secrets/n20_usb_key tools/benchmark-chunk-server.py root@192.168.137.2:/run/n20/chunk-benchmark/
-ssh -i local/secrets/n20_usb_key root@192.168.137.2 "python3 -m py_compile /run/n20/chunk-benchmark/benchmark-chunk-server.py"
-node tests/test-chunk-client.js
-node tools/benchmark-chunk-host.js --cases 12:8,16:8,24:8,32:8,256:8,16:4,16:16,16:32,16:8
-```
-
-`--durations 240,60,90` changes the three phase durations. `--client-view 127`
-requests the largest positive value representable by the client's signed-byte
-view-distance field, which is useful for checking a server cap independently
-of the usual client request of 32. It does not enable a true 256-chunk view.
-`N20_BENCHMARK_SCRIPT` can select a separately staged script under `/run/n20/`.
-For a battery comparison, set `N20_BENCHMARK_HOST` to the phone's verified Wi-Fi
-IPv4 address, physically disconnect external power, and add
-`--require-unplugged --cases 24:8,24:4,32:8,24:8`. Keep the display off and the
-phone on the same surface. This does not change charging or Wi-Fi policies.
-
-Keep the summarized measurements and reusable tools; discard temporary worlds,
-raw logs, downloaded protocol data and scratch measurement files after review.
-The server harness deletes its temporary worlds automatically.
+See [the reusable benchmark instructions](../docs/benchmarking.md).
 
 ## Limits of inference
 

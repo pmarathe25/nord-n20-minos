@@ -12,7 +12,8 @@ The phone uses boot slot B and a reformatted userdata partition. Its bootloader 
 - `boot/` contains the persistent initramfs init and a deterministic builder. Its filesystem UUID and USB configuration are specific to this device.
 - `tools/` has non-installing builds, screen capture, and a Minecraft status probe; `tests/` exercises administration and backup behavior in temporary directories.
 - [Device and development notes](docs/device.md) describe dependencies, firmware, deployment, boot-image inputs, and known limitations.
-- [Battery baseline](docs/power-baseline.md) records the short unplugged measurement and its limitations.
+- `reports/` contains dated measurements and investigations; `docs/` is for durable documentation.
+- [Power measurements](reports/2026-11-08-power-baseline.md) record battery, idle-policy and earlier performance comparisons and their limitations.
 - The tested phone stops charging at 55% and resumes at 50%; see [device notes](docs/device.md) for details and recovery.
 - `local/` holds Git-ignored device inputs and credentials on the original workstation. [Local materials](docs/local-materials.md) lists its contents and explains how to reproduce public build inputs.
 
@@ -67,14 +68,16 @@ python3 tests/test-restore-area.py  # root
 
 The backup tests use temporary directories and an isolated Restic repository; they require `restic`, `rsync`, `nice`, and `ionice`. They do not test real gameplay or guarantee atomic snapshots of a changing world. Run `/tmp/n20-dashboard-test --benchmark` for an isolated renderer comparison. For an optional disposable server heap comparison, run `python3 tools/benchmark-server-memory.py --jar /opt/n20-minecraft/current/server.jar --eula /srv/minecraft/eula.txt` as root; it temporarily increases device load. Set `N20_UI_METRICS=1` when launching the dashboard to log aggregate rendering time, event-to-frame-submission time, and peak RSS; neither measures whole-phone power.
 
-For a read-only battery log on the phone, run `python3 tools/measure-battery.py --duration 600 --interval 10 > /tmp/n20-battery.csv`. Compare unplugged runs with similar workloads and display states; the vendor current counter is not calibrated. See [the power baseline](docs/power-baseline.md) for measurements, limitations, and the current display-wake constraint.
+For a read-only battery log on the phone, run `python3 tools/measure-battery.py --duration 600 --interval 10 > /tmp/n20-battery.csv`. Compare unplugged runs with similar workloads and display states; the vendor current counter is not calibrated. See [the power baseline](reports/2026-11-08-power-baseline.md) for measurements, limitations, and the current display-wake constraint.
 
 For a synthetic active-world heap comparison, run `python3 tools/benchmark-server-workload.py --jar /opt/n20-minecraft/current/server.jar --eula /srv/minecraft/eula.txt` as root. It creates disposable loopback-only worlds and temporarily adds substantial load; `--reverse` swaps the heap test order. Its results do not establish real-play latency or battery life.
 
-The [connected-client distance benchmark](docs/chunk-benchmark.md) compares
+The [connected-client distance benchmark](reports/2026-11-09-chunk-distances.md) compares
 loading, stationary play and new-terrain movement using disposable worlds.
 Its harness temporarily stops an idle production server and restores it on
 exit. It does not measure client rendering or calibrated electrical power.
+See [server tuning](docs/server-tuning.md) for the available controls and
+[benchmark instructions](docs/benchmarking.md) for repeatable comparisons.
 
 From Windows, build the dashboard on the existing phone without installing it:
 
