@@ -1,0 +1,10 @@
+[
+  {"id":"r01","question":"How many honeycombs do I use to craft a beehive?","titles":["Beehive"],"expect":["\\b(?:3|three)\\b"],"evidence":["3 × honeycomb"]},
+  {"id":"r02","question":"How many iron ingots does it take to craft a shield?","titles":["Shield"],"expect":["\\b(?:1|one)\\b"],"evidence":["1 × iron ingot"]},
+  {"id":"r03","question":"How many diamonds are in a jukebox recipe?","titles":["Jukebox"],"expect":["\\b(?:1|one)\\b"],"evidence":["1 × diamond"]},
+  {"id":"r04","question":"How many bookshelves does one lectern recipe take?","titles":["Lectern"],"expect":["\\b(?:1|one)\\b"],"evidence":["1 × bookshelf"]},
+  {"id":"r05","question":"How many iron ingots go into one smithing table?","titles":["Smithing Table"],"expect":["\\b(?:2|two)\\b"],"evidence":["2 × iron ingot"]},
+  {"id":"r06","question":"How many stone slabs go into one grindstone recipe?","titles":["Grindstone"],"expect":["\\b(?:1|one)\\b"],"evidence":["1 × stone slab"]},
+  {"id":"r07","question":"How many pieces of string do I need to craft a loom?","titles":["Loom"],"expect":["\\b(?:2|two)\\b"],"evidence":["2 × string"]},
+  {"id":"r08","question":"How many tripwire hooks are used in a crossbow recipe?","titles":["Crossbow"],"expect":["\\b(?:1|one)\\b"],"evidence":["1 × tripwire hook"]}
+]
