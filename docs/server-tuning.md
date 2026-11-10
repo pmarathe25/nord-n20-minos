@@ -37,6 +37,11 @@ See [Java's option reference](https://docs.oracle.com/en/java/javase/25/docs/spe
 
 [Lithium](https://modrinth.com/mod/lithium) targets game logic while aiming to
 preserve vanilla mechanics and explicitly supports server-only installation.
+This is not exact behavioral equivalence: the tested release documents
+default-enabled differences in portal-search chunk loading, chunk unload order,
+and explosion edge cases. See its [versioned optimization reference](https://github.com/CaffeineMC/lithium/blob/mc26.3-0.26.3/lithium-fabric-mixin-config.md).
+Specific optimizations can be disabled, but parity-sensitive contraptions still
+need validation; the terrain benchmark does not provide that validation.
 [C2ME](https://modrinth.com/mod/c2me-fabric) parallelizes generation, I/O and
 loading. Test the exact build; release labels and compatibility change over
 time. A mod being faster in a short terrain test is not sufficient evidence to

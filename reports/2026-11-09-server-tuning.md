@@ -151,6 +151,11 @@ sizing is the strongest tested general-survival starting point, with vanilla
 plus the same flag as a simpler alternative. Neither establishes a universal
 optimum for a developed world or multiple players.
 
+A subsequent source review found documented, default-enabled behavior differences
+in this Lithium release. The performance recommendation does not establish
+vanilla equivalence; see the [versioned optimization reference](https://github.com/CaffeineMC/lithium/blob/mc26.3-0.26.3/lithium-fabric-mixin-config.md)
+and [compatibility guidance](../docs/server-tuning.md).
+
 ## Distant Horizons compatibility
 
 A separate 45-second compatibility run used view 24 / simulation 10, Lithium,

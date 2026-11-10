@@ -64,8 +64,8 @@ Wi-Fi power-saving policy are unchanged by the range expansion.
 
 For general survival play, start with **24 view / 10 simulation**, using 8 as
 a lower-load alternative. Simulation 10 preserves the usual default radius.
-A fresh server normally starts at
-10 view / 10 simulation; the two settings serve different purposes. See the
+MinOS's reference configuration defaults to 24/10.
+Vanilla defaults to 10 view / 10 simulation; the two settings serve different purposes. See the
 [server properties reference](https://docs.papermc.io/paper/reference/server-properties/).
 
 Simulation 4 is an optional exploration or lower-load setting. Its roughly
