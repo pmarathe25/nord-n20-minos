@@ -488,6 +488,11 @@ fn rank(
     let making = ["craft", "make", "turn", "create", "build", "carve"]
         .iter()
         .any(|word| terms.contains(word));
+    let q = question.to_ascii_lowercase();
+    let asks_usage = q.contains("used for")
+        || q.contains("use for")
+        || q.contains("what does")
+        || q.contains("what can i do with");
     let minimum = ["minimum", "start", "enough", "least"]
         .iter()
         .any(|word| terms.contains(word));
@@ -545,6 +550,7 @@ fn rank(
         let describes_creation = making
             && shared_title > 0
             && (result_type == "crafting"
+                || result_type == "smelting"
                 || result_type == "obtaining"
                 || result_type == "cutting"
                 || result_type == "creation"
@@ -558,6 +564,23 @@ fn rank(
             + 2.8 * f64::from(numeric)
             + 2.3 * f64::from(minimum && numeric && text_terms.contains("minimum"))
             + 3.0 * f64::from(describes_creation)
+            - 3.0 * f64::from(making && result_type == "usage")
+            + 8.0
+                * f64::from(
+                    asks_usage
+                        && shared_title > 0
+                        && (result_type == "usage" || result_type == "smithing ingredient"),
+                )
+            + 2.0 * f64::from(asks_usage && !item.passage.text.starts_with("Ingredients:"))
+            + 3.0
+                * f64::from(
+                    item.overview
+                        && shared_title > 0
+                        && ["A ", "An ", "The "]
+                            .iter()
+                            .any(|prefix| item.passage.text.starts_with(prefix)),
+                )
+            - 2.0 * f64::from(item.passage.text.starts_with("It "))
             + 1.5 * f64::from(item.overview)
             - 4.0
                 * f64::from(

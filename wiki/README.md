@@ -88,6 +88,7 @@ Review the answers alongside the pattern-based scores.
 
 Use `--cases wiki/benchmark-fresh.json` for the follow-up question set.
 Use `--cases wiki/benchmark-recipes.json` to check recipe counts.
+Use `--cases wiki/benchmark-recent-chat.json` for recent armor-trim and dye questions.
 Use `--answer-style chat` to exercise the phone bridge's grounded prompt,
 prefix reuse, stop rule, and source validation. Its JSONL includes per-request
 model timings when llama-server reports them. The desktop benchmark calls
@@ -97,6 +98,32 @@ Use `--answer-style grounded` to test the single-call support-first prompt.
 The harness records the supporting line for review and scores the player-facing
 answer separately.
 
+## Experimental page-prefix snapshots
+
+`build_page_cache.py` generates offline snapshots for cleaned default sections,
+using the current chat prompt and the model server's template and tokenizer.
+It is not wired into the phone bridge. It requires a dedicated local
+llama-server with one slot and `--slot-save-path` set to the same private output
+directory. Use a separate cache copy and server while experimenting:
+
+```sh
+mkdir -p /tmp/wiki-page-states
+llama-server --model /path/model.gguf --host 127.0.0.1 --port 8080 \
+  --parallel 1 --ctx-size 4096 --slot-save-path /tmp/wiki-page-states
+python3 wiki/build_page_cache.py --cache /path/to/wiki-cache \
+  --output /tmp/wiki-page-states --model /path/model.gguf \
+  --runtime /path/to/llama-server --profile 'backend-and-all-options' --reserve-tokens 512
+```
+
+The profile must identify runtime libraries, backend, firmware, context and KV
+settings not captured by the executable hash and server metadata. The manifest
+identifies the model, executable, server build, profile, article revision,
+prompt tokens and state checksum. An overlong or invalid page is reported and
+causes a nonzero exit; other valid pages are still generated. State files can be
+large. Compatibility across builds, devices or backends is not established; a
+future consumer must verify identity, checksum and the token prefix before reuse.
+Whole-page prompting and fallback for long pages need further evaluation.
+
 ## Build and test
 
 For a static ARM64 Linux build, install Zig and `cargo-zigbuild`, and add the
@@ -104,6 +131,7 @@ For a static ARM64 Linux build, install Zig and `cargo-zigbuild`, and add the
 
 ```sh
 cargo test --manifest-path wiki/Cargo.toml --locked
+python3 tests/test-wiki-page-cache.py
 cargo zigbuild --manifest-path wiki/Cargo.toml --locked --release --target aarch64-unknown-linux-musl
 ```
 

@@ -328,6 +328,55 @@ mod tests {
     }
 
     #[test]
+    fn recent_player_questions_retrieve_actionable_evidence() {
+        let cache = tempfile::tempdir().unwrap();
+        let pages = [
+            (
+                "Coast Armor Trim",
+                r#"<p>A coast armor trim is a type of smithing template used in smithing tables to add a trim to armor. It is consumed when used, but can be duplicated using an existing template, cobblestone, and seven diamonds.</p><h2 id="Usage">Usage</h2><p>It is an ingredient in its own recipe.</p><h3 id="Smithing_ingredient">Smithing ingredient</h3><p>Using the smithing table, the coast armor trim can be applied to any armor piece, using any trim material.</p>"#,
+            ),
+            (
+                "Green Dye",
+                r#"<p>Green dye is one of the sixteen available dyes.</p><h2 id="Smelting">Smelting</h2><table class="wikitable"><tr><th>Name</th><th>Ingredients</th><th>Smelting recipe</th></tr><tr><td>Green Dye</td><td>Cactus + Any fuel</td><td>1</td></tr></table><h2 id="Usage">Usage</h2><p>Combined with gunpowder to make a firework star.</p>"#,
+            ),
+            (
+                "Lime Dye",
+                r#"<p>Lime dye is one of the sixteen available dyes.</p><h2 id="Crafting">Crafting</h2><table class="wikitable"><tr><th>Ingredients</th><th>Crafting recipe</th></tr><tr><td>Green Dye + White Dye</td><td>1</td></tr><tr><td>Green Dye + Bone Meal</td><td>2</td></tr></table><h2 id="Smelting">Smelting</h2><table class="wikitable"><tr><th>Name</th><th>Ingredients</th></tr><tr><td>Lime Dye</td><td>Sea Pickle + Any fuel</td></tr></table>"#,
+            ),
+        ];
+        for (title, body) in pages {
+            cached_article(cache.path(), title, Mode::Cached, |_| {
+                Ok(Page {
+                    title: title.into(),
+                    revid: 1,
+                    text: format!(r#"<div class="mw-parser-output">{body}</div>"#),
+                })
+            })
+            .unwrap();
+        }
+        let mut index = Index::open(cache.path()).unwrap();
+        index.sync(cache.path()).unwrap();
+        for (question, expected) in [
+            ("what is coast armor trim?", "smithing table"),
+            ("what can I do with the coast armor trim?", "armor piece"),
+            ("what is the coast armor trim used for?", "armor piece"),
+            ("what does coast armor trim do", "armor piece"),
+            ("how do I make or get green dye?", "Cactus"),
+            ("how to make lime dye?", "Green Dye + White Dye"),
+        ] {
+            let found = evidence(&mut index, cache.path(), question, true).unwrap();
+            assert!(
+                found["passages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["text"].as_str().unwrap().contains(expected)),
+                "{question}: {found}"
+            );
+        }
+    }
+
+    #[test]
     fn indexes_existing_cache_and_refreshes_only_changed_revisions() {
         let cache = tempfile::tempdir().unwrap();
         let cache = cache.path();

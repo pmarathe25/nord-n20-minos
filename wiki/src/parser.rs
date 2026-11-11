@@ -821,6 +821,89 @@ mod tests {
     }
 
     #[test]
+    fn default_gameplay_text_excludes_navigation_media_old_and_other_editions() {
+        let page = article(
+            r#"
+            <header><p>Header noise</p></header><nav><a href="/w/Noise">Navigation noise</a></nav>
+            <aside>Sidebar noise</aside><footer>Footer noise</footer>
+            <div class="sidebar">Sidebar class noise</div><div class="navbox">Navbox noise</div>
+            <div class="toc">Contents noise</div><div class="mw-editsection">Edit noise</div>
+            <p>A useful <a href="/w/Armor">armor</a> fact.<sup class="reference">[1]</sup></p>
+            <p>Java Edition:</p><p>Java gameplay rule.</p>
+            <p>Bedrock Edition:</p><p>Bedrock gameplay rule.</p>
+            <h2 id="Usage">Usage</h2><p>Shared usage.</p>
+            <h2 id="History">History</h2><p>Old version rule.</p><h3 id="History_child">Details</h3><p>Old child.</p>
+            <h2 id="Gallery">Gallery</h2><p>Gallery noise.</p>
+            <h2 id="Sounds">Sounds</h2><p>Sound noise.</p>
+            <h2 id="Bedrock_Edition">Bedrock Edition</h2><p>Bedrock heading rule.</p>
+            <h2 id="Mechanics">Mechanics</h2><p>Shared mechanics.</p>
+        "#,
+        );
+        let text = page.passages(None).to_string();
+        for keep in [
+            "A useful armor fact.",
+            "Java gameplay rule.",
+            "Shared usage.",
+            "Shared mechanics.",
+        ] {
+            assert!(text.contains(keep), "missing {keep}: {text}");
+        }
+        for exclude in [
+            "Header noise",
+            "Navigation noise",
+            "Sidebar",
+            "Footer noise",
+            "Navbox noise",
+            "Contents noise",
+            "Edit noise",
+            "[1]",
+            "Bedrock gameplay",
+            "Old version",
+            "Old child",
+            "Gallery noise",
+            "Sound noise",
+            "Bedrock heading",
+        ] {
+            assert!(!text.contains(exclude), "unexpected {exclude}: {text}");
+        }
+        assert!(
+            page.passages(Some("History"))
+                .to_string()
+                .contains("Old version rule.")
+        );
+        assert!(
+            page.passages(Some("Sounds"))
+                .to_string()
+                .contains("Sound noise.")
+        );
+    }
+
+    #[test]
+    fn edition_annotations_do_not_remove_shared_text_or_leak_other_edition_rows() {
+        let page = article(
+            r#"
+            <p>Shared rule. Bedrock-only rule.<sup class="Inline-Template"><span title="This statement only applies to Bedrock Edition">BE</span></sup> Another shared rule.</p>
+            <table class="wikitable"><tr><th>Java Edition</th></tr><tr><th>Value</th></tr><tr><td>Java row</td></tr>
+            <tr><th>Bedrock Edition</th></tr><tr><th>Value</th></tr><tr><td>Bedrock row</td></tr>
+            <tr><th>Java Edition</th></tr><tr><th>Value</th></tr><tr><td>Second Java row</td></tr></table>
+            <table class="wikitable"><caption>Bedrock Edition</caption><tr><th>Value</th></tr><tr><td>Other table</td></tr></table>
+        "#,
+        );
+        let text = page.passages(None).to_string();
+        for keep in [
+            "Shared rule.",
+            "Another shared rule.",
+            "Java row",
+            "Second Java row",
+        ] {
+            assert!(text.contains(keep), "{text}");
+        }
+        for exclude in ["Bedrock-only rule", "Bedrock row", "Other table"] {
+            assert!(!text.contains(exclude), "{text}");
+        }
+    }
+
+    #[test]
     fn retains_java_rows_and_excludes_marked_sections() {
         let page = article(
             r#"

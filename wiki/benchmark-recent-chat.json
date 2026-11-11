@@ -1,0 +1,8 @@
+[
+  {"id":"chat01","question":"what is coast armor trim?","titles":["Coast Armor Trim"],"expect":["smithing|trim","armor"],"evidence":["smithing table|smithing tables","armor"]},
+  {"id":"chat02","question":"what can I do with the coast armor trim?","titles":["Coast Armor Trim"],"expect":["armor","apply|trim|decorat|appearance"],"evidence":["armor piece|trim to armor"]},
+  {"id":"chat03","question":"what is the coast armor trim used for?","titles":["Coast Armor Trim"],"expect":["armor","trim|decorat|appearance"],"evidence":["armor piece|trim to armor"]},
+  {"id":"chat04","question":"what does coast armor trim do","titles":["Coast Armor Trim"],"expect":["armor","trim|decorat|appearance"],"evidence":["armor piece|trim to armor"]},
+  {"id":"chat05","question":"how do I make or get green dye?","titles":["Green Dye"],"expect":["cactus","smelt|furnace|cook"],"evidence":["cactus"]},
+  {"id":"chat06","question":"how to make lime dye?","titles":["Lime Dye"],"expect":["green dye","white dye|bone meal"],"evidence":["green dye.*(?:white dye|bone meal)"]}
+]
