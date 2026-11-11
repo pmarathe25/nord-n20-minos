@@ -1,0 +1,67 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 907ae52..8c8c1dd 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3051,6 +3051,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+         }
++        if (n20_phase_attn) ggml_set_name(cur, "n20_trace_flash");
+         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+@@ -3079,6 +3080,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+     } else {
+         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+         cb(kq, "kq", il);
++        if (n20_single) ggml_set_name(kq, "n20_trace_qk");
+ 
+         // note: this op tends to require high floating point range
+         //       while for some models F16 is enough, for others it is not, so we default to F32 here
+@@ -3114,15 +3116,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+         ggml_soft_max_add_sinks(kq, sinks);
+         cb(kq, "kq_soft_max", il);
++        if (n20_single) ggml_set_name(kq, "n20_trace_softmax");
+ 
+         if (!v_trans) {
+             // note: avoid this branch
+             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+             cb(v, "v_cont", il);
++            if (n20_single) ggml_set_name(v, "n20_trace_vcopy");
+         }
+ 
+         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+         cb(kqv, "kqv", il);
++        if (n20_single) ggml_set_name(kqv, "n20_trace_kqv");
+ 
+         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+         if (v_mla) {
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5626bd1..bd922d4 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #define CL_TARGET_OPENCL_VERSION GGML_OPENCL_TARGET_VERSION
+ #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+ 
+@@ -39331,12 +39332,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             if (!any_on_device) {
+                 return false;
+             }
++            if (strcmp(tensor->name, "n20_trace_flash") == 0) { static std::atomic<bool> once{false}; if (!once.exchange(true)) fprintf(stderr, "n20 phase GPU execution: flash\n"); }
+             ggml_cl_flash_attn(backend, tensor->src[0], tensor->src[1], tensor);
+             return true;
+         default:
+             return false;
+     }
+ 
++    if (strncmp(tensor->name, "n20_trace_", 10) == 0) {
++        static std::atomic<unsigned> seen{0};
++        unsigned bit = strcmp(tensor->name, "n20_trace_qk") == 0 ? 1 : strcmp(tensor->name, "n20_trace_softmax") == 0 ? 2 : strcmp(tensor->name, "n20_trace_vcopy") == 0 ? 4 : strcmp(tensor->name, "n20_trace_kqv") == 0 ? 8 : 0;
++        if (bit && !(seen.fetch_or(bit) & bit)) fprintf(stderr, "n20 phase GPU execution: %s\n", tensor->name + 10);
++    }
+     func(backend, tensor->src[0], tensor->src[1], tensor);
+     return true;
+ }

@@ -1,0 +1,31 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index edf1ca7..907ae52 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -17,6 +17,8 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <atomic>
++#include <cstdlib>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -3015,7 +3017,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+     ggml_tensor * cur;
+ 
+-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
++    // Experimental one-token path; freeze the opt-in for graph-cache consistency.
++    static const bool n20_phase_attn = std::getenv("N20_PHASE_ATTN") != nullptr;
++    const bool n20_single = n20_phase_attn && arch == LLM_ARCH_QWEN35 && n_tokens == 1 &&
++        n_stream == 1 && kv_rows == nullptr && kq_b == nullptr && sinks == nullptr && v_mla == nullptr && !v_trans && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
++    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !n20_single;
++    if (n20_phase_attn && cparams.flash_attn && kq_b == nullptr) {
++        static std::atomic<bool> logged_flash{false}, logged_single{false};
++        if (n20_single && !logged_single.exchange(true)) fprintf(stderr, "n20 phase attention: one-token non-FA\n");
++        if (use_flash_attn && !logged_flash.exchange(true)) fprintf(stderr, "n20 phase attention: flash\n");
++    }
+     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
+     if (use_flash_attn) {
+         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");

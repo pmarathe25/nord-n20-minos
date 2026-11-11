@@ -1,0 +1,153 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -32,6 +32,14 @@
+ );
+ 
+ #include <CL/cl.h>
++#ifdef __ANDROID__
++#include <dlfcn.h>
++struct n20_hybrid;
++using n20_hybrid_open_fn = int (*)(n20_hybrid **,cl_context,cl_device_id,cl_command_queue,const char *,const char *);
++using n20_hybrid_close_fn = void (*)(n20_hybrid **);
++using n20_hybrid_upload_fn = int (*)(n20_hybrid *,const void *,size_t,uint32_t *,float *);
++using n20_hybrid_project_fn = int (*)(n20_hybrid *,uint32_t,float,unsigned,unsigned,cl_mem,cl_mem,cl_mem,cl_mem,cl_mem,cl_ulong);
++#endif
+ 
+ #include <inttypes.h>
+ #include <string.h>
+@@ -713,6 +721,46 @@
+ 
+     cl_context context;
+     cl_command_queue queue;
++
++#ifdef __ANDROID__
++    void * n20_hybrid_lib = nullptr;
++    n20_hybrid * n20_hybrid_state = nullptr;
++    n20_hybrid_close_fn n20_hybrid_close = nullptr;
++    n20_hybrid_upload_fn n20_hybrid_upload = nullptr;
++    n20_hybrid_project_fn n20_hybrid_project = nullptr;
++    bool n20_hybrid_attempted = false;
++    uint64_t n20_hybrid_epoch = 0;
++
++    void n20_hybrid_release() {
++        if (n20_hybrid_state && n20_hybrid_close) n20_hybrid_close(&n20_hybrid_state);
++        if (n20_hybrid_lib) dlclose(n20_hybrid_lib);
++        n20_hybrid_lib = nullptr; n20_hybrid_close = nullptr;
++        n20_hybrid_upload = nullptr; n20_hybrid_project = nullptr;
++        n20_hybrid_attempted = false;
++    }
++    bool n20_hybrid_initialize() {
++        if (n20_hybrid_attempted) return n20_hybrid_state != nullptr;
++        n20_hybrid_attempted = true;
++        const char *path = getenv("N20_HYBRID_RUNTIME");
++        const char *row = getenv("N20_HYBRID_ROW_SOURCE");
++        const char *aux = getenv("N20_HYBRID_AUX_SOURCE");
++        if (!path || !*path || !row || !*row || !aux || !*aux) return false;
++        n20_hybrid_lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++        if (!n20_hybrid_lib) { GGML_LOG_WARN("n20: hybrid library unavailable: %s\n", dlerror()); return false; }
++        auto open = (n20_hybrid_open_fn)dlsym(n20_hybrid_lib, "n20_hybrid_open");
++        n20_hybrid_close = (n20_hybrid_close_fn)dlsym(n20_hybrid_lib, "n20_hybrid_close");
++        n20_hybrid_upload = (n20_hybrid_upload_fn)dlsym(n20_hybrid_lib, "n20_hybrid_upload");
++        n20_hybrid_project = (n20_hybrid_project_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project");
++        if (!open || !n20_hybrid_close || !n20_hybrid_upload || !n20_hybrid_project ||
++            open(&n20_hybrid_state, context, device, queue, row, aux) != 0) {
++            GGML_LOG_WARN("n20: hybrid initialization failed; using GPU\n");
++            n20_hybrid_release(); n20_hybrid_attempted = true; return false;
++        }
++        ++n20_hybrid_epoch;
++        GGML_LOG_INFO("n20: experimental GPU/Hexagon runtime enabled\n");
++        return true;
++    }
++#endif
+ 
+     // On-disk compiled-program cache (see GGML_OPENCL_KERNEL_CACHE_DIR).
+     cl_program_cache_state program_cache;
+@@ -1486,6 +1534,9 @@
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+ 
+     ~ggml_backend_opencl_context() {
++#ifdef __ANDROID__
++        n20_hybrid_release();
++#endif
+         for (cl_kernel kernel : kernel_n20_fwht) {
+             if (kernel) {
+                 CL_CHECK(clReleaseKernel(kernel));
+@@ -1539,6 +1590,9 @@
+ 
+         ref_count--;
+         if (ref_count == 0) {
++#ifdef __ANDROID__
++            n20_hybrid_release();
++#endif
+             if (fa.fd_partial.buffer) {
+                 CL_CHECK(clReleaseMemObject(fa.fd_partial.buffer));
+                 fa.fd_partial.buffer = nullptr;
+@@ -10163,6 +10217,11 @@
+ };
+ 
+ struct ggml_tensor_extra_cl_q2_0 {
++#ifdef __ANDROID__
++    int n20_dsp_slot = -1;
++    float n20_dsp_unit = 0;
++    uint64_t n20_dsp_epoch = 0;
++#endif
+     bool noshuffle = false;
+     cl_mem qs = nullptr;
+     cl_mem d = nullptr;
+@@ -10172,6 +10231,9 @@
+     ~ggml_tensor_extra_cl_q2_0() { reset(); }
+ 
+     void reset() {
++#ifdef __ANDROID__
++        n20_dsp_slot = -1; n20_dsp_unit = 0; n20_dsp_epoch = 0;
++#endif
+         noshuffle = false;
+         if (qs != nullptr) { CL_CHECK(clReleaseMemObject(qs)); qs = nullptr; }
+         if (d != nullptr) { CL_CHECK(clReleaseMemObject(d)); d = nullptr; }
+@@ -14072,6 +14134,22 @@
+         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+         ggml_tensor_extra_cl_q2_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q2_0();
+         extra->noshuffle = ggml_cl_q2_0_use_noshuffle(backend_ctx, tensor);
++#ifdef __ANDROID__
++        // Slots are never recycled within one runtime session. Resetting an
++        // extra invalidates its slot, and an epoch blocks use after teardown.
++        if (extra->noshuffle && !tensor->view_src && tensor->ne[0] == 2560 && tensor->ne[1] == 9216 &&
++            tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
++            (strstr(tensor->name, "ffn_gate.weight") || strstr(tensor->name, "ffn_up.weight")) &&
++            backend_ctx->n20_hybrid_initialize()) {
++            uint32_t slot=0; float unit=0;
++            if (backend_ctx->n20_hybrid_upload(backend_ctx->n20_hybrid_state,data,size,&slot,&unit)==0) {
++                extra->n20_dsp_slot=(int)slot; extra->n20_dsp_unit=unit;
++                extra->n20_dsp_epoch=backend_ctx->n20_hybrid_epoch;
++            } else {
++                GGML_LOG_WARN("n20: hybrid weight upload failed; using GPU for tensor %s\n",tensor->name);
++            }
++        }
++#endif
+ 
+         const size_t blck  = (size_t)ggml_blck_size(tensor->type);
+         const size_t n_blk = ggml_nelements(tensor) / blck;
+@@ -24622,7 +24700,22 @@
+     size_t local[] = { 1, 128, 1 };
+     bool dispatched = false;
+     const bool ffn = (m == 9216 && k == 2560) || (m == 2560 && k == 9216);
+-    if (backend_ctx->n20_q2_texture && ffn && n >= 16 && (size_t)padded_n/4 <= N20_TEXTURE_WIDTH) {
++#ifdef __ANDROID__
++    if (m == 9216 && k == 2560 && n >= 16 && n <= 256 && backend_ctx->n20_q2_texture &&
++        backend_ctx->n20_hybrid_state && backend_ctx->n20_hybrid_project && extra0->n20_dsp_slot >= 0 &&
++        extra0->n20_dsp_epoch == backend_ctx->n20_hybrid_epoch && ggml_is_contiguous(src1) &&
++        ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32 && dst->ne[0] == m && dst->ne[1] == n &&
++        dst->ne[2] == 1 && dst->ne[3] == 1 && dst->nb[1] == (size_t)m * sizeof(float)) {
++        dispatched = backend_ctx->n20_hybrid_project(backend_ctx->n20_hybrid_state,
++            (uint32_t)extra0->n20_dsp_slot,extra0->n20_dsp_unit,(unsigned)n,(unsigned)padded_n,
++            b_sub_buf_trans,backend_ctx->n20_q2_texture,extra0->qs,extra0->d,extrad->data_device,offsetd) != 0;
++        if (dispatched) {
++            static std::once_flag trace;
++            std::call_once(trace, [] { GGML_LOG_INFO("n20: experimental GPU/Hexagon Q2 projection dispatched\n"); });
++        }
++    }
++#endif
++    if (!dispatched && backend_ctx->n20_q2_texture && ffn && n >= 16 && (size_t)padded_n/4 <= N20_TEXTURE_WIDTH) {
+         const cl_mem texture = backend_ctx->n20_q2_texture;
+         const cl_kernel gemm = backend_ctx->kernel_n20_q2_texture;
+         const size_t origin[] = {0, 0, 0};

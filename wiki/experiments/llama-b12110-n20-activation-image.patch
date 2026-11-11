@@ -1,0 +1,209 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -445,6 +445,10 @@ static void populateProfilingInfo(
+     info.output_size[3] = tensor->ne[3];
+ }
+ 
++// The Wiki worker's tested 256-token microbatch and largest FFN input width.
++static constexpr size_t N20_TEXTURE_WIDTH = 256/4;
++static constexpr size_t N20_TEXTURE_HEIGHT = 9216;
++
+ struct ggml_backend_opencl_context;
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+@@ -1040,6 +1044,8 @@ struct ggml_backend_opencl_context {
+     size_t q2_0_mv_workgroup_size_wide = 512;
+     cl_kernel kernel_gemm_noshuffle_q2_0_f32 = nullptr;
+     cl_kernel kernel_n20_q2_tail = nullptr;
++    cl_kernel kernel_n20_q2_texture = nullptr;
++    cl_mem n20_q2_texture = nullptr;
+     cl_kernel kernel_gemm_noshuffle_q2_0_q8_1_dp4a = nullptr;
+     cl_kernel kernel_gemm_noshuffle_q2_0_q8_1_dp4a_narrow = nullptr;
+     int q2_0_mv_nsg = 32;
+@@ -1314,7 +1320,7 @@ struct ggml_backend_opencl_context {
+         return workgroup_size;
+     }
+ 
+-    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
++    cl_int try_enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+         // From the spec on clEnqueueNDRangeKernel:
+         // If the device associated with command_queue is an OpenCL 2.1 or newer device,
+         // and global_work_size is NULL or the value in any passed dimension is zero,
+@@ -1324,24 +1330,32 @@ struct ggml_backend_opencl_context {
+         // case of an older device.
+         for (cl_uint i = 0; i < work_dim; i++) {
+             if (global_work_size[i] == 0) {
+-                return;
++                return CL_SUCCESS;
+             }
+         }
+ #ifdef GGML_OPENCL_PROFILING
+         cl_event evt;
+-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
++        const cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt);
++        if (err != CL_SUCCESS) {
++            return err;
++        }
+ 
+         profiling_info.emplace_back();
+         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
+         if (profiling_info.size() >= 2048) {
+             flush_profiling_batch();
+         }
++        return CL_SUCCESS;
+ #else
+         GGML_UNUSED(tensor);
+-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
++        return clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+ #endif
+     }
+ 
++    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
++        CL_CHECK(try_enqueue_ndrange_kernel(kernel, work_dim, global_work_size, local_work_size, tensor));
++    }
++
+     const void * get_adreno_bin_kernel(const std::string &kernel_name, size_t *bin_size) const {
+         if (!get_adreno_bin_kernel_func) {
+             return nullptr;
+@@ -1484,6 +1498,12 @@ struct ggml_backend_opencl_context {
+         if (kernel_n20_q2_vocab16) {
+             CL_CHECK(clReleaseKernel(kernel_n20_q2_vocab16));
+         }
++        if (n20_q2_texture) {
++            CL_CHECK(clReleaseMemObject(n20_q2_texture));
++        }
++        if (kernel_n20_q2_texture) {
++            CL_CHECK(clReleaseKernel(kernel_n20_q2_texture));
++        }
+         if (kernel_n20_q2_tail) {
+             CL_CHECK(clReleaseKernel(kernel_n20_q2_tail));
+         }
+@@ -5140,6 +5160,67 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    if (const char * path = getenv("N20_Q2_TEXTURE_SOURCE")) {
++        if (!getenv("N20_Q2_PREFILL_SOURCE")) {
++            GGML_ABORT("n20: activation texture requires the tuned prefill fallback");
++        }
++        cl_bool image_support = CL_FALSE;
++        size_t max_width = 0;
++        size_t max_height = 0;
++        cl_ulong max_allocation = 0;
++        cl_command_queue_properties queue_properties = 0;
++        const auto device = backend_ctx->device;
++        if (clGetDeviceInfo(device, CL_DEVICE_IMAGE_SUPPORT, sizeof(image_support), &image_support, nullptr) != CL_SUCCESS ||
++            clGetDeviceInfo(device, CL_DEVICE_IMAGE2D_MAX_WIDTH, sizeof(max_width), &max_width, nullptr) != CL_SUCCESS ||
++            clGetDeviceInfo(device, CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(max_height), &max_height, nullptr) != CL_SUCCESS ||
++            clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_allocation), &max_allocation, nullptr) != CL_SUCCESS ||
++            clGetCommandQueueInfo(backend_ctx->queue, CL_QUEUE_PROPERTIES, sizeof(queue_properties), &queue_properties, nullptr) != CL_SUCCESS ||
++            !image_support || max_width < N20_TEXTURE_WIDTH || max_height < N20_TEXTURE_HEIGHT ||
++            max_allocation < N20_TEXTURE_WIDTH*N20_TEXTURE_HEIGHT*4*sizeof(cl_half) ||
++            (queue_properties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE)) {
++            GGML_ABORT("n20: OpenCL activation texture limits unavailable");
++        }
++
++        const auto context = backend_ctx->context;
++        cl_uint format_count = 0;
++        CL_CHECK(clGetSupportedImageFormats(context, CL_MEM_READ_ONLY, CL_MEM_OBJECT_IMAGE2D, 0, nullptr, &format_count));
++        if (!format_count) {
++            GGML_ABORT("n20: no OpenCL read-only activation texture formats");
++        }
++        std::vector<cl_image_format> formats(format_count);
++        CL_CHECK(clGetSupportedImageFormats(context, CL_MEM_READ_ONLY, CL_MEM_OBJECT_IMAGE2D, format_count, formats.data(), nullptr));
++        const cl_image_format format = { CL_RGBA, CL_HALF_FLOAT };
++        if (std::none_of(formats.begin(), formats.end(), [&](const cl_image_format & candidate) {
++                return candidate.image_channel_order == format.image_channel_order &&
++                       candidate.image_channel_data_type == format.image_channel_data_type;
++            })) {
++            GGML_ABORT("n20: OpenCL activation texture format unavailable");
++        }
++
++        const std::string source = read_file(path);
++        if (source.empty()) {
++            GGML_ABORT("n20: empty or unreadable OpenCL activation texture source");
++        }
++        cl_program program = build_program_from_source(backend_ctx, source.c_str(), compile_opts);
++        backend_ctx->kernel_n20_q2_texture = clCreateKernel(program, "kernel_gemm_noshuffle_q2_0_f32", &err);
++        CL_CHECK(err);
++        CL_CHECK(clReleaseProgram(program));
++        if (backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_n20_q2_texture) < 128) {
++            GGML_ABORT("n20: OpenCL activation texture requires a 128-lane workgroup");
++        }
++
++        // A single bounded texture is reused by the in-order compute queue.
++        cl_image_desc desc = {};
++        desc.image_type = CL_MEM_OBJECT_IMAGE2D;
++        desc.image_width = N20_TEXTURE_WIDTH;
++        desc.image_height = N20_TEXTURE_HEIGHT;
++        backend_ctx->n20_q2_texture = clCreateImage(context, CL_MEM_READ_ONLY, &format, &desc, nullptr, &err);
++        if (err != CL_SUCCESS || !backend_ctx->n20_q2_texture) {
++            GGML_ABORT("n20: OpenCL activation texture allocation failed (%d)", err);
++        }
++        GGML_LOG_INFO("n20: selected Q2_0 activation texture source %s\n", path);
++    }
++
+     // gemv_noshuffle_iq4_xs_f32
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -24512,18 +24593,49 @@ static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_t
+         static std::once_flag trace;
+         std::call_once(trace, [] { GGML_LOG_INFO("n20: four-token Q2_0 tail\n"); });
+     }
+-    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &extra0->qs));
+-    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),    &extra0->d));
+-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),    &b_img_trans));
+-    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),    &extrad->data_device));
+-    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong),  &offsetd));
+-    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),       &m));
+-    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),       &padded_n));
+-    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),       &k));
+-    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),       &n));
++    const auto set_gemm_args = [&](cl_kernel gemm, cl_mem input) {
++        const void * args[] = { &extra0->qs, &extra0->d, &input, &extrad->data_device,
++                               &offsetd, &m, &padded_n, &k, &n };
++        const size_t sizes[] = { sizeof(cl_mem), sizeof(cl_mem), sizeof(cl_mem), sizeof(cl_mem),
++                                 sizeof(cl_ulong), sizeof(int), sizeof(int), sizeof(int), sizeof(int) };
++        for (cl_uint i = 0; i < sizeof(args)/sizeof(args[0]); ++i) {
++            const cl_int status = clSetKernelArg(gemm, i, sizes[i], args[i]);
++            if (status != CL_SUCCESS) {
++                return status;
++            }
++        }
++        return CL_SUCCESS;
++    };
+     size_t global[] = { (size_t)CEIL_DIV(n, 8), (size_t)CEIL_DIV(m, 512)*128, 1 };
+     size_t local[] = { 1, 128, 1 };
+-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
++    bool dispatched = false;
++    const bool ffn = (m == 9216 && k == 2560) || (m == 2560 && k == 9216);
++    if (backend_ctx->n20_q2_texture && ffn && n >= 16 && (size_t)padded_n/4 <= N20_TEXTURE_WIDTH) {
++        const cl_mem texture = backend_ctx->n20_q2_texture;
++        const cl_kernel gemm = backend_ctx->kernel_n20_q2_texture;
++        const size_t origin[] = {0, 0, 0};
++        const size_t extent[] = {(size_t)padded_n/4, (size_t)k, 1};
++        err = set_gemm_args(gemm, texture);
++        if (err == CL_SUCCESS) {
++            err = clEnqueueCopyBufferToImage(backend_ctx->queue, b_sub_buf_trans, texture, 0, origin, extent, 0, nullptr, nullptr);
++        }
++        if (err == CL_SUCCESS) {
++            err = backend_ctx->try_enqueue_ndrange_kernel(gemm, 3, global, local, dst);
++        }
++        dispatched = err == CL_SUCCESS;
++        if (dispatched) {
++            static std::once_flag trace;
++            std::call_once(trace, [] { GGML_LOG_INFO("n20: dispatched Q2_0 activation texture prefill\n"); });
++        } else {
++            GGML_LOG_WARN("n20: activation texture dispatch failed (%d); continuing with tuned image buffers\n", err);
++            CL_CHECK(clReleaseMemObject(texture));
++            backend_ctx->n20_q2_texture = nullptr;
++        }
++    }
++    if (!dispatched) {
++        CL_CHECK(set_gemm_args(kernel, b_img_trans));
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
++    }
+ 
+     CL_CHECK(clReleaseMemObject(b_img_trans));
+     CL_CHECK(clReleaseMemObject(b_sub_buf_trans));

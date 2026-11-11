@@ -1,0 +1,67 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -728,6 +728,8 @@
+     n20_hybrid * n20_hybrid_state = nullptr;
+     n20_hybrid_close_fn n20_hybrid_close = nullptr;
+     n20_hybrid_upload_fn n20_hybrid_upload = nullptr;
++    n20_hybrid_upload_fn n20_hybrid_upload_down = nullptr;
++    n20_hybrid_project_fn n20_hybrid_project_down = nullptr;
+     n20_hybrid_project_fn n20_hybrid_project = nullptr;
+     n20_hybrid_reuse_fn n20_hybrid_reuse = nullptr;
+     bool n20_hybrid_attempted = false;
+@@ -738,6 +740,7 @@
+         if (n20_hybrid_lib) dlclose(n20_hybrid_lib);
+         n20_hybrid_lib = nullptr; n20_hybrid_close = nullptr;
+         n20_hybrid_upload = nullptr; n20_hybrid_project = nullptr; n20_hybrid_reuse = nullptr;
++        n20_hybrid_upload_down = nullptr; n20_hybrid_project_down = nullptr;
+         n20_hybrid_attempted = false;
+     }
+     bool n20_hybrid_initialize() {
+@@ -754,6 +757,8 @@
+         n20_hybrid_upload = (n20_hybrid_upload_fn)dlsym(n20_hybrid_lib, "n20_hybrid_upload");
+         n20_hybrid_project = (n20_hybrid_project_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project");
+         n20_hybrid_reuse = (n20_hybrid_reuse_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project_reuse");
++        n20_hybrid_upload_down = (n20_hybrid_upload_fn)dlsym(n20_hybrid_lib, "n20_hybrid_upload_down");
++        n20_hybrid_project_down = (n20_hybrid_project_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project_down");
+         if (!open || !n20_hybrid_close || !n20_hybrid_upload || !n20_hybrid_project ||
+             open(&n20_hybrid_state, context, device, queue, row, aux) != 0) {
+             GGML_LOG_WARN("n20: hybrid initialization failed; using GPU\n");
+@@ -14150,12 +14155,16 @@
+ #ifdef __ANDROID__
+         // Slots are never recycled within one runtime session. Resetting an
+         // extra invalidates its slot, and an epoch blocks use after teardown.
+-        if (extra->noshuffle && !tensor->view_src && tensor->ne[0] == 2560 && tensor->ne[1] == 9216 &&
+-            tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+-            (strstr(tensor->name, "ffn_gate.weight") || strstr(tensor->name, "ffn_up.weight")) &&
++        const bool n20_up_shape = tensor->ne[0] == 2560 && tensor->ne[1] == 9216 &&
++            (strstr(tensor->name, "ffn_gate.weight") || strstr(tensor->name, "ffn_up.weight"));
++        const bool n20_down_shape = getenv("N20_HYBRID_DOWN") && tensor->ne[0] == 9216 && tensor->ne[1] == 2560 &&
++            strstr(tensor->name, "ffn_down.weight");
++        if (extra->noshuffle && !tensor->view_src && ggml_is_contiguous(tensor) &&
++            (n20_up_shape || n20_down_shape) && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+             backend_ctx->n20_hybrid_initialize()) {
+             uint32_t slot=0; float unit=0;
+-            if (backend_ctx->n20_hybrid_upload(backend_ctx->n20_hybrid_state,data,size,&slot,&unit)==0) {
++            const auto upload = n20_down_shape ? backend_ctx->n20_hybrid_upload_down : backend_ctx->n20_hybrid_upload;
++            if (upload && upload(backend_ctx->n20_hybrid_state,data,size,&slot,&unit)==0) {
+                 extra->n20_dsp_slot=(int)slot; extra->n20_dsp_unit=unit;
+                 extra->n20_dsp_epoch=backend_ctx->n20_hybrid_epoch;
+             } else {
+@@ -24715,12 +24724,14 @@
+     bool dispatched = false;
+     const bool ffn = (m == 9216 && k == 2560) || (m == 2560 && k == 9216);
+ #ifdef __ANDROID__
+-    if (m == 9216 && k == 2560 && n >= 16 && n <= 256 && backend_ctx->n20_q2_texture &&
+-        backend_ctx->n20_hybrid_state && backend_ctx->n20_hybrid_project && extra0->n20_dsp_slot >= 0 &&
++    const bool n20_down = m == 2560 && k == 9216 && getenv("N20_HYBRID_DOWN");
++    const auto n20_project = n20_down ? backend_ctx->n20_hybrid_project_down : backend_ctx->n20_hybrid_project;
++    if (((m == 9216 && k == 2560) || n20_down) && n >= 16 && n <= 256 && backend_ctx->n20_q2_texture &&
++        backend_ctx->n20_hybrid_state && n20_project && extra0->n20_dsp_slot >= 0 &&
+         extra0->n20_dsp_epoch == backend_ctx->n20_hybrid_epoch && ggml_is_contiguous(src1) &&
+         ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32 && dst->ne[0] == m && dst->ne[1] == n &&
+         dst->ne[2] == 1 && dst->ne[3] == 1 && dst->nb[1] == (size_t)m * sizeof(float)) {
+-        dispatched = backend_ctx->n20_hybrid_project(backend_ctx->n20_hybrid_state,
++        dispatched = n20_project(backend_ctx->n20_hybrid_state,
+             (uint32_t)extra0->n20_dsp_slot,extra0->n20_dsp_unit,(unsigned)n,(unsigned)padded_n,
+             b_sub_buf_trans,backend_ctx->n20_q2_texture,extra0->qs,extra0->d,extrad->data_device,offsetd) != 0;
+         if (dispatched) {

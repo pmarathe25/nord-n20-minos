@@ -1,0 +1,41 @@
+--- a/wiki/experiments/n20-model-bench.c
++++ b/wiki/experiments/n20-model-bench.c
+@@ -42,6 +42,17 @@
+     free(prompt);
+     require(count > 0, "Could not tokenize prompt within the context limit");
+     return count;
++}
++
++static uint64_t hash_logits(struct llama_context *context, int vocab_size, uint64_t hash) {
++    const float *logits = llama_get_logits_ith(context, -1);
++    require(logits != NULL, "No logits for hashing");
++    for (int i = 0; i < vocab_size; ++i) {
++        uint32_t bits;
++        memcpy(&bits, logits + i, sizeof(bits));
++        hash = (hash ^ bits) * UINT64_C(1099511628211);
++    }
++    return hash;
+ }
+ 
+ static llama_token greedy(struct llama_context *context, int vocab_size, bool on_backend,
+@@ -185,15 +196,20 @@
+                 "Prefill failed");
+         llama_token generated[MAX_GENERATION + 1];
+         generated[0] = greedy(context, vocab_size, on_backend, options, choose ? 5 : 0);
++        uint64_t sequence_hash = !on_backend ? hash_logits(context, vocab_size, UINT64_C(14695981039346656037)) : 0;
+         const double decode_start = seconds();
+         for (int i = 0; i < steps; ++i) {
+             require(llama_decode(context, llama_batch_get_one(&generated[i], 1)) == 0, "Decode failed");
+             generated[i + 1] = greedy(context, vocab_size, on_backend, NULL, 0);
++            if (!on_backend)
++                sequence_hash = hash_logits(context, vocab_size, sequence_hash);
+         }
+         printf("run=%d first_token_s=%.4f decode_s=%.4f token_ids=", run + 1,
+                decode_start - prefill_start, seconds() - decode_start);
+         for (int i = 0; i <= steps; ++i)
+             printf("%s%d", i ? "," : "", generated[i]);
++        if (!on_backend)
++            printf(" sequence_logits_hash=%016" PRIx64, sequence_hash);
+         if (!on_backend && steps == 0) {
+             const float *logits = llama_get_logits_ith(context, -1);
+             uint64_t hash = UINT64_C(14695981039346656037);

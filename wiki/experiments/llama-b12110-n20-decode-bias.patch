@@ -1,0 +1,124 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1086,6 +1086,10 @@
+     cl_kernel kernel_gemv_noshuffle_q2_0_f32 = nullptr;
+     cl_kernel kernel_gemv_noshuffle_q2_0_f32_wide = nullptr;
+     cl_kernel kernel_n20_q2_decode = nullptr;
++    cl_kernel kernel_n20_q2_bias = nullptr;
++    cl_kernel kernel_n20_q2_bias_decode = nullptr;
++    cl_mem n20_q2_bias_buffer = nullptr;
++    uint64_t n20_q2_bias_attempts = 0, n20_q2_bias_successes = 0;
+     cl_kernel kernel_n20_q2_vocab16 = nullptr;
+     size_t n20_q2_decode_max_workgroup = 0;
+     size_t q2_0_mv_workgroup_size = 512;
+@@ -1565,6 +1569,13 @@
+         if (kernel_n20_q2_decode) {
+             CL_CHECK(clReleaseKernel(kernel_n20_q2_decode));
+         }
++        if (kernel_n20_q2_bias) CL_CHECK(clReleaseKernel(kernel_n20_q2_bias));
++        if (kernel_n20_q2_bias_decode) CL_CHECK(clReleaseKernel(kernel_n20_q2_bias_decode));
++        if (n20_q2_bias_buffer) CL_CHECK(clReleaseMemObject(n20_q2_bias_buffer));
++        if (n20_q2_bias_attempts) {
++            fprintf(stderr, "n20 bias: attempts=%" PRIu64 " dispatched=%" PRIu64 " fallbacks=%" PRIu64 "\n",
++                    n20_q2_bias_attempts, n20_q2_bias_successes, n20_q2_bias_attempts - n20_q2_bias_successes);
++        }
+         if (iq1_s_grid_image) {
+             CL_CHECK(clReleaseMemObject(iq1_s_grid_image));
+         }
+@@ -5385,6 +5396,48 @@
+             }
+         }
+         GGML_LOG_INFO("n20: selected Q2_0 decode source %s\n", path);
++    }
++
++    // Experimental decode-only block-sum reuse, isolated from the ordinary
++    // Q2 decode program. A failed setup leaves the original GPU path intact.
++    if (const char * path = getenv("N20_Q2_BIAS_SOURCE")) {
++        cl_command_queue_properties props = 0;
++        std::ifstream file(path, std::ios::binary);
++        const std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++        cl_int status = CL_SUCCESS;
++        cl_program program = nullptr;
++        if (!source.empty() && source.size() <= 1024*1024 &&
++            clGetCommandQueueInfo(backend_ctx->queue, CL_QUEUE_PROPERTIES, sizeof(props), &props, nullptr) == CL_SUCCESS &&
++            !(props & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE)) {
++            const char * source_ptr = source.c_str();
++            const size_t source_size = source.size();
++            program = clCreateProgramWithSource(backend_ctx->context, 1, &source_ptr, &source_size, &status);
++            const std::string options = compile_opts + " -DQ2_0_MV_WIDE=1";
++            if (status == CL_SUCCESS && !program) status = CL_INVALID_PROGRAM;
++            if (status == CL_SUCCESS && program)
++                status = clBuildProgram(program, 1, &backend_ctx->device, options.c_str(), nullptr, nullptr);
++            if (status == CL_SUCCESS) {
++                backend_ctx->kernel_n20_q2_bias = clCreateKernel(program, "n20_q2_decode_bias64", &status);
++                if (status == CL_SUCCESS && !backend_ctx->kernel_n20_q2_bias) status = CL_INVALID_KERNEL;
++                if (status == CL_SUCCESS)
++                    backend_ctx->kernel_n20_q2_bias_decode = clCreateKernel(program, "kernel_gemv_noshuffle_q2_0_f32", &status);
++                if (status == CL_SUCCESS && !backend_ctx->kernel_n20_q2_bias_decode) status = CL_INVALID_KERNEL;
++                if (status == CL_SUCCESS && backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_n20_q2_bias_decode) >= 512)
++                    backend_ctx->n20_q2_bias_buffer = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, 144*sizeof(float), nullptr, &status);
++                else if (status == CL_SUCCESS) status = CL_INVALID_WORK_GROUP_SIZE;
++            }
++        } else status = CL_INVALID_VALUE;
++        if (program) clReleaseProgram(program);
++        if (status != CL_SUCCESS || !backend_ctx->kernel_n20_q2_bias || !backend_ctx->kernel_n20_q2_bias_decode || !backend_ctx->n20_q2_bias_buffer) {
++            if (backend_ctx->kernel_n20_q2_bias) clReleaseKernel(backend_ctx->kernel_n20_q2_bias);
++            if (backend_ctx->kernel_n20_q2_bias_decode) clReleaseKernel(backend_ctx->kernel_n20_q2_bias_decode);
++            if (backend_ctx->n20_q2_bias_buffer) clReleaseMemObject(backend_ctx->n20_q2_bias_buffer);
++            backend_ctx->kernel_n20_q2_bias = nullptr; backend_ctx->kernel_n20_q2_bias_decode = nullptr;
++            backend_ctx->n20_q2_bias_buffer = nullptr;
++            GGML_LOG_WARN("n20: Q2 decode bias unavailable (%d); using ordinary GPU path\n", status);
++        } else {
++            GGML_LOG_INFO("n20: selected experimental Q2 decode block-bias source %s\n", path);
++        }
+     }
+ 
+     // gemm_noshuffle_iq1_s_q8_1_dp4a
+@@ -24617,6 +24670,47 @@
+         const size_t lanes = workgroup/nsg;
+         const int stride_d = dst->ne[0];
+         const int stride_b = src1->nb[1]/sizeof(float);
++        // Restrict to tested one-token FFN shapes and contiguous, disjoint
++        // source/destination tensors. The queue owns one in-order scratch sum
++        // buffer; no bias is reused across graph nodes or model requests.
++        if (n == 1 && n20_ffn && tuned && backend_ctx->kernel_n20_q2_bias &&
++            backend_ctx->kernel_n20_q2_bias_decode && backend_ctx->n20_q2_bias_buffer &&
++            k > 0 && k % 64 == 0 && k / 64 <= 144 &&
++            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++            src1->ne[0] == k && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++            dst->ne[0] == m && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
++            ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++            !ggml_cl_tensors_overlap(src1, dst) && offset1 % sizeof(float) == 0 && offsetd % sizeof(float) == 0) {
++            ++backend_ctx->n20_q2_bias_attempts;
++            cl_int status = CL_SUCCESS;
++            cl_kernel bias_kernel = backend_ctx->kernel_n20_q2_bias;
++            cl_kernel candidate = backend_ctx->kernel_n20_q2_bias_decode;
++            const cl_mem bias_buffer = backend_ctx->n20_q2_bias_buffer;
++            const void * bargs[] = { &extra1->data_device, &offset1, &bias_buffer, &k, &stride_b };
++            const size_t bsizes[] = { sizeof(cl_mem), sizeof(cl_ulong), sizeof(cl_mem), sizeof(int), sizeof(int) };
++            for (cl_uint i = 0; i < sizeof(bargs)/sizeof(bargs[0]) && status == CL_SUCCESS; ++i)
++                status = clSetKernelArg(bias_kernel, i, bsizes[i], bargs[i]);
++            const void * cargs[] = { &extra0->qs, &extra0->d, &extra1->data_device, &offset1,
++                                    &extrad->data_device, &offsetd, &k, &m, &stride_b, &stride_d, &bias_buffer };
++            const size_t csizes[] = { sizeof(cl_mem), sizeof(cl_mem), sizeof(cl_mem), sizeof(cl_ulong),
++                                      sizeof(cl_mem), sizeof(cl_ulong), sizeof(int), sizeof(int), sizeof(int), sizeof(int), sizeof(cl_mem) };
++            for (cl_uint i = 0; i < sizeof(cargs)/sizeof(cargs[0]) && status == CL_SUCCESS; ++i)
++                status = clSetKernelArg(candidate, i, csizes[i], cargs[i]);
++            size_t bg[] = { (size_t)k / 64, 1 };
++            size_t cg[] = { (size_t)CEIL_DIV(m, rows*lanes)*lanes, nsg, 1 };
++            size_t cl[] = { lanes, nsg, 1 };
++            if (status == CL_SUCCESS) status = backend_ctx->try_enqueue_ndrange_kernel(bias_kernel, 2, bg, nullptr, dst);
++            if (status == CL_SUCCESS) status = backend_ctx->try_enqueue_ndrange_kernel(candidate, 3, cg, cl, dst);
++            if (status == CL_SUCCESS) {
++                ++backend_ctx->n20_q2_bias_successes;
++                static std::once_flag trace;
++                std::call_once(trace, [] { GGML_LOG_INFO("n20: experimental Q2 decode shared bias dispatched\n"); });
++                return;
++            }
++            // A queued precompute is harmless. If candidate submission failed,
++            // the original projection follows it on the same in-order queue.
++            GGML_LOG_WARN("n20: Q2 decode shared bias failed (%d); using ordinary GPU path\n", status);
++        }
+         CL_CHECK(clSetKernelArg(gemv,  0, sizeof(cl_mem),    &extra0->qs));
+         CL_CHECK(clSetKernelArg(gemv,  1, sizeof(cl_mem),    &extra0->d));
+         CL_CHECK(clSetKernelArg(gemv,  2, sizeof(cl_mem),    &extra1->data_device));

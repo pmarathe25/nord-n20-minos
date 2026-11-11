@@ -1,0 +1,105 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -40,6 +40,8 @@
+ using n20_hybrid_upload_fn = int (*)(n20_hybrid *,const void *,size_t,uint32_t *,float *);
+ using n20_hybrid_project_fn = int (*)(n20_hybrid *,uint32_t,float,unsigned,unsigned,cl_mem,cl_mem,cl_mem,cl_mem,cl_mem,cl_ulong);
+ using n20_hybrid_reuse_fn = int (*)(n20_hybrid *,uint32_t,float,unsigned,unsigned,cl_mem,cl_mem,cl_mem,cl_mem,cl_ulong);
++using n20_hybrid_batch_fn = int (*)(n20_hybrid *,unsigned,unsigned,cl_mem,cl_mem,
++    uint32_t,float,cl_mem,cl_mem,cl_mem,cl_ulong,uint32_t,float,cl_mem,cl_mem,cl_mem,cl_ulong);
+ #endif
+ 
+ #include <inttypes.h>
+@@ -730,6 +732,7 @@
+     n20_hybrid_upload_fn n20_hybrid_upload = nullptr;
+     n20_hybrid_project_fn n20_hybrid_project = nullptr;
+     n20_hybrid_reuse_fn n20_hybrid_reuse = nullptr;
++    n20_hybrid_batch_fn n20_hybrid_batch = nullptr;
+     bool n20_hybrid_attempted = false;
+     uint64_t n20_hybrid_epoch = 0;
+ 
+@@ -737,7 +740,7 @@
+         if (n20_hybrid_state && n20_hybrid_close) n20_hybrid_close(&n20_hybrid_state);
+         if (n20_hybrid_lib) dlclose(n20_hybrid_lib);
+         n20_hybrid_lib = nullptr; n20_hybrid_close = nullptr;
+-        n20_hybrid_upload = nullptr; n20_hybrid_project = nullptr; n20_hybrid_reuse = nullptr;
++        n20_hybrid_upload = nullptr; n20_hybrid_project = nullptr; n20_hybrid_reuse = nullptr; n20_hybrid_batch = nullptr;
+         n20_hybrid_attempted = false;
+     }
+     bool n20_hybrid_initialize() {
+@@ -754,6 +757,7 @@
+         n20_hybrid_upload = (n20_hybrid_upload_fn)dlsym(n20_hybrid_lib, "n20_hybrid_upload");
+         n20_hybrid_project = (n20_hybrid_project_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project");
+         n20_hybrid_reuse = (n20_hybrid_reuse_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project_reuse");
++        n20_hybrid_batch = (n20_hybrid_batch_fn)dlsym(n20_hybrid_lib, "n20_hybrid_project_batch_pair");
+         if (!open || !n20_hybrid_close || !n20_hybrid_upload || !n20_hybrid_project ||
+             open(&n20_hybrid_state, context, device, queue, row, aux) != 0) {
+             GGML_LOG_WARN("n20: hybrid initialization failed; using GPU\n");
+@@ -11328,7 +11332,7 @@
+         // match so the FFN GLU subgraph stays dormant on Intel/other drivers.
+ #if defined(__ANDROID__) && defined(GGML_OPENCL_USE_ADRENO_KERNELS)
+         if (!backend_ctx->disable_fusion && node->op == GGML_OP_MUL_MAT &&
+-            getenv("N20_HYBRID_PAIR") && ggml_cl_try_n20_hybrid_pair(backend,cgraph,i)) {
++            (getenv("N20_HYBRID_PAIR") || getenv("N20_HYBRID_BATCH_PAIR")) && ggml_cl_try_n20_hybrid_pair(backend,cgraph,i)) {
+             ++i; continue;
+         }
+ #endif
+@@ -24588,7 +24592,8 @@
+     return true;
+ }
+ 
+-static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool *hybrid_success = nullptr) {
++static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool *hybrid_success = nullptr,
++        const ggml_tensor *pair_weight = nullptr, const ggml_tensor *pair_dst = nullptr, bool force_gpu = false) {
+     if (hybrid_success) *hybrid_success = false;
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     ggml_tensor_extra_cl_q2_0 * extra0 = (ggml_tensor_extra_cl_q2_0 *)src0->extra;
+@@ -24715,14 +24720,24 @@
+     bool dispatched = false;
+     const bool ffn = (m == 9216 && k == 2560) || (m == 2560 && k == 9216);
+ #ifdef __ANDROID__
+-    if (m == 9216 && k == 2560 && n >= 16 && n <= 256 && backend_ctx->n20_q2_texture &&
++    if (!force_gpu && m == 9216 && k == 2560 && n >= 16 && n <= 256 && backend_ctx->n20_q2_texture &&
+         backend_ctx->n20_hybrid_state && backend_ctx->n20_hybrid_project && extra0->n20_dsp_slot >= 0 &&
+         extra0->n20_dsp_epoch == backend_ctx->n20_hybrid_epoch && ggml_is_contiguous(src1) &&
+         ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32 && dst->ne[0] == m && dst->ne[1] == n &&
+         dst->ne[2] == 1 && dst->ne[3] == 1 && dst->nb[1] == (size_t)m * sizeof(float)) {
+-        dispatched = backend_ctx->n20_hybrid_project(backend_ctx->n20_hybrid_state,
+-            (uint32_t)extra0->n20_dsp_slot,extra0->n20_dsp_unit,(unsigned)n,(unsigned)padded_n,
+-            b_sub_buf_trans,backend_ctx->n20_q2_texture,extra0->qs,extra0->d,extrad->data_device,offsetd) != 0;
++        if (pair_weight && pair_dst && backend_ctx->n20_hybrid_batch) {
++            auto *other=(const ggml_tensor_extra_cl_q2_0 *)pair_weight->extra;
++            auto *destination=(const ggml_tensor_extra_cl *)pair_dst->extra;
++            const cl_ulong other_offset=destination->offset+pair_dst->view_offs;
++            dispatched=backend_ctx->n20_hybrid_batch(backend_ctx->n20_hybrid_state,(unsigned)n,(unsigned)padded_n,
++                b_sub_buf_trans,backend_ctx->n20_q2_texture,
++                (uint32_t)extra0->n20_dsp_slot,extra0->n20_dsp_unit,extra0->qs,extra0->d,extrad->data_device,offsetd,
++                (uint32_t)other->n20_dsp_slot,other->n20_dsp_unit,other->qs,other->d,destination->data_device,other_offset)!=0;
++        } else if (!pair_weight) {
++            dispatched = backend_ctx->n20_hybrid_project(backend_ctx->n20_hybrid_state,
++                (uint32_t)extra0->n20_dsp_slot,extra0->n20_dsp_unit,(unsigned)n,(unsigned)padded_n,
++                b_sub_buf_trans,backend_ctx->n20_q2_texture,extra0->qs,extra0->d,extrad->data_device,offsetd) != 0;
++        }
+         if (dispatched) {
+             if (hybrid_success) *hybrid_success = true;
+             static std::once_flag trace;
+@@ -24796,6 +24811,20 @@
+     if (!g->noshuffle || !u->noshuffle || g->n20_dsp_slot<0 || u->n20_dsp_slot<0 ||
+         g->n20_dsp_epoch!=ctx->n20_hybrid_epoch || u->n20_dsp_epoch!=ctx->n20_hybrid_epoch ||
+         (size_t)padded/4>N20_TEXTURE_WIDTH || (x->offset+input->view_offs)%ctx->alignment) return false;
++    if (getenv("N20_HYBRID_BATCH_PAIR")) {
++        if (!ctx->n20_hybrid_batch) return false;
++        bool batch_success=false;
++        ggml_cl_mul_mat_q2_0_f32_adreno(backend,w0,input,first,&batch_success,w1,second);
++        if (!batch_success) {
++            /* The first helper has already enqueued a complete GPU overwrite.
++             * Overwrite the second output on the same queue before GLU. */
++            ggml_cl_mul_mat_q2_0_f32_adreno(backend,w1,input,second,nullptr,nullptr,nullptr,true);
++        } else {
++            static std::once_flag trace;
++            std::call_once(trace, [] { GGML_LOG_INFO("n20: batched hybrid pair dispatched\n"); });
++        }
++        return true;
++    }
+     bool first_hybrid=false;
+     ggml_cl_mul_mat_q2_0_f32_adreno(backend,w0,input,first,&first_hybrid);
+     const cl_ulong offset=y->offset+second->view_offs;

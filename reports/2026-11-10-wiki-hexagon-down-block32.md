@@ -1,0 +1,17 @@
+# Hexagon down-projection token blocking
+
+2026-11-10. A scratch HVX variant processes 32 tokens across all DSP row tiles before advancing to the next token block. It retains the established eight-token arithmetic, original token-major input and full-call output stride. The candidate is [v66-q2-hvx-token-block32.c](../wiki/experiments/v66-q2-hvx-token-block32.c); the control is the unchanged `v66-q2-hvx.c`. Both use the existing 128-token FastRPC dispatcher. This tests Astra's proposal to reduce the activation working set for the long FFN down projection, without assuming that cache behavior explains the result.
+
+The Nord N20 ran the existing dynamic-Q8 row-view harness on real layer-0 Bonsai down weights (2,560 rows by 9,216 columns), with 128 deterministic synthetic tokens and 768 DSP rows. Each value is the median of five samples, with control/candidate/control workers. GPU-only timing includes the same image copy and projection. Mixed timing includes activation reduction and packing, guard synchronization, GPU and DSP shards, RPC and final assembly, but excludes model loading and initial weight packing and upload.
+
+| Worker | GPU-only before | Mixed | DSP kernel | GPU-only after |
+| --- | ---: | ---: | ---: | ---: |
+| Control before | 56.805 ms | 128.237 ms | 100.927 ms | 56.823 ms |
+| 32-token candidate | 56.840 ms | 89.236 ms | 63.236 ms | 56.837 ms |
+| Control after | 56.818 ms | 128.221 ms | 102.202 ms | 56.747 ms |
+
+Blocking improved the mixed projection by about 30%, but it remained about 57% slower than GPU-only. The candidate's packing and readiness took roughly 25 ms, and its overlapping GPU shard about 45 ms; these measurements show why reducing DSP compute alone would not make this particular split attractive. This is one synthetic projection configuration, not a complete-model or gameplay result, and does not establish that every possible split or packing strategy loses. It does not warrant integrating this path.
+
+For each normal 128-token sample, all 98,304 DSP integer outputs matched the scalar fixed-point reference; GPU packing, shared-buffer visibility, GPU shard and scatter checks passed, including alternating inputs. Candidate tests at 31, 32, 33 and 127 tokens likewise checked all DSP outputs and alternating inputs. The 128-token DSP output's normalized RMS error was 0.004922 against a double-precision reference using the original scales and activations; these checks do not establish model-answer quality. A separate 33-token out-of-range test observed all six expected GPU fallbacks and bitwise agreement for non-NaN values. The first combined fallback invocation was rejected because the harness prohibits combining its guard-injection and alternating-input flags; the separate run corrected that setup.
+
+Two initial attempts failed before benchmarking because the private `/dev` lacked standard character devices; after adding them to the temporary namespace the comparison completed. The main trial's final guard reported an error for the incompatible fallback flags, after all normal comparisons and boundary checks had passed. The separate fallback trial exited successfully. Across the successful measurement and fallback runs, minimum sampled available memory was 5,028,100 KiB and maximum sampled battery temperature 27.1 °C. Minecraft's status check passed after each guarded run, and CDSP was offline with zero reported crashes. No installed model, service, firmware, partition or world was changed; scratch weights, binaries, image copy and logs were removed.

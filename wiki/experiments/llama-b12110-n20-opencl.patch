@@ -1,0 +1,328 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -889,6 +889,9 @@
+     cl_kernel kernel_mul_mat_f32_f32;
+     cl_kernel kernel_mul_mv_f32_f32_r2 = nullptr;
+     cl_kernel kernel_fwht[2] = {};
++    cl_kernel kernel_n20_fwht[2] = {};
++    cl_kernel kernel_n20_fwht512[2] = {};
++    size_t n20_fwht_workgroup_size[2] = {};
+     size_t fwht_workgroup_size[2] = {};
+     cl_kernel kernel_mul_mat_f16_f16;
+     cl_kernel kernel_mul_mat_f16_f32_1row;
+@@ -1025,13 +1028,18 @@
+     cl_mem iq2_xxs_grid_image = nullptr;
+     cl_kernel kernel_mul_mv_iq2_xxs_f32;
+     cl_kernel kernel_convert_block_q2_0, kernel_restore_block_q2_0;
++    cl_kernel kernel_n20_q2_pack = nullptr;
+     cl_kernel kernel_mul_mv_q2_0_f32_flat;
+     cl_kernel kernel_mul_mm_q2_0_f32_l4_lm;
+     cl_kernel kernel_gemv_noshuffle_q2_0_f32 = nullptr;
+     cl_kernel kernel_gemv_noshuffle_q2_0_f32_wide = nullptr;
++    cl_kernel kernel_n20_q2_decode = nullptr;
++    cl_kernel kernel_n20_q2_vocab16 = nullptr;
++    size_t n20_q2_decode_max_workgroup = 0;
+     size_t q2_0_mv_workgroup_size = 512;
+     size_t q2_0_mv_workgroup_size_wide = 512;
+     cl_kernel kernel_gemm_noshuffle_q2_0_f32 = nullptr;
++    cl_kernel kernel_n20_q2_tail = nullptr;
+     cl_kernel kernel_gemm_noshuffle_q2_0_q8_1_dp4a = nullptr;
+     cl_kernel kernel_gemm_noshuffle_q2_0_q8_1_dp4a_narrow = nullptr;
+     int q2_0_mv_nsg = 32;
+@@ -1463,6 +1471,28 @@
+ #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+ 
+     ~ggml_backend_opencl_context() {
++        for (cl_kernel kernel : kernel_n20_fwht) {
++            if (kernel) {
++                CL_CHECK(clReleaseKernel(kernel));
++            }
++        }
++        for (cl_kernel kernel : kernel_n20_fwht512) {
++            if (kernel) {
++                CL_CHECK(clReleaseKernel(kernel));
++            }
++        }
++        if (kernel_n20_q2_vocab16) {
++            CL_CHECK(clReleaseKernel(kernel_n20_q2_vocab16));
++        }
++        if (kernel_n20_q2_tail) {
++            CL_CHECK(clReleaseKernel(kernel_n20_q2_tail));
++        }
++        if (kernel_n20_q2_pack) {
++            CL_CHECK(clReleaseKernel(kernel_n20_q2_pack));
++        }
++        if (kernel_n20_q2_decode) {
++            CL_CHECK(clReleaseKernel(kernel_n20_q2_decode));
++        }
+         if (iq1_s_grid_image) {
+             CL_CHECK(clReleaseMemObject(iq1_s_grid_image));
+         }
+@@ -2168,6 +2198,24 @@
+         CL_CHECK((backend_ctx->kernel_convert_block_iq2_s = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_iq2_s", &err), err));
+         CL_CHECK((backend_ctx->kernel_restore_block_iq2_s = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_iq2_s", &err), err));
+         CL_CHECK((backend_ctx->kernel_convert_block_q2_0 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q2_0", &err), err));
++        if (const char * path = getenv("N20_Q2_PACK_SOURCE")) {
++            std::ifstream file(path, std::ios::binary);
++            GGML_ASSERT(file.good());
++            const std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++            GGML_ASSERT(!source.empty());
++            cl_program program = build_program_from_source(backend_ctx, source.c_str(), compile_opts);
++            cl_kernel pack = clCreateKernel(program, "kernel_n20_q2_pack", &err);
++            CL_CHECK(err);
++            CL_CHECK(clReleaseProgram(program));
++            size_t limit = 0;
++            CL_CHECK(clGetKernelWorkGroupInfo(pack, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
++                sizeof(limit), &limit, nullptr));
++            if (limit >= 256) {
++                backend_ctx->kernel_n20_q2_pack = pack;
++            } else {
++                CL_CHECK(clReleaseKernel(pack));
++            }
++        }
+         CL_CHECK((backend_ctx->kernel_restore_block_q2_0 = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q2_0", &err), err));
+         CL_CHECK((backend_ctx->kernel_convert_block_iq1_s = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_iq1_s", &err), err));
+         CL_CHECK((backend_ctx->kernel_restore_block_iq1_s = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_iq1_s", &err), err));
+@@ -2819,6 +2867,35 @@
+                 nth /= 2;
+             }
+             backend_ctx->fwht_workgroup_size[i] = nth;
++        }
++        auto load_n20_fwht = [&](const char * path, cl_kernel (&kernels)[2]) {
++            std::ifstream file(path, std::ios::binary);
++            GGML_ASSERT(file.good());
++            const std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++            GGML_ASSERT(!source.empty());
++            for (int i = 0; i < 2; ++i) {
++                const std::string opts = compile_opts + (i == 0 ? " -DSRC_TYPE=float" : " -DSRC_TYPE=half");
++                cl_program program = build_program_from_source(backend_ctx, source.c_str(), opts);
++                kernels[i] = clCreateKernel(program, "kernel_fwht", &err);
++                CL_CHECK(err);
++                CL_CHECK(clReleaseProgram(program));
++            }
++        };
++        if (const char * path = getenv("N20_FWHT_SOURCE")) {
++            load_n20_fwht(path, backend_ctx->kernel_n20_fwht);
++            for (int i = 0; i < 2; ++i) {
++                backend_ctx->n20_fwht_workgroup_size[i] = std::min(
++                    size_t(128), backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_n20_fwht[i]));
++            }
++        }
++        if (const char * path = getenv("N20_FWHT_RADIX_SOURCE")) {
++            load_n20_fwht(path, backend_ctx->kernel_n20_fwht512);
++            for (const auto kernel : backend_ctx->kernel_n20_fwht512) {
++                size_t required[3];
++                CL_CHECK(clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_COMPILE_WORK_GROUP_SIZE,
++                                                 sizeof(required), required, nullptr));
++                GGML_ASSERT(required[0] == 32 && required[1] == 1 && required[2] == 1);
++            }
+         }
+         GGML_LOG_CONT(".");
+     }
+@@ -5033,15 +5110,33 @@
+     // gemm_noshuffle_q2_0_f32
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+-        const std::string kernel_src {
++        std::string kernel_src {
+             #include "gemm_noshuffle_q2_0_f32.cl.h"
+         };
+ #else
+-        const std::string kernel_src = read_file("gemm_noshuffle_q2_0_f32.cl");
++        std::string kernel_src = read_file("gemm_noshuffle_q2_0_f32.cl");
+ #endif
++        if (const char * path = getenv("N20_Q2_PREFILL_SOURCE")) {
++            std::ifstream file(path, std::ios::binary);
++            GGML_ASSERT(file.good());
++            kernel_src.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++            GGML_ASSERT(!kernel_src.empty());
++            GGML_LOG_INFO("n20: selected Q2_0 prefill source %s\n", path);
++        }
+         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_0_f32", &err), err));
+         CL_CHECK(clReleaseProgram(prog));
++        if (getenv("N20_Q2_PREFILL_SOURCE") && getenv("N20_Q2_TAIL")) {
++            cl_program tail = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DN20_TILE_TOKENS=4");
++            cl_kernel kernel = clCreateKernel(tail, "kernel_gemm_noshuffle_q2_0_f32", &err);
++            CL_CHECK(err);
++            CL_CHECK(clReleaseProgram(tail));
++            if (backend_ctx->get_kernel_workgroup_size(kernel) >= 128) {
++                backend_ctx->kernel_n20_q2_tail = kernel;
++            } else {
++                CL_CHECK(clReleaseKernel(kernel));
++            }
++        }
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -5117,6 +5212,32 @@
+             }
+         }
+         GGML_LOG_CONT(".");
++    }
++
++    if (const char * path = getenv("N20_Q2_DECODE_SOURCE")) {
++        std::ifstream file(path, std::ios::binary);
++        GGML_ASSERT(file.good());
++        const std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++        GGML_ASSERT(!source.empty());
++        cl_program program = build_program_from_source(backend_ctx, source.c_str(), compile_opts + " -DQ2_0_MV_WIDE=1");
++        backend_ctx->kernel_n20_q2_decode = clCreateKernel(program, "kernel_gemv_noshuffle_q2_0_f32", &err);
++        CL_CHECK(err);
++        CL_CHECK(clReleaseProgram(program));
++        CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_n20_q2_decode, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
++            sizeof(size_t), &backend_ctx->n20_q2_decode_max_workgroup, nullptr));
++        if (getenv("N20_Q2_WIDE_VOCAB")) {
++            cl_program vocab = build_program_from_source(backend_ctx, source.c_str(),
++                compile_opts + " -DQ2_0_MV_WIDE=1 -DN20_DECODE_ROWS=16");
++            cl_kernel kernel = clCreateKernel(vocab, "kernel_gemv_noshuffle_q2_0_f32", &err);
++            CL_CHECK(err);
++            CL_CHECK(clReleaseProgram(vocab));
++            if (backend_ctx->get_kernel_workgroup_size(kernel) >= 512) {
++                backend_ctx->kernel_n20_q2_vocab16 = kernel;
++            } else {
++                CL_CHECK(clReleaseKernel(kernel));
++            }
++        }
++        GGML_LOG_INFO("n20: selected Q2_0 decode source %s\n", path);
+     }
+ 
+     // gemm_noshuffle_iq1_s_q8_1_dp4a
+@@ -13883,15 +14004,29 @@
+         region.size = size_d;
+         CL_CHECK((extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+ 
+-        cl_kernel kernel = backend_ctx->kernel_convert_block_q2_0;
+-        cl_ulong nb_arg = (cl_ulong)n_blk;
+-        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &data_device));
+-        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),    &extra->qs));
+-        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),    &extra->d));
+-        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong),  &nb_arg));
+-
+-        size_t global_work_size[] = { (size_t)CEIL_DIV(n_blk, 64)*64, 1, 1 };
+-        size_t local_work_size[]  = { 64, 1, 1 };
++        const bool packed = extra->noshuffle && backend_ctx->kernel_n20_q2_pack;
++        cl_kernel kernel = packed ? backend_ctx->kernel_n20_q2_pack : backend_ctx->kernel_convert_block_q2_0;
++        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
++        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->qs));
++        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
++
++        size_t global_work_size[] = { CEIL_DIV(n_blk, 64)*64, 1, 1 };
++        size_t local_work_size[] = { 64, 1, 1 };
++        if (packed) {
++            const cl_uint rows = tensor->ne[1];
++            const cl_uint blocks = tensor->ne[0] / 64;
++            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(rows), &rows));
++            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(blocks), &blocks));
++            global_work_size[0] = (size_t)blocks * 16;
++            global_work_size[1] = (size_t)CEIL_DIV(rows, 16) * 16;
++            local_work_size[0] = 16;
++            local_work_size[1] = 16;
++            static std::once_flag trace;
++            std::call_once(trace, [] { GGML_LOG_INFO("n20: fused Q2_0 weight packing\n"); });
++        } else {
++            const cl_ulong blocks = n_blk;
++            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(blocks), &blocks));
++        }
+ 
+         cl_event evt;
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+@@ -13900,7 +14035,7 @@
+         CL_CHECK(clReleaseMemObject(data_device));
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+-        if (extra->noshuffle) {
++        if (extra->noshuffle && !packed) {
+             const int m = tensor->ne[1];
+             const int k = tensor->ne[0];
+             transpose_2d_as_8b(backend_ctx, extra->qs, extra->qs, size_qs, k/4, m, true, true);
+@@ -17965,6 +18100,20 @@
+     cl_ulong offset0 = extra0->offset + src0->view_offs;
+     cl_ulong offset1 = extra1->offset + src1->view_offs;
+     cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    // A valid row index for a one-row tensor can only be zero.
++    static const bool single_row_copy = getenv("N20_SINGLE_ROW_COPY") != nullptr;
++    if (single_row_copy && src0->type == GGML_TYPE_F32 && src0->ne[1] == 1 &&
++        src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_nelements(src1) == 1 &&
++        ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && ne00 >= 4096) {
++        const cl_int status = clEnqueueCopyBuffer(backend_ctx->queue, extra0->data_device,
++            extrad->data_device, offset0, offsetd, ggml_nbytes(dst), 0, nullptr, nullptr);
++        if (status == CL_SUCCESS) {
++            static std::once_flag trace;
++            std::call_once(trace, [&] { GGML_LOG_INFO("n20: direct recurrent row copy (%d floats)\n", ne00); });
++            return;
++        }
++    }
+ 
+     cl_kernel kernel;
+ 
+@@ -24268,11 +24417,29 @@
+     const int k = src0->ne[0];
+ 
+     if (n == 1 || !ggml_is_contiguous(src1) || offset1 % backend_ctx->alignment != 0) {
+-        const bool wide = m >= 16384 && m % 8 == 0;
++        const bool n20_ffn = (m == 9216 && k == 2560) || (m == 2560 && k == 9216);
++        const bool n20_vocab = m == 248320 && k == 2560;
++        const bool vocab16 = n == 1 && n20_vocab && backend_ctx->kernel_n20_q2_vocab16;
++        const size_t n20_group = n20_vocab && !vocab16 ? 256 : 512;
++        const bool tuned = vocab16 || (n == 1 && (n20_ffn || n20_vocab) && backend_ctx->kernel_n20_q2_decode &&
++                                      backend_ctx->n20_q2_decode_max_workgroup >= n20_group);
++        const bool wide = tuned || (m >= 16384 && m % 8 == 0);
+         cl_kernel gemv = wide ? backend_ctx->kernel_gemv_noshuffle_q2_0_f32_wide : backend_ctx->kernel_gemv_noshuffle_q2_0_f32;
+-        const size_t workgroup = wide ? backend_ctx->q2_0_mv_workgroup_size_wide : backend_ctx->q2_0_mv_workgroup_size;
+-        const size_t rows = wide ? 8 : 4;
++        const size_t workgroup = tuned ? n20_group :
++            (wide ? backend_ctx->q2_0_mv_workgroup_size_wide : backend_ctx->q2_0_mv_workgroup_size);
++        const size_t rows = vocab16 ? 16 : wide ? 8 : 4;
+         size_t nsg = std::min((size_t)backend_ctx->q2_0_mv_nsg, wide ? size_t(8) : m >= 4096 ? size_t(16) : size_t(32));
++        if (vocab16) {
++            gemv = backend_ctx->kernel_n20_q2_vocab16;
++            nsg = 4;
++            static std::once_flag trace;
++            std::call_once(trace, [] { GGML_LOG_INFO("n20: 16-row Q2_0 vocabulary projection\n"); });
++        } else if (tuned) {
++            gemv = backend_ctx->kernel_n20_q2_decode;
++            nsg = n20_vocab ? 8 : 16;
++            static std::once_flag trace;
++            std::call_once(trace, [&] { GGML_LOG_INFO("n20: dispatched Q2_0 decode (%d x %d)\n", m, k); });
++        }
+         while (nsg > (size_t)k/64 || nsg*16 > workgroup) {
+             nsg /= 2;
+         }
+@@ -24339,7 +24506,12 @@
+     size_t t_local[] = { 1, 16 };
+     backend_ctx->enqueue_ndrange_kernel(kernel, 2, t_global, t_local, dst);
+ 
+-    kernel = backend_ctx->kernel_gemm_noshuffle_q2_0_f32;
++    const bool tail = n >= 2 && n <= 4 && backend_ctx->kernel_n20_q2_tail;
++    kernel = tail ? backend_ctx->kernel_n20_q2_tail : backend_ctx->kernel_gemm_noshuffle_q2_0_f32;
++    if (tail) {
++        static std::once_flag trace;
++        std::call_once(trace, [] { GGML_LOG_INFO("n20: four-token Q2_0 tail\n"); });
++    }
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &extra0->qs));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),    &extra0->d));
+     CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),    &b_img_trans));
+@@ -30312,8 +30484,19 @@
+     const float scale = 1.0f/sqrtf((float)n);
+     const int type_index = src->type == GGML_TYPE_F16 ? 1 : 0;
+ 
+-    cl_kernel kernel = backend_ctx->kernel_fwht[type_index];
+-    const size_t nth = std::min((size_t)n/2, backend_ctx->fwht_workgroup_size[type_index]);
++    const bool tuned = backend_ctx->kernel_n20_fwht[type_index] && (n == 64 || n == 256 || n == 1024);
++    cl_kernel kernel = tuned ? backend_ctx->kernel_n20_fwht[type_index] : backend_ctx->kernel_fwht[type_index];
++    const bool radix = n == 512 && backend_ctx->kernel_n20_fwht512[type_index];
++    const size_t nth = radix ? 32 : std::min((size_t)n/2, tuned ? backend_ctx->n20_fwht_workgroup_size[type_index]
++                                                               : backend_ctx->fwht_workgroup_size[type_index]);
++    if (radix) {
++        kernel = backend_ctx->kernel_n20_fwht512[type_index];
++        static std::once_flag trace;
++        std::call_once(trace, [] { GGML_LOG_INFO("n20: radix-32x16 FWHT width 512\n"); });
++    } else if (tuned) {
++        static std::once_flag trace;
++        std::call_once(trace, [&] { GGML_LOG_INFO("n20: register FWHT width %d\n", n); });
++    }
+ 
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra_src->data_device));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset_src));

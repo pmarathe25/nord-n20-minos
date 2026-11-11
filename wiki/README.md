@@ -88,6 +88,11 @@ Review the answers alongside the pattern-based scores.
 
 Use `--cases wiki/benchmark-fresh.json` for the follow-up question set.
 Use `--cases wiki/benchmark-recipes.json` to check recipe counts.
+Use `--answer-style chat` to exercise the phone bridge's grounded prompt,
+prefix reuse, stop rule, and source validation. Its JSONL includes per-request
+model timings when llama-server reports them. The desktop benchmark calls
+the model for each question so it can measure inference independently of
+the bridge's in-memory reply cache.
 Use `--answer-style grounded` to test the single-call support-first prompt.
 The harness records the supporting line for review and scores the player-facing
 answer separately.

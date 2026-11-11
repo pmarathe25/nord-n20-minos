@@ -51,6 +51,9 @@ fi
 if [ -x /usr/local/sbin/n20-save-events ]; then
     /usr/local/bin/busybox setsid /usr/local/sbin/n20-save-events >>/var/log/n20-save-events.log 2>&1 </dev/null &
 fi
+if [ -f /etc/n20-wiki-enabled ] && [ -x /usr/local/sbin/n20-wiki-start ]; then
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-wiki-start >>/var/log/n20-wiki.log 2>&1 </dev/null &
+fi
 if [ -x /usr/local/sbin/n20-admin ]; then
     /usr/local/bin/busybox setsid /usr/local/sbin/n20-admin scheduler >>/var/log/n20-scheduler.log 2>&1 </dev/null &
     # Restart the guard after an unexpected exit, permitting charging while it

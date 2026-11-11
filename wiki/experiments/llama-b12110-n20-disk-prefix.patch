@@ -1,0 +1,245 @@
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -35,7 +35,7 @@
+ 
+ target_include_directories(${TARGET} PRIVATE ../mtmd)
+ target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
+-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
++target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT} PRIVATE vendor::hash)
+ 
+ # llama-server-impl: server logic, reusable by app
+ 
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -33,6 +33,13 @@
+ #include <random>
+ #include <utility>
+ #include <fstream>
++
++#if !defined(_WIN32)
++#include "hash/hash.h"
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ 
+ // fix problem with std::min and std::max
+ #if defined(_WIN32)
+@@ -1133,6 +1140,7 @@
+     // sleep releases the context and model buffers.
+     llama_tokens n20_prefix_tokens;
+     std::vector<uint8_t> n20_prefix_state;
++    llama_tokens n20_disk_prefix_tokens;
+ 
+     int32_t n20_system_prefix(const server_slot & slot) const {
+         static const bool enabled = std::getenv("N20_KEEP_SYSTEM_PREFIX") != nullptr;
+@@ -1148,35 +1156,180 @@
+         return (int32_t)spans[1].pos;
+     }
+ 
++    static constexpr size_t n20_prefix_max = 64 * 1024 * 1024;
++
++#if !defined(_WIN32)
++    // The operator supplies a private cache directory and a SHA-256 identity
++    // for the exact model, runtime, context options, and backend settings.
++    int n20_open_prefix_dir() const {
++        const char * path = std::getenv("N20_PREFIX_DIR");
++        const char * key = std::getenv("N20_PREFIX_KEY");
++        if (!path || !key || path[0] != '/' ||
++            std::strlen(key) != 64 || std::strspn(key, "0123456789abcdef") != 64) {
++            return -1;
++        }
++        const int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++        struct stat st = {};
++        if (fd >= 0 && (fstat(fd, &st) != 0 || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700)) {
++            close(fd);
++            return -1;
++        }
++        return fd;
++    }
++
++    struct n20_prefix_header {
++        char version[8] = {'N', '2', '0', 'P', 'F', 'X', '1', 0};
++        char key[64];
++        char digest[64];
++        uint64_t count;
++        uint64_t size;
++    };
++
++    static std::string n20_prefix_digest(const llama_tokens & tokens, const std::vector<uint8_t> & state) {
++        const std::string hashes = std::string(std::getenv("N20_PREFIX_KEY")) +
++            hash_sha256_hex(tokens.data(), tokens.size() * sizeof(llama_token)) +
++            hash_sha256_hex(state.data(), state.size());
++        return hash_sha256_hex(hashes.data(), hashes.size());
++    }
++
++    bool n20_write_prefix(int dir, const llama_tokens & tokens, const std::vector<uint8_t> & state) const {
++        n20_prefix_header header;
++        std::memcpy(header.key, std::getenv("N20_PREFIX_KEY"), sizeof(header.key));
++        const auto digest = n20_prefix_digest(tokens, state);
++        std::memcpy(header.digest, digest.data(), sizeof(header.digest));
++        header.count = tokens.size();
++        header.size = state.size();
++        const std::string temp = "prefix.tmp." + std::to_string(getpid());
++        const int fd = openat(dir, temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++        if (fd < 0) {
++            return false;
++        }
++        FILE * file = fdopen(fd, "wb");
++        bool ok = file &&
++            std::fwrite(&header, sizeof(header), 1, file) == 1 &&
++            std::fwrite(tokens.data(), sizeof(tokens[0]), tokens.size(), file) == tokens.size() &&
++            std::fwrite(state.data(), 1, state.size(), file) == state.size() &&
++            std::fflush(file) == 0 && fsync(fd) == 0;
++        const int closed = file ? std::fclose(file) : close(fd);
++        ok = ok && closed == 0 && renameat(dir, temp.c_str(), dir, "prefix.state") == 0;
++        if (ok) {
++            fsync(dir);
++        } else {
++            unlinkat(dir, temp.c_str(), 0);
++        }
++        return ok;
++    }
++
++    std::vector<uint8_t> n20_read_prefix(int dir, const server_tokens & input, size_t count) const {
++        const int fd = openat(dir, "prefix.state", O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
++        if (fd < 0) {
++            return {};
++        }
++        struct stat st = {};
++        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
++            (st.st_mode & 0777) != 0600 || st.st_nlink != 1) {
++            close(fd);
++            return {};
++        }
++        FILE * raw = fdopen(fd, "rb");
++        if (!raw) {
++            close(fd);
++            return {};
++        }
++        std::unique_ptr<FILE, decltype(&std::fclose)> file(raw, std::fclose);
++        const n20_prefix_header expected = {};
++        n20_prefix_header header;
++        if (std::fread(&header, sizeof(header), 1, raw) != 1 ||
++            std::memcmp(header.version, expected.version, sizeof(header.version)) != 0 ||
++            std::memcmp(header.key, std::getenv("N20_PREFIX_KEY"), sizeof(header.key)) != 0 ||
++            header.count != count || header.size == 0 || header.size > n20_prefix_max ||
++            st.st_size != (off_t)(sizeof(header) + count * sizeof(llama_token) + header.size)) {
++            return {};
++        }
++        llama_tokens tokens(count);
++        if (std::fread(tokens.data(), sizeof(tokens[0]), count, raw) != count ||
++            !std::equal(tokens.begin(), tokens.end(), input.get_tokens().begin())) {
++            return {};
++        }
++        std::vector<uint8_t> state(header.size);
++        if (std::fread(state.data(), 1, state.size(), raw) != state.size() ||
++            n20_prefix_digest(tokens, state).compare(0, sizeof(header.digest), header.digest,
++                                                     sizeof(header.digest)) != 0) {
++            return {};
++        }
++        return state;
++    }
++#endif
++
+     void n20_save_prefix(const server_slot & slot, int64_t count, llama_pos min, llama_pos max) {
+         if (!n20_prefix_tokens.empty() || count <= 0 || count != n20_system_prefix(slot) ||
+             min < 0 || max != count - 1) {
+             return;
+         }
++        const auto & tokens = slot.prompt.tokens.get_tokens();
++        llama_tokens prefix(tokens.begin(), tokens.begin() + count);
++        if (prefix == n20_disk_prefix_tokens) {
++            return;
++        }
+         const size_t size = llama_state_seq_get_size(ctx_tgt, slot.id);
+-        if (size == 0 || size > 64 * 1024 * 1024) {
++        if (size == 0 || size > n20_prefix_max) {
+             return;
+         }
+         std::vector<uint8_t> state(size);
+-        if (llama_state_seq_get_data(ctx_tgt, state.data(), size, slot.id) == size) {
+-            const auto & tokens = slot.prompt.tokens.get_tokens();
+-            n20_prefix_tokens.assign(tokens.begin(), tokens.begin() + count);
+-            n20_prefix_state = std::move(state);
+-            SRV_INF("n20: retained %d system tokens (%zu bytes)\n", (int)count, size);
+-        }
++        if (llama_state_seq_get_data(ctx_tgt, state.data(), size, slot.id) != size) {
++            return;
++        }
++#if !defined(_WIN32)
++        const int dir = n20_open_prefix_dir();
++        if (dir >= 0) {
++            const bool ok = n20_write_prefix(dir, prefix, state);
++            close(dir);
++            if (ok) {
++                n20_disk_prefix_tokens = prefix;
++                SRV_INF("n20: persisted %d system tokens (%zu bytes)\n", (int)count, size);
++            }
++        }
++        if (std::getenv("N20_PREFIX_DIR")) {
++            return;
++        }
++#endif
++        n20_prefix_tokens = std::move(prefix);
++        n20_prefix_state = std::move(state);
++        SRV_INF("n20: retained %d system tokens (%zu bytes)\n", (int)count, size);
+     }
+ 
+     void n20_restore_prefix(server_slot & slot, const server_tokens & input) {
+-        if (n20_prefix_tokens.empty() || !slot.prompt.tokens.empty() ||
+-            n20_prefix_tokens.size() != (size_t)n20_system_prefix(slot) ||
+-            !std::equal(n20_prefix_tokens.begin(), n20_prefix_tokens.end(), input.get_tokens().begin()) ||
++        const size_t count = n20_system_prefix(slot);
++        if (count == 0 || !slot.prompt.tokens.empty() ||
+             llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= 0) {
+             return;
+         }
+-        const auto size = n20_prefix_state.size();
+-        if (llama_state_seq_set_data(ctx_tgt, n20_prefix_state.data(), size, slot.id) == size) {
+-            slot.prompt.tokens.insert(n20_prefix_tokens);
+-            SRV_INF("n20: restored %zu system tokens\n", n20_prefix_tokens.size());
++        std::vector<uint8_t> disk_state;
++#if !defined(_WIN32)
++        if (n20_prefix_tokens.empty()) {
++            n20_disk_prefix_tokens.clear();
++            const int dir = n20_open_prefix_dir();
++            if (dir >= 0) {
++                disk_state = n20_read_prefix(dir, input, count);
++                close(dir);
++            }
++        }
++#endif
++        if (disk_state.empty() &&
++            (n20_prefix_tokens.size() != count ||
++             !std::equal(n20_prefix_tokens.begin(), n20_prefix_tokens.end(), input.get_tokens().begin()))) {
++            return;
++        }
++        const auto & state = disk_state.empty() ? n20_prefix_state : disk_state;
++        if (llama_state_seq_set_data(ctx_tgt, state.data(), state.size(), slot.id) == state.size() &&
++            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) == (llama_pos)count - 1) {
++            const auto & tokens = input.get_tokens();
++            llama_tokens prefix(tokens.begin(), tokens.begin() + count);
++            slot.prompt.tokens.insert(prefix);
++            if (!disk_state.empty()) {
++                n20_disk_prefix_tokens = std::move(prefix);
++            }
++            SRV_INF("n20: restored %zu system tokens from %s\n", count, disk_state.empty() ? "memory" : "disk");
+         } else {
+             llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+             n20_prefix_tokens.clear();
+@@ -4931,6 +5084,14 @@
+             // shifted according to the current sub-batch
+             const int tok_idx = slot.i_batch - off;
+ 
++#if !defined(_WIN32)
++            static const bool n20_hash_logits = std::getenv("N20_HASH_FIRST_LOGITS") != nullptr;
++            if (n20_hash_logits && slot.stats.n_gen == 0) {
++                const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
++                const auto hash = hash_sha256_hex(logits, llama_vocab_n_tokens(vocab) * sizeof(float));
++                SRV_INF("n20: first-token logits %s\n", hash.c_str());
++            }
++#endif
+             llama_token id;
+             {
+                 scoped_timer timer(t_sampl, n_sampl);

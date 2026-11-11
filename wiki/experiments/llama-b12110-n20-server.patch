@@ -1,0 +1,100 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1129,6 +1129,60 @@ private:
+     std::set<std::string> model_tags;    // informational tags
+ 
+     bool sleeping = false;
++    // One full state for the fixed text-chat system prefix, retained when
++    // sleep releases the context and model buffers.
++    llama_tokens n20_prefix_tokens;
++    std::vector<uint8_t> n20_prefix_state;
++
++    int32_t n20_system_prefix(const server_slot & slot) const {
++        static const bool enabled = std::getenv("N20_KEEP_SYSTEM_PREFIX") != nullptr;
++        const auto & spans = slot.task->params.message_spans.spans;
++        if (!enabled || slots.size() != 1 || ctx_dft || mctx || !slot.lora.empty() ||
++            slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_stateless() ||
++            slot.task->n_tokens_shared != 0 || !slot.task->params.cache_prompt ||
++            spans.size() < 2 || spans[0].role != COMMON_CHAT_ROLE_SYSTEM ||
++            spans[1].role != COMMON_CHAT_ROLE_USER ||
++            spans[1].pos == 0 || spans[1].pos > 512 || spans[1].pos >= slot.task->tokens.size()) {
++            return 0;
++        }
++        return (int32_t)spans[1].pos;
++    }
++
++    void n20_save_prefix(const server_slot & slot, int64_t count, llama_pos min, llama_pos max) {
++        if (!n20_prefix_tokens.empty() || count <= 0 || count != n20_system_prefix(slot) ||
++            min < 0 || max != count - 1) {
++            return;
++        }
++        const size_t size = llama_state_seq_get_size(ctx_tgt, slot.id);
++        if (size == 0 || size > 64 * 1024 * 1024) {
++            return;
++        }
++        std::vector<uint8_t> state(size);
++        if (llama_state_seq_get_data(ctx_tgt, state.data(), size, slot.id) == size) {
++            const auto & tokens = slot.prompt.tokens.get_tokens();
++            n20_prefix_tokens.assign(tokens.begin(), tokens.begin() + count);
++            n20_prefix_state = std::move(state);
++            SRV_INF("n20: retained %d system tokens (%zu bytes)\n", (int)count, size);
++        }
++    }
++
++    void n20_restore_prefix(server_slot & slot, const server_tokens & input) {
++        if (n20_prefix_tokens.empty() || !slot.prompt.tokens.empty() ||
++            n20_prefix_tokens.size() != (size_t)n20_system_prefix(slot) ||
++            !std::equal(n20_prefix_tokens.begin(), n20_prefix_tokens.end(), input.get_tokens().begin()) ||
++            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= 0) {
++            return;
++        }
++        const auto size = n20_prefix_state.size();
++        if (llama_state_seq_set_data(ctx_tgt, n20_prefix_state.data(), size, slot.id) == size) {
++            slot.prompt.tokens.insert(n20_prefix_tokens);
++            SRV_INF("n20: restored %zu system tokens\n", n20_prefix_tokens.size());
++        } else {
++            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
++            n20_prefix_tokens.clear();
++            n20_prefix_state.clear();
++        }
++    }
+ 
+     int64_t t_last_load_progress_ms = 0;
+ 
+@@ -2774,6 +2828,7 @@ private:
+         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
++        n20_save_prefix(slot, cur.n_tokens, pos_min, pos_max);
+ 
+         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+@@ -4101,6 +4156,7 @@ private:
+                             }
+ 
+                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
++                                n20_restore_prefix(slot, input_tokens);
+                                 // reuse any previously computed tokens that are common with the new prompt
+                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+ 
+@@ -4457,6 +4513,11 @@ private:
+ 
+                     const auto & spans = slot.task->params.message_spans;
+                     const auto last_user_pos = spans.last_user_message_pos();
++                    // Independent Wiki questions can reuse the system prefix
++                    // without forcing batches at the end of each question.
++                    static const bool n20_wiki_single_turn = std::getenv("N20_WIKI_SINGLE_TURN") != nullptr;
++                    const bool skip_tail_checkpoints = n20_wiki_single_turn && last_user_pos > 0 &&
++                        last_user_pos == n20_system_prefix(slot);
+ 
+                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+ 
+@@ -4514,7 +4575,7 @@ private:
+                         //  - 4 + n_ubatch
+                         //  - 4
+                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+-                        if (do_checkpoint) {
++                        if (do_checkpoint && !skip_tail_checkpoints) {
+                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+ 
+                             bool should_break = false;

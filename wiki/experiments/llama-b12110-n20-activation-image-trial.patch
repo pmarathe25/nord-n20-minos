@@ -1,0 +1,39 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -24505,6 +24505,19 @@
+     size_t t_global[] = { (size_t)width_b, (size_t)padded_height_b };
+     size_t t_local[] = { 1, 16 };
+     backend_ctx->enqueue_ndrange_kernel(kernel, 2, t_global, t_local, dst);
++    cl_mem n20_texture = nullptr;
++    if (getenv("N20_IMAGE2D")) {
++        cl_image_desc texture_desc = {};
++        texture_desc.image_type = CL_MEM_OBJECT_IMAGE2D;
++        texture_desc.image_width = padded_n / 4;
++        texture_desc.image_height = k;
++        n20_texture = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &texture_desc, nullptr, &err);
++        CL_CHECK(err);
++        const size_t origin[3] = {0, 0, 0};
++        const size_t extent[3] = {(size_t)padded_n / 4, (size_t)k, 1};
++        CL_CHECK(clEnqueueCopyBufferToImage(backend_ctx->queue, b_sub_buf_trans, n20_texture, 0, origin, extent, 0, nullptr, nullptr));
++    }
++    cl_mem n20_activation = n20_texture ? n20_texture : b_img_trans;
+ 
+     const bool tail = n >= 2 && n <= 4 && backend_ctx->kernel_n20_q2_tail;
+     kernel = tail ? backend_ctx->kernel_n20_q2_tail : backend_ctx->kernel_gemm_noshuffle_q2_0_f32;
+@@ -24514,7 +24527,7 @@
+     }
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &extra0->qs));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),    &extra0->d));
+-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),    &b_img_trans));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),    &n20_activation));
+     CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),    &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong),  &offsetd));
+     CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),       &m));
+@@ -24525,6 +24538,7 @@
+     size_t local[] = { 1, 128, 1 };
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+ 
++    if (n20_texture) CL_CHECK(clReleaseMemObject(n20_texture));
+     CL_CHECK(clReleaseMemObject(b_img_trans));
+     CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
+     CL_CHECK(clReleaseMemObject(b_img));

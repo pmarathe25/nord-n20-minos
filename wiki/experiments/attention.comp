@@ -1,0 +1,85 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer Queries { float query[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Keys { float keys[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Values { float values[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Output { float output_vector[]; };
+layout(push_constant) uniform Shape {
+    uint heads;
+    uint kv_heads;
+    uint head_size;
+    uint visible_keys;
+    uint cache_stride;
+};
+
+shared float scores[2048];
+shared float partial[8];
+shared float aggregate;
+
+float reduce(float value, bool maximum) {
+    const float reduced = maximum ? subgroupMax(value) : subgroupAdd(value);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = reduced;
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0) {
+        float total = partial[0];
+        for (uint i = 1; i < gl_NumSubgroups; ++i) {
+            total = maximum ? max(total, partial[i]) : total + partial[i];
+        }
+        aggregate = total;
+    }
+    barrier();
+    const float result = aggregate;
+    barrier();
+    return result;
+}
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint q_offset = head * head_size;
+    const uint kv_offset = head / (heads / kv_heads) * cache_stride * head_size;
+    const uint key_lane = gl_SubgroupInvocationID % 16;
+    const uint key_group = gl_SubgroupID * (gl_SubgroupSize / 16) + gl_SubgroupInvocationID / 16;
+    const float scale = inversesqrt(float(head_size));
+    for (uint base = 0; base < visible_keys; base += 8) {
+        const uint key = base + key_group;
+        float score = 0.0;
+        if (key < visible_keys) {
+            for (uint channel = key_lane; channel < head_size; channel += 16) {
+                score += query[q_offset + channel] * keys[kv_offset + key * head_size + channel];
+            }
+        }
+        for (uint offset = 8; offset != 0; offset >>= 1) {
+            score += subgroupShuffleXor(score, offset);
+        }
+        if (key_lane == 0 && key < visible_keys) {
+            scores[key] = score * scale;
+        }
+    }
+    barrier();
+
+    float local_max = -3.402823466e38;
+    for (uint key = lane; key < visible_keys; key += 128) {
+        local_max = max(local_max, scores[key]);
+    }
+    const float max_score = reduce(local_max, true);
+    float local_sum = 0.0;
+    for (uint key = lane; key < visible_keys; key += 128) {
+        const float weight = exp(scores[key] - max_score);
+        scores[key] = weight;
+        local_sum += weight;
+    }
+    const float sum = reduce(local_sum, false);
+    for (uint channel = lane; channel < head_size; channel += 128) {
+        float weighted = 0.0;
+        for (uint key = 0; key < visible_keys; ++key) {
+            weighted += scores[key] * values[kv_offset + key * head_size + channel];
+        }
+        output_vector[q_offset + channel] = weighted / sum;
+    }
+}

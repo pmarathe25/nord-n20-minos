@@ -1,0 +1,343 @@
+/* Time Q2 decode including the separate global split-reduction dispatch. */
+#define CL_TARGET_OPENCL_VERSION 200
+#include <CL/cl.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+enum { BLOCK_COLUMNS = 64, BLOCK_BYTES = 18, RUNS = 5 };
+
+static void check(cl_int status, const char *call) {
+    if (status != CL_SUCCESS) {
+        fprintf(stderr, "%s failed (%d)\n", call, status);
+        exit(1);
+    }
+}
+
+#define CL(call) check((call), #call)
+
+static void *alloc(size_t size) {
+    void *result = malloc(size);
+    if (!result) {
+        perror("malloc");
+        exit(1);
+    }
+    return result;
+}
+
+static unsigned char *read_file(const char *path, size_t expected, size_t *length) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        perror(path);
+        exit(1);
+    }
+    if (fseek(file, 0, SEEK_END) || ftell(file) < 0) {
+        perror(path);
+        exit(1);
+    }
+    const size_t size = ftell(file);
+    rewind(file);
+    unsigned char *data = alloc(size);
+    if ((expected && size != expected) || fread(data, 1, size, file) != size) {
+        fprintf(stderr, "Unexpected file length for %s\n", path);
+        exit(1);
+    }
+    fclose(file);
+    if (length)
+        *length = size;
+    return data;
+}
+
+static int dimension(const char *value, int multiple, long maximum) {
+    char *end;
+    const long result = strtol(value, &end, 10);
+    return *value && !*end && result > 0 && result <= maximum && result % multiple == 0
+        ? (int)result : 0;
+}
+
+static cl_mem upload(cl_context context, void *data, size_t size) {
+    cl_int status;
+    cl_mem buffer = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   size, data, &status);
+    check(status, "clCreateBuffer(input)");
+    return buffer;
+}
+
+static float weight_scale(const unsigned char *block) {
+    _Float16 scale;
+    memcpy(&scale, block, sizeof(scale));
+    return scale;
+}
+
+static double verify(const unsigned char *raw, const _Float16 *input, const float *output,
+                     int rows, int columns, int tokens, int padded) {
+    const int blocks = columns / BLOCK_COLUMNS;
+    const int stride = getenv("N20_VERIFY_ALL") ? 1 : (rows <= 1024 ? 1 : 97);
+    double error = 0, signal = 0, maximum = 0;
+    unsigned count = 0;
+    for (int token = 0; token < tokens; token += tokens > 16 ? 7 : 1) {
+        for (int row = 0; row < rows; row += stride) {
+            double expected = 0;
+            for (int b = 0; b < blocks; ++b) {
+                const unsigned char *block = raw + ((size_t)row * blocks + b) * BLOCK_BYTES;
+                const float scale = weight_scale(block);
+                for (int k = 0; k < BLOCK_COLUMNS; ++k) {
+                    const int weight = ((block[2 + k / 4] >> (2 * (k % 4))) & 3) - 1;
+                    expected += (double)scale * weight * input[(b * BLOCK_COLUMNS + k) * padded + token];
+                }
+            }
+            const double difference = output[(size_t)token * rows + row] - expected;
+            if (!isfinite(difference)) {
+                fprintf(stderr, "Non-finite output at row %d token %d\n", row, token);
+                exit(1);
+            }
+            error += difference * difference;
+            signal += expected * expected;
+            maximum = fmax(maximum, fabs(difference));
+            ++count;
+        }
+    }
+    const double nrmse = sqrt(error / fmax(signal, 1e-30));
+    printf("checked=%u nrmse=%.7g max_error=%.7g\n", count, nrmse, maximum);
+    return nrmse;
+}
+
+int main(int argc, char **argv) {
+    const int rows = argc >= 6 ? dimension(argv[3], 4, 262144) : 0;
+    const int columns = argc >= 6 ? dimension(argv[4], BLOCK_COLUMNS, 16384) : 0;
+    const int tokens = argc >= 6 ? dimension(argv[5], 1, 256) : 0;
+    const int decode = argc == 10;
+    const int prefill_tile = argc == 9;
+    const int row_tile = decode ? dimension(argv[7], 4, 16) :
+        prefill_tile ? dimension(argv[7], 2, 4) : 4;
+    const int token_tile = prefill_tile ? dimension(argv[8], 4, 16) : 8;
+    const int workgroup = decode ? dimension(argv[8], 32, 512) : 128;
+    const int splits = decode ? dimension(argv[9], 1, columns / BLOCK_COLUMNS) : 1;
+    if (!decode) { fputs("This experiment accepts decode geometry only\n", stderr); return 2; }
+    if ((argc != 6 && argc != 7 && !decode && !prefill_tile) || !rows || !columns || !tokens ||
+        !row_tile || (row_tile & (row_tile - 1)) || rows % row_tile ||
+        !token_tile || (token_tile & (token_tile - 1)) ||
+        !workgroup || !splits || workgroup % splits) {
+        fprintf(stderr,
+                "Usage: %s KERNEL WEIGHTS ROWS COLUMNS TOKENS [FLAGS [ROW_TILE TOKEN_TILE|ROW_TILE GROUP SPLITS]]\n",
+                argv[0]);
+        return 2;
+    }
+    const int blocks = columns / BLOCK_COLUMNS;
+    // The backend keeps eight-token input padding when it uses the four-token tail.
+    const int padding_tile = token_tile < 8 ? 8 : token_tile;
+    const int padded = (tokens + padding_tile - 1) / padding_tile * padding_tile;
+    const size_t weights = (size_t)rows * blocks;
+    const size_t output_size = (size_t)rows * tokens * sizeof(float);
+    const size_t input_size = (size_t)columns * padded * sizeof(_Float16);
+    unsigned char *raw = read_file(argv[2], weights * BLOCK_BYTES, NULL);
+    unsigned char *codes = alloc(weights * 16);
+    uint16_t *scales = alloc(weights * sizeof(*scales));
+    _Float16 *input = alloc(input_size);
+    float *output = alloc(output_size);
+    for (int row = 0; row < rows; ++row) {
+        for (int b = 0; b < blocks; ++b) {
+            const unsigned char *block = raw + ((size_t)row * blocks + b) * BLOCK_BYTES;
+            memcpy(scales + b * (size_t)rows + row, block, sizeof(*scales));
+            for (int i = 0; i < 16; ++i)
+                codes[(b * 16 + i) * (size_t)rows + row] = block[2 + i];
+        }
+    }
+    const char *seed_text = getenv("N20_INPUT_SEED");
+    uint32_t rng = seed_text ? (uint32_t)strtoul(seed_text, NULL, 10) : 621;
+    for (int k = 0; k < columns; ++k) {
+        for (int token = 0; token < padded; ++token) {
+            rng = 1664525u * rng + 1013904223u;
+            input[k * padded + token] = token < tokens
+                ? (float)((int)(rng >> 16) - 32768) / 16384 : 0;
+        }
+    }
+
+    cl_platform_id platform;
+    cl_device_id device;
+    CL(clGetPlatformIDs(1, &platform, NULL));
+    CL(clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL));
+    cl_int status;
+    cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &status);
+    check(status, "clCreateContext");
+    const cl_queue_properties properties[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
+    cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, properties, &status);
+    check(status, "clCreateCommandQueueWithProperties");
+
+    size_t length;
+    const char *source = (char *)read_file(argv[1], 0, &length);
+    cl_program program = clCreateProgramWithSource(context, 1, &source, &length, &status);
+    check(status, "clCreateProgramWithSource");
+    char options[512];
+    const int option_length = snprintf(options, sizeof(options),
+                                       "-cl-fast-relaxed-math -DQ2_0_MV_WIDE=%d -DN20_DECODE_ROWS=%d %s",
+                                       row_tile == 8, row_tile, argc >= 7 ? argv[6] : "");
+    if (option_length < 0 || (size_t)option_length >= sizeof(options))
+        return 2;
+    status = clBuildProgram(program, 1, &device, options, NULL, NULL);
+    if (status != CL_SUCCESS) {
+        size_t size;
+        CL(clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &size));
+        char *log = alloc(size + 1);
+        CL(clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, size, log, NULL));
+        log[size] = '\0';
+        fprintf(stderr, "%s\n", log);
+        free(log);
+        check(status, "clBuildProgram");
+    }
+    free((void *)source);
+    const char *name = decode ? "kernel_gemv_noshuffle_q2_0_f32" : "kernel_gemm_noshuffle_q2_0_f32";
+    cl_kernel kernel = clCreateKernel(program, name, &status);
+    check(status, "clCreateKernel");
+    cl_mem q = upload(context, codes, weights * 16);
+    cl_mem d = upload(context, scales, weights * sizeof(*scales));
+    const int offset_test = getenv("N20_OFFSET_TEST") != NULL;
+    const size_t extra = offset_test ? 128 : 0;
+    const cl_ulong offset = offset_test ? 64 : 0;
+    cl_mem x, x_image = NULL;
+    if (decode) {
+        const size_t bytes = (size_t)columns * tokens * sizeof(float);
+        unsigned char *storage = alloc(bytes + extra);
+        memset(storage, 0xa5, bytes + extra);
+        float *contiguous = (float *)(storage + offset);
+        for (int token = 0; token < tokens; ++token) {
+            for (int k = 0; k < columns; ++k)
+                contiguous[token * columns + k] = input[k * padded + token];
+        }
+        x = upload(context, storage, bytes + extra);
+        free(storage);
+    } else {
+        x = upload(context, input, input_size);
+        const cl_image_format format = {CL_RGBA, CL_HALF_FLOAT};
+        const cl_image_desc image = {
+            .image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER, .image_width = (size_t)columns * padded / 4,
+            .buffer = x,
+        };
+        x_image = clCreateImage(context, CL_MEM_READ_ONLY, &format, &image, NULL, &status);
+        check(status, "clCreateImage");
+    }
+    cl_mem y = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size + extra, NULL, &status);
+    check(status, "clCreateBuffer(output)");
+    if (offset_test) {
+        const unsigned char marker = 0xa5;
+        CL(clEnqueueFillBuffer(queue, y, &marker, sizeof(marker), 0, output_size + extra, 0, NULL, NULL));
+    }
+    cl_mem bias = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                                output_size * (size_t)splits, NULL, &status);
+    check(status, "clCreateBuffer(block bias)");
+    cl_kernel bias_kernel = clCreateKernel(program, "n20_q2_decode_reduce", &status);
+    check(status, "clCreateKernel(block bias)");
+
+    #define ARG(index, value) CL(clSetKernelArg(kernel, index, sizeof(value), &(value)))
+    ARG(0, q);
+    ARG(1, d);
+    size_t global[2], local[2];
+    if (decode) {
+        ARG(2, x);
+        ARG(3, offset);
+        ARG(4, y);
+        ARG(5, offset);
+        ARG(6, columns);
+        ARG(7, rows);
+        ARG(8, columns);
+        ARG(9, rows);
+        ARG(10, bias);
+        const cl_uint split_arg = (cl_uint)splits;
+        ARG(11, split_arg);
+        const size_t tiles = (size_t)rows / row_tile;
+        global[0] = (tiles + workgroup - 1) / workgroup * workgroup;
+        global[1] = (size_t)tokens * splits;
+        local[0] = (size_t)workgroup;
+        local[1] = 1;
+    } else {
+        ARG(2, x_image);
+        ARG(3, y);
+        ARG(4, offset);
+        ARG(5, rows);
+        ARG(6, padded);
+        ARG(7, columns);
+        ARG(8, tokens);
+        const int rows_per_group = row_tile * workgroup;
+        global[0] = ((size_t)tokens + token_tile - 1) / token_tile;
+        global[1] = (size_t)(rows + rows_per_group - 1) / rows_per_group * workgroup;
+        local[0] = 1;
+        local[1] = workgroup;
+    }
+    #undef ARG
+    const cl_uint split_arg = (cl_uint)splits;
+    CL(clSetKernelArg(bias_kernel, 0, sizeof(bias), &bias));
+    CL(clSetKernelArg(bias_kernel, 1, sizeof(y), &y));
+    CL(clSetKernelArg(bias_kernel, 2, sizeof(offset), &offset));
+    CL(clSetKernelArg(bias_kernel, 3, sizeof(rows), &rows));
+    CL(clSetKernelArg(bias_kernel, 4, sizeof(rows), &rows));
+    CL(clSetKernelArg(bias_kernel, 5, sizeof(split_arg), &split_arg));
+    const size_t bias_global[] = {(size_t)rows / row_tile, (size_t)tokens};
+
+    double host_ms[RUNS];
+    printf("rows=%d columns=%d tokens=%d gpu_ms=", rows, columns, tokens);
+    for (int run = 0; run < RUNS; ++run) {
+        struct timespec t0, t1;
+        if (clock_gettime(CLOCK_MONOTONIC, &t0)) return 1;
+        cl_event bias_event, event;
+        CL(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &bias_event));
+        CL(clEnqueueNDRangeKernel(queue, bias_kernel, 2, NULL, bias_global, NULL, 0, NULL, &event));
+        CL(clWaitForEvents(1, &event));
+        if (clock_gettime(CLOCK_MONOTONIC, &t1)) return 1;
+        host_ms[run] = (t1.tv_sec-t0.tv_sec)*1000.0 + (t1.tv_nsec-t0.tv_nsec)/1000000.0;
+        cl_ulong start, end;
+        CL(clGetEventProfilingInfo(bias_event, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL));
+        CL(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL));
+        printf("%s%.3f", run ? "," : "", (double)(end - start) / 1e6);
+        CL(clReleaseEvent(event));
+        CL(clReleaseEvent(bias_event));
+    }
+    putchar('\n');
+    printf("host_ms=");
+    for (int i = 0; i < RUNS; ++i) printf("%s%.3f", i ? "," : "", host_ms[i]);
+    putchar('\n');
+    CL(clEnqueueReadBuffer(queue, y, CL_TRUE, offset, output_size, output, 0, NULL, NULL));
+    if (offset_test) {
+        unsigned char guard[64];
+        CL(clEnqueueReadBuffer(queue, y, CL_TRUE, 0, sizeof(guard), guard, 0, NULL, NULL));
+        for (size_t i=0; i<sizeof(guard); ++i) if (guard[i] != 0xa5) { fputs("output prefix overwritten\n", stderr); return 1; }
+        CL(clEnqueueReadBuffer(queue, y, CL_TRUE, offset+output_size, sizeof(guard), guard, 0, NULL, NULL));
+        for (size_t i=0; i<sizeof(guard); ++i) if (guard[i] != 0xa5) { fputs("output suffix overwritten\n", stderr); return 1; }
+        puts("output_canaries=ok");
+    }
+    const char *output_file = getenv("N20_OUTPUT_FILE");
+    if (output_file) {
+        FILE *f = fopen(output_file, "wb");
+        if (!f || fwrite(output, 1, output_size, f) != output_size || fclose(f)) {
+            fputs("output write failed\n", stderr); return 1;
+        }
+    }
+    if (getenv("N20_OUTPUT_HASH")) {
+        uint64_t hash = UINT64_C(14695981039346656037);
+        const unsigned char *bytes = (const unsigned char *)output;
+        for (size_t i = 0; i < output_size; ++i) hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+        printf("output_fnv64=%016llx\n", (unsigned long long)hash);
+    }
+    const double nrmse = verify(raw, input, output, rows, columns, tokens, padded);
+
+    CL(clReleaseMemObject(y));
+    CL(clReleaseMemObject(bias));
+    if (x_image)
+        CL(clReleaseMemObject(x_image));
+    CL(clReleaseMemObject(x));
+    CL(clReleaseMemObject(d));
+    CL(clReleaseMemObject(q));
+    CL(clReleaseKernel(kernel));
+    CL(clReleaseKernel(bias_kernel));
+    CL(clReleaseProgram(program));
+    CL(clReleaseCommandQueue(queue));
+    CL(clReleaseContext(context));
+    free(output);
+    free(input);
+    free(scales);
+    free(codes);
+    free(raw);
+    return nrmse > 0.003 ? 1 : 0;
+}

@@ -6,12 +6,13 @@ The phone uses boot slot B and a reformatted userdata partition. Its bootloader 
 
 ## Repository
 
-- `runtime/` contains the current installed service scripts and MTP configuration, with their paths relative to the phone's Debian root. `minecraft-supervisor` starts them; this system does not use systemd as PID 1.
+- `runtime/` contains service scripts and MTP configuration, with their paths relative to the phone's Debian root. The installation can lag behind the checkout; the disabled Wiki bridge is one such case. `minecraft-supervisor` starts the services; this system does not use systemd as PID 1.
 - `dashboard/` contains the DRM/FreeType touchscreen UI and framebuffer capture source.
 - `radio/` and `third_party/` contain the Android compatibility stub, Qualcomm service sources, boot tools, and the BusyBox build input and source. Their original license files are retained.
 - `boot/` contains the persistent initramfs init and a deterministic builder. Its filesystem UUID and USB configuration are specific to this device.
 - `tools/` has non-installing builds, screen capture, and a Minecraft status probe; `tests/` exercises administration and backup behavior in temporary directories.
 - [Device and development notes](docs/device.md) describe dependencies, firmware, deployment, boot-image inputs, and known limitations.
+- [Minecraft Wiki chat](docs/wiki-chat.md) describes the on-device `@wiki` bridge, GPU worker, and cache maintenance.
 - `reports/` contains dated measurements and investigations; `docs/` is for durable documentation.
 - [Power measurements](reports/2026-11-08-power-baseline.md) record battery, idle-policy and earlier performance comparisons and their limitations.
 - The tested phone stops charging at 55% and resumes at 50%; see [device notes](docs/device.md) for details and recovery.

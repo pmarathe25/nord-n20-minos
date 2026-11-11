@@ -1,0 +1,452 @@
+# Minecraft Wiki chat on the Nord N20
+
+The bridge has answered a real chat message on the phone using the Adreno
+GPU. The feature remains disabled on the live server because the gameplay
+trial saw longer tail ticks during inference. See the
+[end-to-end trial](../reports/2026-11-09-wiki-end-to-end.md) for the measurements.
+
+The phone can run the existing 4B model, but it is slow for interactive chat.
+A representative warmed GPU-only request took about 39 seconds, and a
+separate experimental GPU–Hexagon configuration took about 27 seconds to
+its first token on one 323-token prompt. These are different measurements,
+not a direct comparison. The hybrid runtime and newer kernels under
+`wiki/experiments/` have not been installed or validated for production.
+Recent kernel tuning has produced small gains or regressions; the available
+measurements do not establish an order-of-magnitude speedup. See the
+[performance assessment](../reports/2026-11-10-wiki-optimization-assessment.md).
+The [configuration index](wiki-inference-status.md) links the tested profiles,
+benchmarks and their deployment status.
+
+The checkout is the development version, not an exact copy of the disabled
+installation. On 2026-11-10, the installed launcher and all four installed
+Python modules differed from the checkout files listed below. The tests and
+newer launcher behavior in this document describe the checkout unless a
+specific phone trial says otherwise. Do not enable the installed bridge on the
+assumption that those changes are already present; a future deployment needs
+to install and validate a matched bundle on the phone first.
+
+On vanilla Java 26.3, a message starting with `@wiki ` can ask the local
+assistant a question, such as `@wiki How many copper ingots make a lightning rod?`.
+The bridge follows new player-chat lines in the server log. A background worker
+retrieves parsed Java Edition excerpts. It answers recognized ingredient,
+fuel, storage capacity, and item property questions directly when the retrieved
+evidence supplies a unique answer. Ingredient counts require the full ingredient
+name and accept common plural forms. Other questions go to the local model.
+The bridge sends the answer and its Wiki section link privately to the player
+through the existing server console FIFO. The model can make factual mistakes
+even when it cites a passage. The Wiki cannot see the server's world, inventory,
+or player activity.
+
+The bridge allows one request at a time, with at least 30 seconds between
+requests. On a cache miss, the retriever may send search terms to Minecraft
+Wiki and cache the parsed articles. An offline invocation of the bridge
+searches cached pages only. The bridge caches up to 64 sourced replies in
+memory. Reusing a reply requires the same question and the same retrieved
+evidence, including the page revisions. The bridge pauses lookups at 40 °C
+battery temperature or above, or below 900 MiB of available system memory.
+
+## GPU worker setup
+
+This launcher is specific to the C.24 vendor kernel and matching Android
+userspace libraries. It runs Android ARM64 llama.cpp b12110 under the
+existing Bionic linker and uses the C.24 Adreno OpenCL 2.0 driver.
+The tested build used Android NDK r30, API 30, and
+`-march=armv8.2-a+fp16+dotprod` for C and C++. It set
+`GGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod` and `GGML_OPENCL_TARGET_VERSION=200`
+and enabled `GGML_OPENCL`, `GGML_OPENCL_EMBED_KERNELS` and
+`GGML_OPENCL_USE_ADRENO_KERNELS`. It disabled `GGML_NATIVE`, `GGML_HEXAGON`,
+`GGML_RPC`, `GGML_OPENMP`, `LLAMA_CURL` and `LLAMA_OPENSSL`.
+The compatibility shim supplies the signed packed
+dot-product intrinsic that the C.24 OpenCL compiler lacks. Build the shim
+as a shared object with the Android ARM64 toolchain.
+
+A non-deploying helper can prepare the tuned, activation-texture,
+Gated DeltaNet and disk-prefix patches together from a Git checkout of the
+exact b12110 commit. It archives that commit into a new output directory,
+applies the patches there, builds Android ARM64 binaries, stages the tested
+kernel sources, and records hashes. It requires Python 3.12 or later, Git,
+CMake, Ninja, the Android NDK, OpenCL headers and an Android ARM64 OpenCL link
+library. The output must be a new directory outside both source checkouts.
+For example, on a host with these prerequisites:
+
+```sh
+python3 tools/build-wiki-gpu.py --source "$LLAMA_SRC" --ndk "$ANDROID_NDK" \
+    --opencl-include "$OPENCL_HEADERS" --opencl-library "$OPENCL_LINK_LIBRARY" \
+    --output "$WIKI_BUILD_OUTPUT"
+```
+
+The resulting `bundle/` is partial: it does not contain the model, the
+compatibility shim, C.24 drivers or firmware, the retriever, or the launcher.
+`manifest.json` records the upstream commit and hashes of patches and staged
+artifacts, but is not a complete fingerprint of toolchains and device runtime.
+The helper does not modify the phone or install files. Building successfully
+is not a gameplay or answer-quality validation. See the [scratch build check](../reports/2026-11-10-wiki-gpu-build.md).
+
+```sh
+aarch64-linux-android30-clang -O2 -shared -fPIC \
+    wiki/experiments/n20-opencl-compat.c -o cl-compat.so -ldl
+```
+
+Use the matching C.24 OTA's `vendor/firmware` files `a630_sqe.fw`,
+`a615_zap.mdt`, and `a615_zap.b00` through `a615_zap.b02` for the KGSL
+driver. The launcher creates restricted KGSL and ION character devices from
+their registered sysfs major and minor numbers. Reserve numeric UID and GID
+61124 for this worker. Use `n20-wiki-start --devices-only` as root to prepare
+the two device nodes for an experiment without starting the chat bridge.
+Install the files into root-controlled paths.
+
+| Path | Contents |
+| --- | --- |
+| `/opt/n20-wiki/n20-wiki` | ARM64 Rust retriever from [the wiki build](../wiki/README.md) |
+| `/opt/n20-wiki/opencl/bin/` | Android ARM64 `llama-server` and its shared libraries |
+| `/opt/n20-wiki/opencl/{vendor,system}/` | Matching C.24 OpenCL driver and its runtime dependencies, with notices |
+| `/opt/n20-wiki/opencl/cl-compat.so` | Packed dot-product compatibility shim |
+| `/usr/local/lib/n20-radio/android/linker64` | Existing C.24 Bionic linker, beside its libraries |
+| `/opt/n20-wiki/model.gguf` | Verified GGUF checkpoint |
+| `/usr/local/lib/n20/` | `wiki_chat.py`, `wiki_answer.py`, `wiki_fast.py`, and `wiki_prefix.py` from the runtime tree |
+| `/usr/local/sbin/n20-wiki-start` | Launcher from the runtime tree, mode 0755 |
+| `/var/lib/n20-wiki/cache` | Parsed articles and SQLite index, mode 0700 owned by `minecraft` |
+| `/var/lib/n20-wiki/shaders/opencl` | OpenCL kernel cache, mode 0700 owned by UID and GID 61124 |
+
+The model serves one client slot over a local Unix socket. Its CPU threads
+are restricted to efficiency cores and run at reduced priority. It requests
+the OpenCL GPU explicitly and releases the model from memory after 90
+seconds of inactivity. A request that wakes the model pays the reload cost.
+While awake, the single slot can reuse the unchanged portion of the prompt.
+The launcher passes `--cache-ram 0` to skip saving older model states in a
+separate RAM cache. The chat bridge still reuses sourced replies after
+checking the current evidence. A model request for an older question that
+misses the reply cache may need more prefill. See the
+[prompt cache comparison](../reports/2026-11-10-wiki-prompt-cache.md).
+The bridge lets the worker generate through its normal end-of-generation token,
+so a blank line before the answer does not cut the reply short. It reads model
+output as it arrives and extracts the answer and its cited passage
+after the worker reports a normal stop. The bridge allows up to 75 seconds for
+the first text, 15 seconds between text updates, and 105 seconds total for
+the model request. The separate retrieval step can take up to 20 seconds.
+When the model deadline expires, the bridge closes the connection and sends
+the player an unavailable message. See the [streaming deadline trial](../reports/2026-11-10-wiki-stream-deadline.md)
+for the phone comparison. The model worker has its own UID. The bridge runs
+as `minecraft` to use the game-owned console FIFO.
+
+The supervisor starts the worker when `/etc/n20-wiki-enabled` exists. To
+enable a tested installation without restarting Minecraft, create the marker
+and start the launcher in the background under a separate session. Use its
+log to verify that llama.cpp selected the Adreno device and offloaded the
+model. Removing the marker shuts down the bridge and the model on the next
+launcher check.
+
+For the optional disk-backed system prefix, build llama-server with both
+`wiki/experiments/llama-b12110-n20-server.patch` and
+`wiki/experiments/llama-b12110-n20-disk-prefix.patch`, in that order. Install
+the patched server and `wiki_prefix.py`, create the root-controlled regular
+file `/etc/n20-wiki-disk-prefix`, and restart the Wiki launcher. The launcher
+fingerprints the protected model, runtime, firmware, boot ID, and exact worker
+options before enabling the cache. It stores one private snapshot under
+`/var/lib/n20-wiki/prefix` and uses it only during the same boot. If validation
+fails, it logs the reason and uses ordinary prefill. The [phone trial](../reports/2026-11-10-wiki-disk-prefix.md)
+includes launch-time fingerprinting and compares replies and logits.
+
+```sh
+install -m 644 /dev/null /etc/n20-wiki-enabled
+/usr/local/bin/busybox setsid /usr/local/sbin/n20-wiki-start \
+    >> /var/log/n20-wiki.log 2>&1 </dev/null &
+```
+
+## Experimental Adreno kernels
+
+The [inference tuning trial](../reports/2026-11-09-wiki-inference-tuning.md)
+compares custom Q2_0 prefill and decode kernels, a direct recurrent-state
+copy, and a reusable prompt-prefix snapshot on this phone.
+
+The launcher has an optional OpenCL profile for the tested Bonsai 2 4B
+group-64 Q2_0 checkpoint. Build llama-server with the OpenCL patch and the
+two server patches described above. Stop the Wiki launcher before replacing
+the runtime or kernel files. Stage the built OpenCL library beside
+llama-server and install the four kernel files below in a root-owned
+directory with mode 0755. Run these commands from a copy of the checkout on
+the phone as root.
+
+```sh
+install -d -m 755 /opt/n20-wiki/kernels
+install -m 644 wiki/experiments/n20-q2-decode.cl wiki/experiments/n20-q2-pack.cl \
+    wiki/experiments/n20-fwht-radix.cl /opt/n20-wiki/kernels/
+prefill=$(mktemp)
+{ printf '#define N20_PARTIAL 64\n'; cat wiki/experiments/n20-q2-prefill.cl; } > "$prefill"
+install -m 644 "$prefill" /opt/n20-wiki/kernels/n20-q2-prefill-64.cl
+rm "$prefill"
+install -m 644 /dev/null /etc/n20-wiki-opencl-tuned
+```
+
+Restart the Wiki launcher to apply the marker. The profile enables the
+64-column prefill kernel with FP32 outer accumulation, the four-lane tail,
+the tested decode shapes and wide vocabulary tile, direct weight packing
+and recurrent-state copy, and the width-512 Hadamard transform. When the
+disk prefix is also enabled, single-turn Wiki batching skips two tail
+checkpoints and uses a separate snapshot in `/var/lib/n20-wiki/prefix-tuned`.
+The snapshot identity includes the source contents and the worker options.
+Invalid or missing inputs select stock OpenCL kernels. If a tuned worker
+exits, the launcher retries once with stock kernels and the stock prefix
+cache. Remove `/etc/n20-wiki-opencl-tuned` and restart the launcher to
+select stock kernels on subsequent starts. See the
+[isolated launcher comparison](../reports/2026-11-10-wiki-tuned-launcher.md)
+for reply, startup and prefix restore measurements.
+
+### Activation texture profile
+
+Apply `wiki/experiments/llama-b12110-n20-activation-image.patch` after
+the N20 OpenCL patch and rebuild the Android ARM64 OpenCL backend with
+`GGML_OPENCL_TARGET_VERSION=200`. With the tuned profile staged and the
+Wiki launcher stopped, place the rebuilt library beside `llama-server`.
+Install the texture source and add the separate marker as root.
+
+```sh
+install -m 644 wiki/experiments/n20-q2-activation-image-prefill.cl /opt/n20-wiki/kernels/
+install -m 644 /dev/null /etc/n20-wiki-opencl-texture
+```
+
+Restart the Wiki launcher. It accepts this profile only when tuned
+validation passes and `model.gguf` matches the tested Bonsai 2 4B
+group-64 Q2_0 checkpoint. The worker checks that its device and in-order
+queue support the required RGBA FP16 image, checks kernel workgroup
+capacity, and reuses one 64 × 9,216 texture with a 4.5 MiB pixel payload.
+It sets a 256-token microbatch and uses the texture for the tested
+feed-forward dimensions with at least 16 tokens. Other projections use
+the tuned image-buffer kernels.
+
+Validation failures select tuned kernels. If texture setup fails or the
+texture worker exits, the launcher starts the tuned worker, then retries
+with stock kernels if the tuned worker exits. If a texture argument,
+copy, or launch call returns an immediate OpenCL error during inference,
+the worker disables the texture for that context and completes that
+projection with the tuned image buffer. The in-order queue keeps the
+copy and GEMM ordered without a per-projection wait.
+
+The texture profile has a private shader cache in
+`/var/lib/n20-wiki/shaders-texture`. With the disk prefix enabled it
+uses a separate snapshot under `/var/lib/n20-wiki/prefix-texture`, keyed
+to both prefill sources, the backend, checkpoint, and worker options. Texture
+validation and prefix fingerprinting share a single full checkpoint hash;
+the helper checks that the model file identity remains unchanged between
+validation and fingerprinting.
+Remove `/etc/n20-wiki-opencl-texture` and restart the launcher to select
+the tuned profile. See the [initial activation texture trial](../reports/2026-11-10-wiki-activation-texture.md)
+for kernel and model comparisons and the [launcher trial](../reports/2026-11-10-wiki-texture-launcher.md)
+for complete replies and fallback checks.
+
+### Flash Attention shader cache
+
+Apply the optional Flash Attention cache patch after the selected N20
+OpenCL patches and rebuild the Android ARM64 backend.
+
+```sh
+git -C "$LLAMA_SRC" apply "$MINOS/wiki/experiments/llama-b12110-n20-fa-cache.patch"
+cmake --build "$LLAMA_BUILD" --target ggml-opencl
+```
+
+The worker adds lazy Flash Attention programs to its existing private
+shader cache. It builds missing or unusable entries from source with the
+existing retry and fallback behavior. Once the entries are populated, the
+next fresh worker process can reuse them. On the texture profile this cut
+process launch to health from 18.42 to 7.47 seconds in a paired run with
+identical cited replies. [Phone trial](../reports/2026-11-10-wiki-fa-cache.md)
+
+### Individual kernel experiments
+
+Apply the experiment patch to a separate llama.cpp b12110 checkout and build
+the OpenCL backend with the same Android toolchain and build options as the
+worker. For experiments with individual settings, stage the resulting
+shared library in a separate directory.
+
+```sh
+git -C "$LLAMA_SRC" apply "$MINOS/wiki/experiments/llama-b12110-n20-opencl.patch"
+cmake --build "$LLAMA_BUILD" --target ggml-opencl
+{ printf '#define N20_PARTIAL 64\n'; cat "$MINOS/wiki/experiments/n20-q2-prefill.cl"; } > /tmp/half64.cl
+```
+
+With the test library selected in the isolated Bionic process, set
+`N20_Q2_PREFILL_SOURCE` to the absolute path of the copied `half64.cl` on the
+phone. Set `N20_Q2_DECODE_SOURCE` to the path of `n20-q2-decode.cl` and set
+`N20_SINGLE_ROW_COPY=1` for the direct recurrent copy. Each setting is
+independent. The decode override dispatches for the two tested feed-forward
+shapes and the tested vocabulary projection at one token.
+Set `N20_Q2_WIDE_VOCAB=1` with the custom decode source to use 16 rows
+per work item for the single-token vocabulary projection. The option
+keeps the existing feed-forward decode tiles.
+`N20_Q2_PACK_SOURCE` can point to `n20-q2-pack.cl` to transpose the packed
+weights and scales directly from the original GGUF blocks during upload.
+Set `N20_Q2_TAIL=1` with the custom prefill source to use a four-lane
+tile for batches of two to four tokens. `N20_FWHT_SOURCE` can point to
+`n20-fwht.cl` to use register butterflies at widths 64, 256, and 1024.
+The other widths use the upstream transform.
+Set `N20_FWHT_RADIX_SOURCE` to `n20-fwht-radix.cl` to use the
+32 × 16 register transform at width 512. It accepts both F16 and F32
+inputs and retains F32 accumulation.
+
+For the in-process system-prefix cache, apply
+`wiki/experiments/llama-b12110-n20-server.patch` to the same b12110
+checkout and build the `llama-server` target. Stage
+`libllama-server-impl.so` alongside the backend and set
+`N20_KEEP_SYSTEM_PREFIX=1` in the isolated server. With one slot and
+context checkpoints enabled, it saves the attention and recurrent state
+up to the first user turn. It checks the exact prefix tokens before
+restoring into an empty slot after idle unload. The snapshot is limited
+to 64 MiB in process memory. This cache saves prefill work while the
+weights still have to reload on wake.
+
+For independent Wiki requests, add `N20_WIKI_SINGLE_TURN=1` alongside
+`N20_KEEP_SYSTEM_PREFIX=1`. It skips the forced end-of-prompt batch splits
+when the first and last user turn are the same. The system checkpoint still
+allows reuse across questions. The [phone response trial](../reports/2026-11-09-wiki-graph.md)
+compares this setting with the tuned baseline and the experimental fused
+feed-forward block. To reproduce the fusion trial, apply
+`wiki/experiments/llama-b12110-n20-ffn-trial.patch` after the OpenCL patch.
+Set `N20_Q2_FFN_SOURCE` to the copied `n20-q2-ffn.cl` and set
+`N20_Q2_FFN_DECODE=1` to test both phases. The fused path was slower in the
+complete reply comparison.
+
+The experimental `llama-b12110-n20-gdn-columns.patch` selects a smaller
+Gated DeltaNet prefill layout when `N20_GDN_CPL=2` is set. It leaves the
+default layout and single-token decode unchanged. When the tuned and texture
+profiles are enabled, the launcher can select this layout if the optional
+root-controlled `/etc/n20-wiki-opencl-gdn2` marker exists and the backend
+contains the patch. It uses separate shader and disk-prefix directories;
+if the worker stops, the launcher retries with the texture profile. The
+marker is not installed automatically. See the [phone comparison](../reports/2026-11-10-wiki-gdn-columns.md)
+before using this experimental profile.
+
+Run `wiki/experiments/n20-wiki-e2e.py` on the phone with `--bridge`,
+`--cache`, `--socket`, `--cases`, and `--ids`. Use a private model socket
+and a copy of the parsed cache. It measures from a simulated chat log line
+through the real bridge to the generated console command.
+
+Build the projection harness with the OpenCL headers and the Android ARM64
+link library for OpenCL. Build the model harness against the same b12110
+headers and libraries as the test backend.
+
+```sh
+cd "$MINOS"
+aarch64-linux-android30-clang -O3 -I"$OPENCL_HEADERS" \
+    wiki/experiments/n20-q2-opencl-bench.c -L"$OPENCL_LIB" -lOpenCL -lm -o projection-bench
+aarch64-linux-android30-clang -O3 -I"$LLAMA_SRC/include" -I"$LLAMA_SRC/ggml/include" \
+    wiki/experiments/n20-model-bench.c -L"$LLAMA_BUILD/bin" -Wl,--allow-shlib-undefined \
+    -llama -lggml -lggml-base -o model-bench
+```
+
+The projection harness takes a kernel, a raw GGUF tensor, rows, columns,
+and token count. For decode, also pass compiler flags, rows per work item,
+workgroup size, and input splits. The model harness takes the GGUF and a
+rendered prompt file followed by the microbatch size, number of decode
+steps and optional repeat count. Pass `host` and a second rendered prompt
+after the repeat count to measure a restored common prefix. Pass `choice`
+with zero decode steps to score one digit from 0 through 4. After the
+prefix file, append `save STATE_FILE` to build a disk snapshot or
+`load STATE_FILE` to restore it in a fresh process. Use a trusted scratch
+file with the same model, runtime, and context settings. The benchmark
+checks the saved token IDs against the requested prefix.
+See the [prefix and retrieval trials](../reports/2026-11-09-wiki-speed-paths.md).
+The [follow-up runtime trial](../reports/2026-11-09-wiki-runtime-2.md)
+records the tail, transform, prefix, and vocabulary-shard measurements.
+The [Bonsai speed experiments](../reports/2026-11-09-bonsai-speed.md)
+compare the expanded tail tile, prompt compression, and speculative decoding.
+The [accelerator follow-up](../reports/2026-11-09-wiki-accelerators.md)
+compares the width-512 transform on Adreno and Hexagon, including the
+cost of returning a DSP result to the GPU.
+
+## Cache maintenance
+
+Run these commands on the phone as root. `--update` checks revisions for
+articles due for revalidation, fetches changed pages, and updates the index.
+Run it during an idle period. `--index` indexes new or changed parsed files
+without contacting the Wiki. Failed refreshes leave the previous parsed copy
+available.
+
+```sh
+runuser -u minecraft -- nice -n 10 /opt/n20-wiki/n20-wiki \
+    --cache /var/lib/n20-wiki/cache --update
+runuser -u minecraft -- nice -n 10 /opt/n20-wiki/n20-wiki \
+    --cache /var/lib/n20-wiki/cache --index
+```
+
+## Rust Vulkan compute experiments
+
+The stock llama.cpp Vulkan build requires 16-bit storage buffers that this
+Turnip/KGSL setup does not expose. The Rust probes use 32-bit storage buffers.
+Build a minimal native Turnip ICD with these Mesa options.
+
+```sh
+meson setup build-turnip --buildtype=release -Dplatforms= -Dgallium-drivers= \
+    -Dvulkan-drivers=freedreno -Dfreedreno-kmds=kgsl -Dllvm=disabled \
+    -Dglx=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled -Dgbm=disabled
+ninja -C build-turnip
+```
+
+`wiki/experiments/q2-gemv.comp` runs a single Bonsai `Q2_0` projection using
+32-bit storage buffers. The Rust projection module repacks the original
+18-byte GGUF blocks. The Vulkan module owns the buffers, pipelines, and
+command recording. The probe times repeated GPU dispatches and compares the
+results with a scalar reference. Build the Rust host for ARM64 Linux and
+compile the two shaders with glslang.
+
+```sh
+glslangValidator -V --target-env vulkan1.1 wiki/experiments/q2-gemv.comp -o /tmp/q2-gemv.spv
+glslangValidator -V --target-env vulkan1.1 wiki/experiments/attention.comp -o /tmp/attention.spv
+cargo build --manifest-path wiki/experiments/Cargo.toml --locked --release
+```
+
+Extract a two-dimensional `Q2_0` tensor with the matching llama.cpp
+`gguf-py` package. For the tested Bonsai 2 4B GGUF, `blk.0.ffn_up.weight`
+has 9,216 output rows and 2,560 input columns.
+
+```python
+from gguf import GGUFReader, GGMLQuantizationType
+
+reader = GGUFReader("/opt/n20-wiki/model.gguf")
+tensor = next(t for t in reader.tensors if t.name == "blk.0.ffn_up.weight")
+assert tensor.tensor_type == GGMLQuantizationType.Q2_0
+tensor.data.tofile("/tmp/ffn-up.q2_0")
+```
+
+Run with `VK_DRIVER_FILES` set to the Turnip manifest, the Vulkan loader on
+the library path, and access to the KGSL device. The trial installation has
+the ARM64 probe and the two compiled shaders in `/opt/n20-wiki/probes`.
+
+```sh
+n20-vulkan-probe q2 /tmp/q2-gemv.spv /tmp/ffn-up.q2_0 9216 2560 25
+n20-vulkan-probe attention /tmp/attention.spv 16 4 256 512 512 25
+```
+
+The attention module accepts precomputed queries and a causal prefix of
+resident keys and values. It handles grouped-query or ordinary multi-head
+attention with a runtime head count, head width, and cache length. Growing
+the prefix updates push constants. Appending cache entries updates the
+mapped buffers. Both operations reuse the original descriptors and pipeline.
+A command buffer can chain multiple operations with GPU-side memory
+dependencies and one queue submission. Tokenization, rotary embeddings,
+the checkpoint's Hadamard transforms and recurrent blocks, and the
+prompt-processing graph belong in a model implementation.
+
+### Native instruction probes
+
+On Turnip, `IR3_SHADER_DEBUG=cs,nocache` prints the native Adreno instructions
+and register and stall counts for the dispatched shader. Mesa also exposes
+`IR3_SHADER_OVERRIDE_PATH` for assembly variants named by the shader's
+native-code hash. Disable the Mesa shader cache when testing an override
+so the driver rebuilds the pipeline. Its stand-alone
+Computerator utility expects an MSM DRM render node, while this C.24
+installation exposes the compute device through KGSL.
+
+The Hexagon probe compiles to a v66 object with one HVX dot-product
+instruction. This checks code generation without starting the DSP.
+
+```sh
+clang -target hexagon -mcpu=hexagonv66 -mhvx -mhvx-length=128B -O3 \
+    -ffreestanding -S wiki/experiments/hvx-v66.c -o /tmp/hvx-v66.s
+```
+
+The [v66 calculator trial](../reports/2026-11-09-hexagon-calculator.md)
+loaded a custom QuRT module on the phone's compute DSP using the existing
+firmware and the stock FastRPC runtime. The
+[projection trial](../reports/2026-11-09-hexagon-projection.md) used HVX to
+compute real Q2_0 model projections and measured both direct offload and
+concurrent Adreno execution.

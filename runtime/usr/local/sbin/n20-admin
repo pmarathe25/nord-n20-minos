@@ -458,8 +458,10 @@ def copy_quiescent_world():
 def retention(allow_prune):
     # Automatic snapshots span both older offline and new live source paths.
     set_operation('Cleaning old snapshots')
-    for tag,args in [('auto',['--keep-last','24','--keep-daily','14','--keep-weekly','8']),
-                     ('manual',['--keep-last','24']),('pre-restore',['--keep-last','5'])]:
+    # Manual snapshots are never passed to forget. Keep one automatic snapshot
+    # for every week that has one, in addition to the recent and daily history.
+    for tag,args in [('auto',['--keep-last','24','--keep-daily','14','--keep-weekly','unlimited']),
+                     ('pre-restore',['--keep-last','5'])]:
         run_restic(['forget','--tag',tag,'--group-by','host']+args,timeout=1200)
     try: last_prune=int(read(PRUNE,'0'))
     except ValueError: last_prune=0

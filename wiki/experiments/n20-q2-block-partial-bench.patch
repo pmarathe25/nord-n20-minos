@@ -1,0 +1,122 @@
+diff --git a/wiki/experiments/n20-q2-opencl-bench.c b/wiki/experiments/n20-q2-opencl-bench.c
+index 1e1f556..1a4bd6e 100644
+--- a/wiki/experiments/n20-q2-opencl-bench.c
++++ b/wiki/experiments/n20-q2-opencl-bench.c
+@@ -204,13 +204,32 @@ int main(int argc, char **argv) {
+     } else {
+         x = upload(context, input, input_size);
+         const cl_image_format format = {CL_RGBA, CL_HALF_FLOAT};
+-        const cl_image_desc image = {
++        cl_image_desc image = {
+             .image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER, .image_width = (size_t)columns * padded / 4,
+             .buffer = x,
+         };
+-        x_image = clCreateImage(context, CL_MEM_READ_ONLY, &format, &image, NULL, &status);
++        if (getenv("N20_IMAGE2D")) {
++            image.image_type = CL_MEM_OBJECT_IMAGE2D;
++            image.image_width = padded / 4;
++            image.image_height = columns;
++            image.buffer = NULL;
++        }
++        x_image = clCreateImage(context,
++            CL_MEM_READ_ONLY | (getenv("N20_IMAGE2D") ? CL_MEM_COPY_HOST_PTR : 0),
++            &format, &image, getenv("N20_IMAGE2D") ? input : NULL, &status);
+         check(status, "clCreateImage");
+     }
++    const int partial_mode = getenv("N20_BLOCK_PARTIAL") != NULL;
++    cl_mem partial = NULL;
++    cl_kernel reduce = NULL;
++    if (partial_mode) {
++        const size_t partial_bytes = (size_t)blocks * tokens * rows * sizeof(cl_half);
++        partial = clCreateBuffer(context, CL_MEM_READ_WRITE, partial_bytes, NULL, &status);
++        check(status, "clCreateBuffer(partial)");
++        reduce = clCreateKernel(program, "n20_reduce", &status);
++        check(status, "clCreateKernel(reduce)");
++        printf("partial_bytes=%zu\n", partial_bytes);
++    }
+     cl_mem y = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, NULL, &status);
+     check(status, "clCreateBuffer(output)");
+ 
+@@ -235,13 +254,22 @@ int main(int argc, char **argv) {
+         local[0] = (size_t)lanes;
+         local[1] = (size_t)splits;
+     } else {
+-        ARG(2, x_image);
++        if (getenv("N20_BUFFER")) { ARG(2, x); } else { ARG(2, x_image); }
+         ARG(3, y);
+         ARG(4, offset);
+         ARG(5, rows);
+         ARG(6, padded);
+         ARG(7, columns);
+         ARG(8, tokens);
++        if (partial_mode) {
++            ARG(9, partial);
++            CL(clSetKernelArg(reduce, 0, sizeof(partial), &partial));
++            CL(clSetKernelArg(reduce, 1, sizeof(d), &d));
++            CL(clSetKernelArg(reduce, 2, sizeof(y), &y));
++            CL(clSetKernelArg(reduce, 3, sizeof(rows), &rows));
++            CL(clSetKernelArg(reduce, 4, sizeof(tokens), &tokens));
++            CL(clSetKernelArg(reduce, 5, sizeof(blocks), &blocks));
++        }
+         const int rows_per_group = row_tile * workgroup;
+         global[0] = ((size_t)tokens + token_tile - 1) / token_tile;
+         global[1] = (size_t)(rows + rows_per_group - 1) / rows_per_group * workgroup;
+@@ -252,19 +280,55 @@ int main(int argc, char **argv) {
+ 
+     printf("rows=%d columns=%d tokens=%d gpu_ms=", rows, columns, tokens);
+     for (int run = 0; run < RUNS; ++run) {
+-        cl_event event;
+-        CL(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event));
+-        CL(clWaitForEvents(1, &event));
++        cl_event event, copied = NULL;
++        if (getenv("N20_IMAGE2D")) {
++            const size_t origin[3] = {0, 0, 0};
++            const size_t extent[3] = {(size_t)padded / 4, (size_t)columns, 1};
++            CL(clEnqueueCopyBufferToImage(queue, x, x_image, 0, origin, extent, 0, NULL, &copied));
++        }
++        cl_event final_event = NULL;
++        if (partial_mode) {
++            const size_t g3[3] = {global[0], global[1], (size_t)blocks};
++            const size_t l3[3] = {local[0], local[1], 1};
++            const size_t gr[2] = {(size_t)tokens, (size_t)rows / 4};
++            CL(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, g3, l3, 0, NULL, &event));
++            CL(clEnqueueNDRangeKernel(queue, reduce, 2, NULL, gr, NULL, 0, NULL, &final_event));
++            CL(clWaitForEvents(1, &final_event));
++        } else {
++            CL(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event));
++            CL(clWaitForEvents(1, &event));
++        }
+         cl_ulong start, end;
+         CL(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL));
+         CL(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL));
++        if (final_event) {
++            cl_ulong finish, partial_start, partial_end;
++            CL(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(partial_start), &partial_start, NULL));
++            CL(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(partial_end), &partial_end, NULL));
++            CL(clGetEventProfilingInfo(final_event, CL_PROFILING_COMMAND_END, sizeof(finish), &finish, NULL));
++            fprintf(stderr, "partial_ms=%.3f reduction_and_gap_ms=%.3f\n", (double)(partial_end-partial_start)/1e6, (double)(finish-partial_end)/1e6);
++            end = finish;
++            CL(clReleaseEvent(final_event));
++        }
++        if (copied) {
++            CL(clGetEventProfilingInfo(copied, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL));
++            CL(clReleaseEvent(copied));
++        }
+         printf("%s%.3f", run ? "," : "", (double)(end - start) / 1e6);
+         CL(clReleaseEvent(event));
+     }
+     putchar('\n');
+     CL(clEnqueueReadBuffer(queue, y, CL_TRUE, 0, output_size, output, 0, NULL, NULL));
++    uint64_t hash = UINT64_C(14695981039346656037);
++    for (size_t h = 0; h < output_size; ++h) {
++        hash ^= ((unsigned char *)output)[h];
++        hash *= UINT64_C(1099511628211);
++    }
++    printf("hash=%016llx\n", (unsigned long long)hash);
+     const double nrmse = verify(raw, input, output, rows, columns, tokens, padded);
+ 
++    if (partial) CL(clReleaseMemObject(partial));
++    if (reduce) CL(clReleaseKernel(reduce));
+     CL(clReleaseMemObject(y));
+     if (x_image)
+         CL(clReleaseMemObject(x_image));

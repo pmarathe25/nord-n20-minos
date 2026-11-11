@@ -1,0 +1,52 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1153,6 +1153,7 @@
+     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
+     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
+     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
++    int n20_gdn_prefill_cpl = 4;
+     cl_kernel kernel_ssm_scan_f32 = nullptr;
+     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
+     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
+@@ -4821,6 +4822,15 @@
+         const std::string kernel_src = read_file("gated_delta_net.cl");
+     #endif
+ 
++        // The opt-in is frozen at backend initialization so build and dispatch agree.
++        const char * n20_gdn_cpl = getenv("N20_GDN_CPL");
++        if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO && n20_gdn_cpl) {
++            if (strcmp(n20_gdn_cpl, "1") == 0) {
++                backend_ctx->n20_gdn_prefill_cpl = 1;
++            } else if (strcmp(n20_gdn_cpl, "2") == 0) {
++                backend_ctx->n20_gdn_prefill_cpl = 2;
++            }
++        }
+         const int gdn_sizes[4] = { 16, 32, 64, 128 };
+         const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
+         if (sg_size < 0) {
+@@ -4863,7 +4873,7 @@
+             }
+             for (int kda = 0; kda < 2; kda++) {
+                 for (int tgpp = 0; tgpp < 2; tgpp++) {
+-                    const int cpl = (tgpp == 0) ? 1 : 4;
++                    const int cpl = (tgpp == 0) ? 1 : (S_V == 128 ? backend_ctx->n20_gdn_prefill_cpl : 4);
+                     const int spw  = (tgpp == 0) ? 1 : 1;
+ 
+                     std::string opts = compile_opts;
+@@ -38468,7 +38478,15 @@
+     // for S_v=128.
+     // Empirically found that when spw=1, we get the best performance for both tg and pp
+     const int tgpp = (n_tokens == 1) ? 0 : 1;
+-    const int cpl  = (tgpp == 0) ? 1 : 4;
++    const int cpl = (tgpp == 0) ? 1 : (S_v == 128 ? backend_ctx->n20_gdn_prefill_cpl : 4);
++    static const bool n20_gdn_trace = getenv("N20_GDN_TRACE") != nullptr;
++    if (n20_gdn_trace && tgpp && S_v == 128) {
++        static std::once_flag n20_trace;
++        std::call_once(n20_trace, [&] {
++            fprintf(stderr, "N20_GDN_CPL_CONFIRMED=%d shuffle=%d\n", cpl, backend_ctx->has_qcom_subgroup_shuffle);
++            fflush(stderr);
++        });
++    }
+     // spw needs adjustment when S_v != 128
+     const int spw  = (tgpp == 0) ? 1 : 1;
+ 
