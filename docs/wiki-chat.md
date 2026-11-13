@@ -47,6 +47,10 @@ The same bridge also recognizes these commands at the start of a chat message:
 
 - `@pin <note>` saves the player's current position, dimension, and note.
 - `@pin_that <note>` saves the block cell the player is looking toward.
+- `@unpin <note>` removes one location whose full note matches, ignoring case
+  and repeated whitespace. If several locations have that note, use
+  `@unpin <note> | <x> <y> <z> | <dimension>` with values from `@map`.
+  Indistinguishable duplicate entries are removed one at a time.
 - `@death` privately lists up to five recorded deaths and gives directions.
 - `@map` lists all shared saved locations in public chat, sorted alphabetically
   without regard to letter case. `@map <search>` finds every note containing

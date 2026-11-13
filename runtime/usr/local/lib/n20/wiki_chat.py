@@ -373,7 +373,7 @@ def reply(path, player, components, broadcast=False):
         os.close(fd)
 
 
-MARKER_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(pin_that|pin|map|death|help)(?:\s+(.*))?$")
+MARKER_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(pin_that|pin|unpin|map|death|help)(?:\s+(.*))?$")
 MARKER_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) has the following entity data: (.+)$")
 RAY_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?(n20_pin_[0-9a-f]{32}) has the following entity data: (.+)$")
 RAY_SAMPLE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Number provider returned value ([0-9]+)$")
@@ -825,8 +825,8 @@ class MarkerQueue:
                                'markers': markers, 'offset': 0, 'landmarks': landmarks})
 
     def pin_pending(self):
-        return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that')) or
-                any(item.get('action') in ('pin', 'pin_that') for item in self.queue))
+        return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that', 'unpin')) or
+                any(item.get('action') in ('pin', 'pin_that', 'unpin') for item in self.queue))
 
     def handle(self, line):
         server = server_identity(self.args.pid_file)
@@ -910,7 +910,9 @@ class MarkerQueue:
         if not server:
             return
         if action == "help":
-            self.send(player, "[Help] @wiki <question> | @pin <note> | @pin_that <note> | @map [search] | @death | @help")
+            self.send(player, "[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @map [search] | @death | @help")
+        elif action == 'unpin' and (not note or not note.strip() or len(note.strip()) > 256):
+            self.send(player, '[Map] Use @unpin followed by the exact location note.')
         elif action in ("pin", "pin_that") and (not note or not note.strip() or len(note.strip()) > 160):
             self.send(player, f"[Map] Use @{action} followed by a note (up to 160 characters).")
         elif len(self.queue) >= MAX_MARKER_QUEUE:
@@ -1124,6 +1126,36 @@ class MarkerQueue:
                         self.enqueue_listing(player, sorted(markers, key=lambda item: item['note'].casefold()))
                 except (OSError, ValueError, TypeError):
                     self.send(player, "[Map] Location service is unavailable.")
+                continue
+            if request['action'] == 'unpin':
+                try:
+                    markers = load_markers(self.args.pins_file)
+                    note = request['note']
+                    normalize = lambda text: ' '.join(text.casefold().split())
+                    hits = [i for i, marker in enumerate(markers) if normalize(marker['note']) == normalize(note)]
+                    selected_coordinates = False
+                    if not hits:
+                        selector = re.fullmatch(r'(.+?)\s+\|\s*(-?\d+)(?:\s*,\s*|\s+)(-?\d+)(?:\s*,\s*|\s+)(-?\d+)(?:\s+\|\s+([a-z0-9_.-]+:[a-z0-9_./-]+))?\s*', note)
+                        if selector:
+                            selected_coordinates = True
+                            name, x, y, z, dimension = selector.groups()
+                            coords = [int(x), int(y), int(z)]
+                            hits = [i for i, marker in enumerate(markers)
+                                    if normalize(marker['note']) == normalize(name)
+                                    and [math.floor(value) for value in marker['pos']] == coords
+                                    and (dimension is None or marker['dimension'] == dimension)]
+                    if not hits:
+                        self.send(player, '[Map] No saved location matches that exact note and any specified coordinates.')
+                    elif (len(hits) > 1 and any(markers[i] != markers[hits[0]] for i in hits[1:]) and
+                          not (selected_coordinates and all(markers[i]['dimension'] == markers[hits[0]]['dimension']
+                              for i in hits[1:]))):
+                        self.send(player, '[Map] That note matches multiple locations. Use @unpin <exact note> | <x> <y> <z> | <dimension>; see @map for coordinates and dimensions.')
+                    else:
+                        removed = markers.pop(hits[0])
+                        save_markers(self.args.pins_file, markers)
+                        self.send(player, '[Map] Removed ' + marker_text(removed))
+                except (OSError, ValueError, TypeError):
+                    self.send(player, '[Map] Could not remove location; the map may be unreadable.')
                 continue
             if request['action'] == 'death':
                 token = 'n20_pin_' + secrets.token_hex(16)

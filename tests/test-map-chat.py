@@ -76,6 +76,39 @@ class MarkerTests(unittest.TestCase):
         self.service.next_ray_batch = 0
         self.service.advance()
 
+    def test_unpin_removes_exact_note_and_keeps_other_entries(self):
+        markers = [{'note': 'Village Well', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'},
+                   {'note': 'Village Well East', 'pos': [3, 64, 4], 'dimension': 'minecraft:overworld'}]
+        m.save_markers(self.args.pins_file, markers)
+        self.service.handle(PREFIX + '<Alex> @unpin  village  WELL')
+        self.assertTrue(self.service.pin_pending())
+        self.service.advance()
+        self.assertEqual(m.load_markers(self.args.pins_file), markers[1:])
+        self.assertTrue(any('Removed Village Well:' in text and kw.get('broadcast') for _, text, kw in self.replies))
+
+    def test_unpin_ambiguous_note_requires_coordinates_and_dimension(self):
+        markers = [{'note': 'home', 'pos': [1.2, 64, 2.7], 'dimension': 'minecraft:overworld'},
+                   {'note': 'home', 'pos': [1.2, 64, 2.7], 'dimension': 'minecraft:the_nether'},
+                   {'note': 'home', 'pos': [-10, 70, 3], 'dimension': 'minecraft:overworld'}]
+        m.save_markers(self.args.pins_file, markers)
+        for query in ('home', 'home | 1, 64, 2'):
+            self.service.handle(PREFIX + '<Alex> @unpin ' + query)
+            self.service.advance()
+            self.assertEqual(m.load_markers(self.args.pins_file), markers)
+        self.service.handle(PREFIX + '<Alex> @unpin home | 1,64,2 | minecraft:the_nether')
+        self.service.advance()
+        self.assertEqual(m.load_markers(self.args.pins_file), [markers[0], markers[2]])
+
+    def test_unpin_follows_queued_pin_and_reports_unknown_note(self):
+        self.service.handle(PREFIX + '<Alex> @pin example')
+        self.service.handle(PREFIX + '<Steve> @unpin example')
+        self.service.advance()
+        self.capture('Alex', '[1.0d, 64.0d, 2.0d]', 'minecraft:overworld')
+        self.assertEqual(m.load_markers(self.args.pins_file), [])
+        self.service.handle(PREFIX + '<Steve> @unpin missing')
+        self.service.advance()
+        self.assertTrue(any('No saved location matches' in text for _, text, _ in self.replies))
+
     def test_concurrent_pins_and_map_are_ordered_and_broadcast(self):
         self.service.handle(PREFIX + '<Alex> @pin small village with a well')
         self.service.handle(PREFIX + '<Steve> @pin mountain house')
