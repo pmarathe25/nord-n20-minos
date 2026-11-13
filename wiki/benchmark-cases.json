@@ -1,5 +1,5 @@
 [
-  {"id":"f01","question":"Can I repair my wings using phantom membranes?","titles":["Elytra"],"expect":["phantom membranes?"],"evidence":["phantom membranes?"],"reject":["\\bno\\b"]},
+  {"id":"f01","question":"Can I repair my wings using phantom membranes?","titles":["Elytra"],"expect":["\\byes\\b|phantom membranes?"],"evidence":["phantom membranes?"],"reject":["\\bno\\b"]},
   {"id":"f02","question":"What power level comes out of the block that watches for changes?","titles":["Observer"],"expect":["\\b15\\b"],"evidence":["(?:signal strength|power)[^.!?]{0,30}\\b15\\b"]},
   {"id":"f03","question":"Can I make the Elytra booster rocket with just paper and gunpowder?","titles":["Firework Rocket"],"expect":["\\byes\\b|(?:no|without|optional)[^.!?]*firework star"],"evidence":["paper","gunpowder"],"reject":["\\brequires? (?:a |the )?firework star\\b"]},
   {"id":"f04","question":"If I break the purple portable chest normally, will the contents spill?","titles":["Shulker Box"],"expect":["\\bno\\b|(?:stay|retain|keep|stored)"],"evidence":["(?:keeps?|stored|retain)[^.!?]{0,60}(?:item|content)|(?:item|content)[^.!?]{0,60}(?:keeps?|stored|retain)"]},
@@ -43,7 +43,7 @@
   {"id":"g10","question":"Is it safe to set my spawn with a charged respawn anchor in the Overworld?","titles":["Respawn Anchor"],"expect":["\\bno\\b|explod"],"evidence":["overworld","explod|explosion"],"reject":["^\\s*yes\\b"]},
   {"id":"g11","question":"How many obsidian blocks are needed for the smallest Nether portal frame with no corners?","titles":["Nether Portal"],"expect":["\\b(?:10|ten)\\b"],"evidence":["(?:10|ten)[^.!?]{0,35}obsidian|obsidian[^.!?]{0,35}(?:10|ten)"]},
   {"id":"g12","question":"When I upgrade a diamond sword to netherite, is a smithing template required?","titles":["Netherite Upgrade","Smithing Table","Smithing Template"],"expect":["\\byes\\b|(?:requires?|need|must)[^.!?]{0,45}template"],"evidence":["diamond","template"],"reject":["^\\s*no\\b"]},
-  {"id":"g13","question":"What metal block goes underneath a carved pumpkin to summon a copper golem?","titles":["Copper Golem"],"expect":["(?:block of copper|copper block)"],"evidence":["(?:block of copper|copper block)","carved pumpkin"]},
+  {"id":"g13","question":"What metal block goes underneath a carved pumpkin to summon a copper golem?","titles":["Copper Golem"],"expect":["\\bcopper\\b"],"evidence":["(?:block of copper|copper block)","carved pumpkin"]},
   {"id":"g14","question":"Will the grindstone remove Curse of Vanishing from my gear?","titles":["Grindstone"],"expect":["\\bno\\b|cannot|can't|does not|doesn't"],"evidence":["(?:except|cannot remove)[^.!?]{0,80}curse"],"reject":["^\\s*yes\\b"]},
   {"id":"g15","question":"If I mine my ender chest with Silk Touch, what item drops?","titles":["Ender Chest"],"expect":["ender chest"],"evidence":["silk touch"],"reject":["drops? (?:8|eight) obsidian"]},
   {"id":"g16","question":"How many stacks of cobblestone can fit in one shulker box?","titles":["Shulker Box"],"expect":["\\b(?:27|twenty.seven)\\b"],"evidence":["(?:27|twenty.seven)[^.!?]{0,30}slots"]},

@@ -19,6 +19,12 @@ _RECIPE = re.compile(r"(?:^|; )Crafting recipe: ([^;]+)")
 _CRAFTED = re.compile(r"^Name: ([^;]+); ")
 _INGREDIENT = re.compile(r"([1-9][0-9]{0,2}) × ([A-Za-z][A-Za-z0-9' -]{0,63})")
 _FIXED_COUNTS = " (fixed ingredient counts; other slots vary)"
+_POWERED_HOPPER_PUSH = re.compile(
+    r"can (?:a |the )?powered hopper (?:still )?push (?:its own )?items? "
+    r"(?:into|to) (?:a |the )?(?:chest|container)(?: it (?:points at|faces))?"
+)
+_HOPPER_LOCK = "when a hopper receives a redstone signal, all three of its functions stop: in this situation the hopper is locked/disabled."
+_HOPPER_PUSH_STOP = "while a locked hopper does not push or pull/collect items"
 
 _RECIPE_LIST = re.compile(
     rf"what (?:(?:ingredients|materials) (?:are (?:needed|required)|"
@@ -281,6 +287,18 @@ def _fuel_yield(item, passages):
 
 def exact_answer(question, passages):
     question = " ".join(question.casefold().split()).removesuffix("?")
+    if _POWERED_HOPPER_PUSH.fullmatch(question):
+        eligible = [(i, p) for i, p in enumerate(passages, 1)
+                    if p['title'] == 'Hopper' and p['section'] == 'Redstone signals'
+                    and p.get('anchor') == 'Redstone_signals' and not _EDITION_NOTE.search(p['text'])]
+        for _, lock in eligible:
+            if _HOPPER_LOCK not in lock['text'].casefold():
+                continue
+            for number, stop in eligible:
+                if (stop.get('revision') == lock.get('revision') and stop.get('revision') is not None
+                        and _HOPPER_PUSH_STOP in stop['text'].casefold()):
+                    return f"No. A powered hopper is locked and does not push items. [{number}]"
+        return None
     # "How many slots are in a hopper?" also matches the broad count form.
     match = _SLOTS.fullmatch(question)
     if match:

@@ -43,9 +43,10 @@ node /dev/ion /sys/class/misc/ion/dev
 [ "$#" -eq 0 ] || exit 0
 [ -r "$bundle/model.gguf" ] && [ -x "$backend/bin/llama-server" ] && [ -x "$bundle/n20-wiki" ] || exit 1
 [ -x "$android/linker64" ] && [ -r "$backend/cl-compat.so" ] || exit 1
-awk '/^MemAvailable:/ { ok = ($2 >= 2097152) } END { exit !ok }' /proc/meminfo
 install -d -m 755 "$run"
 install -d -o "$uid" -g "$uid" -m 2750 "$run/model"
+install -d -o minecraft -g minecraft -m 750 "$run/status"
+install -d -o minecraft -g minecraft -m 700 /var/lib/n20-wiki/history
 sock=$run/model/llama.sock
 rm -f "$sock"
 model=
@@ -133,6 +134,7 @@ run_model() {
 
 profile=stock
 texture_key=
+configure_profile() {
 if [ -e "$tuned_enabled" ] || [ -L "$tuned_enabled" ]; then
     if /usr/bin/python3 -IB "$worker_config" --check-tuned "$bundle" "$android" "$tuned_enabled"; then
         profile=tuned
@@ -151,8 +153,26 @@ if [ -e "$tuned_enabled" ] || [ -L "$tuned_enabled" ]; then
         echo "n20-wiki: starting $profile OpenCL worker" >&2
     fi
 fi
-run_model "$profile" launch "$texture_key" 9>&- &
-model=$!
+}
+
+# Model loading can consume more than 2 GiB on this device. Keep a wider
+# reserve before starting it and stop it if active gameplay uses that reserve.
+memory_at_least() {
+    awk -v limit="$1" '/^MemAvailable:/ { ok = ($2 >= limit) } END { exit !ok }' /proc/meminfo
+}
+temperature_ok() {
+    awk '{ ok = ($1 ~ /^[0-9]+$/ && $1 < 400) } END { exit !ok }' /sys/class/power_supply/battery/temp
+}
+swap_at_least() {
+    awk -v limit="$1" '/^SwapFree:/ { ok = ($2 >= limit) } END { exit !ok }' /proc/meminfo
+}
+model_start_memory_ok() {
+    memory_at_least 3670016 || { swap_at_least 2097152 && memory_at_least 262144; }
+}
+model_running_memory_ok() {
+    if swap_at_least 524288; then memory_at_least 131072; else memory_at_least 921600; fi
+}
+configured=0
 
 setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --groups "$uid" \
     nice -n 10 taskset -c 0-3 /usr/bin/python3 -B /usr/local/lib/n20/wiki_chat.py 9>&- &
@@ -160,7 +180,20 @@ bridge=$!
 
 while [ -f "$enabled" ]; do
     kill -0 "$bridge" || exit 1
-    if ! kill -0 "$model" 2>/dev/null; then
+    if [ -z "$model" ]; then
+        if model_start_memory_ok && temperature_ok; then
+            if [ "$configured" = 0 ]; then configure_profile; configured=1; fi
+            echo "n20-wiki: starting $profile worker with memory reserve" >&2
+            run_model "$profile" launch "$texture_key" 9>&- &
+            model=$!
+        fi
+    elif ! model_running_memory_ok || ! temperature_ok; then
+        echo "n20-wiki: stopping model to protect memory or temperature" >&2
+        kill "$model" 2>/dev/null || :
+        wait "$model" 2>/dev/null || :
+        model=
+        rm -f "$sock"
+    elif ! kill -0 "$model" 2>/dev/null; then
         wait "$model" || :
         case "$profile" in
             texture-gdn2)
@@ -172,13 +205,18 @@ while [ -f "$enabled" ]; do
                 ;;
             texture) next=tuned ;;
             tuned) next=stock ;;
-            *) exit 1 ;;
+            *)
+                echo "n20-wiki: stock worker stopped; waiting before retry" >&2
+                model=
+                rm -f "$sock"
+                sleep 10
+                continue
+                ;;
         esac
         echo "n20-wiki: $profile worker stopped, retrying with $next OpenCL kernels" >&2
         profile=$next
         rm -f "$sock"
-        run_model "$profile" launch "$texture_key" 9>&- &
-        model=$!
+        model=
     fi
-    sleep 3
+    sleep 1
 done

@@ -10,12 +10,15 @@ use std::time::{Duration, UNIX_EPOCH};
 
 const PASSAGE_BYTES: usize = 750;
 const CONTEXT_BYTES: usize = 1800;
-const INDEX_FILE: &str = "passages-v6.sqlite3";
+const INDEX_FILE: &str = "passages-v8.sqlite3";
 
 static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-zA-Z]+|\d+(?:\.\d+)?").unwrap());
 static SENTENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[.!?]["”]?\s+"#).unwrap());
 static QUESTION_COUNT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(how (many|much|long|strong|far)|at most|maximum|minimum|total)\b").unwrap()
+    Regex::new(
+        r"(?i)\b(how (many|much|long|strong|far)|at most|maximum|minimum|highest|lowest|total)\b",
+    )
+    .unwrap()
 });
 const STOP: &str = "a an and are as at be been being by can could did do does for from give get got had has have how i if in into is it its just me much my of on one or our per put so than that the their them then there these they this to too up use using was were what when where which who why will with would you your";
 
@@ -36,6 +39,9 @@ fn words(text: &str) -> Vec<String> {
         .map(|word| {
             let stem = match word.as_str() {
                 "xp" | "exp" => "experience",
+                "powered" => "power",
+                "highest" => "maximum",
+                "lowest" => "minimum",
                 "regeneration" | "regenerates" | "regenerate" | "recover" | "heals" | "healed"
                 | "healing" => "heal",
                 "renamed" | "rename" | "naming" | "named" => "name",
@@ -92,7 +98,7 @@ fn contains_phrase(query: &[String], phrase: &[String]) -> bool {
 
 fn query_expansions(question: &str) -> Vec<String> {
     let question = question.to_ascii_lowercase();
-    [
+    let mut expanded: Vec<String> = [
         ("power level", "signal strength"),
         ("comes out", "output"),
         ("come out", "output"),
@@ -101,7 +107,14 @@ fn query_expansions(question: &str) -> Vec<String> {
     .iter()
     .filter(|(phrase, _)| question.contains(phrase))
     .flat_map(|(_, expansion)| words(expansion))
-    .collect()
+    .collect();
+    if raw_words(&question)
+        .iter()
+        .any(|word| matches!(word.as_str(), "powered" | "powering"))
+    {
+        expanded.extend(words("redstone signal"));
+    }
+    expanded
 }
 
 #[derive(Serialize)]
@@ -657,12 +670,28 @@ fn term_weight(term: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::snippets;
+    use super::{QUESTION_COUNT, query_expansions, snippets, words};
 
     #[test]
     fn dependent_exception_keeps_the_rule_it_refers_to() {
         let text = "The block drops itself when mined using the Example enchantment. \
                     If broken without the enchantment, it drops nothing.";
         assert_eq!(snippets(text), vec![text]);
+    }
+
+    #[test]
+    fn superlatives_match_limit_terms_and_trigger_numeric_ranking() {
+        assert_eq!(words("highest cost"), words("maximum cost"));
+        assert_eq!(words("lowest cost"), words("minimum cost"));
+        assert!(QUESTION_COUNT.is_match("What is the highest level cost?"));
+        assert!(QUESTION_COUNT.is_match("What is the lowest level cost?"));
+    }
+
+    #[test]
+    fn powered_expands_to_redstone_signal_without_matching_unpowered() {
+        assert_eq!(words("powered hopper"), words("power hopper"));
+        assert!(query_expansions("powered hopper").contains(&"redstone".to_owned()));
+        assert!(query_expansions("powering a hopper").contains(&"redstone".to_owned()));
+        assert!(query_expansions("unpowered hopper").is_empty());
     }
 }

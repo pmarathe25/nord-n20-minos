@@ -1,0 +1,10 @@
+[
+  {"id":"hp01","question":"Can a hopper with a redstone signal push items into a chest?","titles":["Hopper"],"expect":["\\bno\\b|cannot|can't|does not|doesn't|stops?|locked"],"evidence":["redstone signal","stop|locked"],"reject":["^yes\\b"]},
+  {"id":"hp02","question":"Does powering a hopper prevent it from pulling items?","titles":["Hopper"],"expect":["\\byes\\b|cannot|can't|does not|doesn't|stop|locked"],"evidence":["redstone signal","stop|locked"],"reject":["^no\\b"]},
+  {"id":"hp03","question":"Does a powered hopper continue to collect dropped items?","titles":["Hopper"],"expect":["\\bno\\b|cannot|can't|does not|doesn't|stops?|locked"],"evidence":["redstone signal","stop|locked"],"reject":["^yes\\b"]},
+  {"id":"hp04","question":"Can a powered hopper receive items from another hopper?","titles":["Hopper"],"expect":["\\byes\\b|(?:can|may|still) receive"],"evidence":["locked hopper","receive items"],"reject":["^no\\b"]},
+  {"id":"hp05","question":"Can another hopper pull items out of a locked hopper?","titles":["Hopper"],"expect":["\\byes\\b|(?:can|may|still)[^.!?]*pull"],"evidence":["locked hopper","pulled out"],"reject":["^no\\b"]},
+  {"id":"hp06","question":"What happens to a hopper's activity when it loses its redstone power?","titles":["Hopper"],"expect":["resum|unlock|enable|again"],"evidence":["loses power","resumes"],"reject":["remains locked"]},
+  {"id":"hp07","question":"Does a hopper produce a redstone signal by itself?","titles":["Hopper"],"expect":["\\bno\\b|does not|doesn't|cannot|can't"],"evidence":["does not output any redstone signals"],"reject":["^yes\\b"]},
+  {"id":"hp08","question":"Can a comparator read how full a hopper is?","titles":["Hopper"],"expect":["\\byes\\b|(?:can|may)[^.!?]*read|fullness[^.!?]*read"],"evidence":["fullness","comparator"],"reject":["^no\\b"]}
+]

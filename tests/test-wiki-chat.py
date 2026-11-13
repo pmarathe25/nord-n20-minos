@@ -1,6 +1,6 @@
 """Exercise the chat boundary with temporary files and a private FIFO."""
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 import io
 import json
@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/usr/local/lib/n20"))
 from wiki_answer import UNKNOWN, grounded_reply
-from wiki_chat import CHAT, LogTail, answer_question, generate, read_completion, render, reply
+from wiki_chat import CHAT, LogTail, RequestProgress, accept_chat, answer_question, generate, load_history, read_completion, render, reply, restore_handoff, save_history, start_queued, write_dashboard_status
 from wiki_fast import exact_answer
 
 
@@ -66,6 +66,252 @@ def model_socket(handler, media_type=b"text/event-stream"):
 
 
 class WikiChatTests(unittest.TestCase):
+    def test_chat_acknowledges_and_processes_requests_in_order(self):
+        from concurrent.futures import Future
+
+        line = "[01:37:23] [Server thread/INFO]: <Alex> @wiki How does a hopper work?"
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "console"
+            os.mkfifo(fifo, 0o600)
+            fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+            args = SimpleNamespace(console=fifo, pid_file=Path(tmp) / "pid")
+            submitted = []
+            requests = deque()
+
+            class Worker:
+                def submit(self, function, *arguments):
+                    submitted.append((function, arguments))
+                    return Future()
+
+            worker = Worker()
+            try:
+                with patch("wiki_chat.server_identity", return_value=(42, "start")), \
+                     patch("wiki_chat.time.monotonic", return_value=100):
+                    accept_chat(line, args, requests, None, 0)
+                    ack = os.read(fd, 4096)
+                    self.assertTrue(ack.startswith(b"tellraw @a "))
+                    self.assertEqual(json.loads(ack[len(b"tellraw @a "):]),
+                                     [{"text": "[Wiki] Looking that up..."}])
+                    second = line.replace("<Alex>", "<Steve>").replace("hopper", "furnace")
+                    accept_chat(second, args, requests, None, 0)
+                    ack = os.read(fd, 4096)
+                    self.assertTrue(ack.startswith(b"tellraw @a "))
+                    self.assertEqual(json.loads(ack[len(b"tellraw @a "):]),
+                                     [{"text": "[Wiki] Your question is queued; I'll look it up soon."}])
+                    self.assertEqual(len(submitted), 0)
+                    future, player, server, next_request, question = start_queued(
+                        args, requests, worker, {}, None, 0, lambda _: None)
+                    self.assertEqual((player, server, next_request), ("Alex", (42, "start"), 130))
+                    self.assertEqual(question, "How does a hopper work?")
+                    self.assertEqual(len(submitted), 1)
+                    self.assertIsNone(start_queued(args, requests, worker, {}, future, 0, lambda _: None))
+                    self.assertIsNone(start_queued(args, requests, worker, {}, None, 130, lambda _: None))
+                    self.assertIsNone(start_queued(args, requests, worker, {}, None, 0, lambda _: None, False))
+                    accept_chat(line.replace("@wiki", "@wikipedia"), args, requests, None, 0)
+                    self.assertEqual(len(submitted), 1)
+                    self.assertEqual(len(requests), 1)
+                with patch("wiki_chat.server_identity", return_value=(42, "start")), \
+                     patch("wiki_chat.time.monotonic", return_value=130):
+                    _, player, _, _, _ = start_queued(args, requests, worker, {}, None, 130, lambda _: None)
+                    self.assertEqual(player, "Steve")
+                    self.assertEqual(submitted[1][1][1], "How does a furnace work?")
+                requests.append(((42, "old"), "Alex", "stale question"))
+                with patch("wiki_chat.server_identity", return_value=(43, "new")), \
+                     patch("wiki_chat.time.monotonic", return_value=200):
+                    self.assertIsNone(start_queued(args, requests, worker, {}, None, 0, lambda _: None))
+                    self.assertFalse(requests)
+                with patch("wiki_chat.server_identity", return_value=(42, "start")), \
+                     patch("wiki_chat.time.monotonic", return_value=300):
+                    accept_chat(line, args, requests, None, 0, False)
+                    self.assertIn(b"question is queued", os.read(fd, 4096))
+                    self.assertIsNone(start_queued(args, requests, worker, {}, None, 0, lambda _: None, False))
+                    self.assertEqual(len(requests), 1)
+                    self.assertIsNotNone(start_queued(args, requests, worker, {}, None, 0, lambda _: None, True))
+            finally:
+                os.close(fd)
+
+    def test_dashboard_status_is_atomic_bounded_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status"
+            requests = deque([((1, "start"), "Alex", "First\tquestion\nnext") for _ in range(130)])
+            write_dashboard_status(path, "ready", ("Steve", "Active question"), requests)
+            lines = path.read_text().splitlines()
+            self.assertIn("model\tready", lines)
+            self.assertIn("count\t130", lines)
+            self.assertIn("active\tSteve\tActive question", lines)
+            self.assertEqual(sum(line.startswith("queue\t") for line in lines), 128)
+            self.assertIn("queue\tAlex\tFirst question next", lines)
+            self.assertEqual(len(requests), 130)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["status"])
+
+    def test_progress_reports_real_stages_and_streamed_characters(self):
+        progress = RequestProgress()
+        progress.report("retrieving", 0)
+        progress.report("prefill", 0)
+        progress.report("generating", 3)
+        progress.report("generating", 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status"
+            write_dashboard_status(path, "ready", ("Alex", "Question?"), deque(), progress=progress)
+            lines = path.read_text().splitlines()
+            self.assertIn("phase\tgenerating", lines)
+            self.assertIn("characters\t7", lines)
+            self.assertTrue(any(line.startswith("elapsed\t") for line in lines))
+
+    def test_recent_history_is_private_bounded_and_visible_in_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "requests.json"
+            history = [{"player": "Alex", "question": f"Question {i}?", "answer": f"[Wiki] Reply {i}."}
+                       for i in range(55)]
+            save_history(path, history)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            saved = load_history(path)
+            self.assertEqual(len(saved), 50)
+            self.assertEqual(saved[0]["question"], "Question 5?")
+            status = Path(tmp) / "status"
+            write_dashboard_status(status, "ready", None, deque(), history=saved)
+            lines = status.read_text().splitlines()
+            shown = [line for line in lines if line.startswith("history\t")]
+            self.assertEqual(len(shown), 50)
+            self.assertEqual(shown[0], "history\tAlex\tQuestion 54?\t[Wiki] Reply 54.")
+
+    def test_stream_progress_counts_content_not_protocol_events(self):
+        stream = io.BytesIO(event("abc") + event("de") + event(finish="stop") + b"data: [DONE]\n\n")
+        counts = []
+        text, finish = read_completion(stream, lambda: None, counts.append)
+        self.assertEqual((text, finish, counts), ("abcde", "stop", [3, 2]))
+
+    def test_resource_guard_uses_swap_only_when_available(self):
+        import wiki_chat
+        original = Path.read_text
+
+        def fixture(path, *args, **kwargs):
+            if str(path) == "/proc/meminfo":
+                return "MemAvailable: 200000 kB\nSwapFree: 1000000 kB\n"
+            if str(path) == "/sys/class/power_supply/battery/temp":
+                return "280\n"
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", fixture):
+            self.assertTrue(wiki_chat.resources_available())
+            self.assertFalse(wiki_chat.resources_available(3670016))
+        def no_swap(path, *args, **kwargs):
+            value = fixture(path, *args, **kwargs)
+            return value.replace("SwapFree: 1000000 kB", "SwapFree: 0 kB")
+        with patch.object(Path, "read_text", no_swap):
+            self.assertFalse(wiki_chat.resources_available())
+
+    def test_handoff_restores_queue_and_log_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "handoff.json"
+            path.write_text(json.dumps({"version": 1, "queue": [[[42, "start"], "Alex", "A question?"]],
+                                        "log": {"dev": 1, "ino": 2, "offset": 17}}))
+            requests, resume = restore_handoff(path)
+            self.assertEqual(list(requests), [((42, "start"), "Alex", "A question?")])
+            self.assertEqual(resume, ((1, 2), 17))
+            self.assertFalse(path.exists())
+            self.assertEqual(restore_handoff(path), (deque(), None))
+            target = Path(tmp) / "target"
+            target.write_text("private")
+            path.symlink_to(target)
+            with self.assertRaises(OSError):
+                restore_handoff(path)
+            self.assertEqual(target.read_text(), "private")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires a Unix FIFO and fork")
+    def test_bridge_queues_overlapping_chat_and_delivers_both_answers(self):
+        import multiprocessing
+        import select
+        import wiki_chat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "server.log"
+            log.write_text("")
+            fifo = root / "console"
+            os.mkfifo(fifo, 0o600)
+            fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+            args = SimpleNamespace(log=log, console=fifo, pid_file=root / "pid", socket=root / "model.sock",
+                                   status_file=root / "status", history_file=root / "history.json")
+            context = multiprocessing.get_context("fork")
+            ready = root / "ready"
+            release = root / "release"
+            original_tail = wiki_chat.LogTail
+
+            class SignallingTail(original_tail):
+                def read(self):
+                    lines = super().read()
+                    ready.touch()
+                    return lines
+
+            def fake_answer(_args, question, _cache, _report=None):
+                if _report:
+                    _report("retrieving", 0)
+                deadline = time.monotonic() + 3
+                while not release.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return [{"text": "[Wiki] Answer: " + question}]
+
+            def bridge():
+                with patch("wiki_chat.LogTail", SignallingTail), \
+                     patch("wiki_chat.server_identity", return_value=(42, "start")), \
+                     patch("wiki_chat.answer_question", fake_answer), \
+                     patch("wiki_chat.model_health", return_value="ready"), \
+                     patch("wiki_chat.resources_available", return_value=True), \
+                     patch("wiki_chat.REQUEST_INTERVAL_SECONDS", 0.05):
+                    wiki_chat.run(args)
+
+            process = context.Process(target=bridge)
+            process.start()
+            try:
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                with log.open("a") as stream:
+                    stream.write("[01:37:23] [Server thread/INFO]: <Alex> @wiki First?\n")
+                    stream.write("[01:37:24] [Server thread/INFO]: <Steve> @wiki Second?\n")
+                buffer = b""
+                messages = []
+
+                def receive(count):
+                    nonlocal buffer
+                    deadline = time.monotonic() + 4
+                    while len(messages) < count and time.monotonic() < deadline:
+                        if select.select([fd], [], [], 0.1)[0]:
+                            buffer += os.read(fd, 4096)
+                            lines = buffer.split(b"\n")
+                            buffer = lines.pop()
+                            messages.extend(lines)
+                    self.assertGreaterEqual(len(messages), count)
+
+                receive(2)
+                self.assertIn(b"Looking that up", messages[0])
+                self.assertIn(b"question is queued", messages[1])
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if args.status_file.exists() and "phase\tretrieving" in args.status_file.read_text():
+                        break
+                    time.sleep(0.02)
+                self.assertIn("phase\tretrieving", args.status_file.read_text())
+                release.touch()
+                receive(4)
+                self.assertTrue(messages[2].startswith(b"tellraw @a "))
+                self.assertIn(b"Answer: First?", messages[2])
+                self.assertTrue(messages[3].startswith(b"tellraw @a "))
+                self.assertIn(b"Answer: Second?", messages[3])
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if args.history_file.exists() and len(load_history(args.history_file)) == 2:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual([item["question"] for item in load_history(args.history_file)], ["First?", "Second?"])
+            finally:
+                release.touch()
+                process.terminate()
+                process.join(5)
+                os.close(fd)
+
     def test_complete_stream_can_finish_after_the_initial_deadline(self):
         def serve(client, stop):
             client.sendall(event("Support: [1] Relevant fact."))
@@ -164,6 +410,21 @@ class WikiChatTests(unittest.TestCase):
         self.assertEqual(exact_answer("What strength is an observer output?", [conditional]),
                          conditional["text"] + " [1]")
         self.assertIsNone(exact_answer("What is the strength of the observer at my base?", [conditional]))
+
+    def test_powered_hopper_push_requires_both_matching_section_passages(self):
+        lock = {"title": "Hopper", "section": "Redstone signals", "anchor": "Redstone_signals",
+                "revision": 42, "text": "When a hopper receives a redstone signal, all three of its functions stop: in this situation the hopper is locked/disabled."}
+        stopped = dict(lock, text="While a locked hopper does not push or pull/collect items, it may still receive items from droppers.")
+        question = "Can a powered hopper still push its own items into the chest it points at?"
+        self.assertEqual(exact_answer(question, [lock, stopped]),
+                         "No. A powered hopper is locked and does not push items. [2]")
+        self.assertIsNone(exact_answer(question, [lock]))
+        self.assertIsNone(exact_answer(question, [stopped]))
+        self.assertIsNone(exact_answer(question, [lock, dict(stopped, revision=43)]))
+        self.assertIsNone(exact_answer(question, [lock, dict(stopped, anchor='Other')]))
+        self.assertIsNone(exact_answer(question, [lock, dict(stopped, text=stopped['text'] + ' Bedrock')]))
+        self.assertIsNone(exact_answer("Can a powered hopper receive items from another hopper?", [lock, stopped]))
+        self.assertIsNone(exact_answer("Can a powered hopper at my base push items into a chest?", [lock, stopped]))
 
     def test_signal_question_accepts_redstone_wording_without_losing_conditions(self):
         passage = {
@@ -312,11 +573,12 @@ class WikiChatTests(unittest.TestCase):
     def test_chat_prefix_and_sender(self):
         prefix = "[01:37:23] [Server thread/INFO]: "
         for trust in ("", "[Not Secure] "):
-            match = CHAT.fullmatch(prefix + trust + "<Alex> @wiki Is this a hopper?")
-            self.assertEqual(match.groups(), ("Alex", "Is this a hopper?"))
+            for command in ("@wiki", "Hey @wiki"):
+                match = CHAT.fullmatch(prefix + trust + "<Alex> " + command + " Is this a hopper?")
+                self.assertEqual(match.groups(), ("Alex", "Is this a hopper?"))
         for message in (
             "System chat: <Alex> @wiki Fake",
-            "<Alex> hi @wiki Fake",
+            "<Alex> wiki Fake",
             "<Alex> @wikipedia Fake",
             "<@a> @wiki Fake",
         ):
@@ -363,6 +625,10 @@ class WikiChatTests(unittest.TestCase):
                 self.assertEqual(command.count(b"\n"), 1)
                 self.assertTrue(command.startswith(b"tellraw Alex "))
                 self.assertEqual(json.loads(command[len(b"tellraw Alex "):]), components)
+                reply(fifo, "Alex", components, broadcast=True)
+                command = os.read(fd, 4096)
+                self.assertTrue(command.startswith(b"tellraw @a "))
+                self.assertEqual(json.loads(command[len(b"tellraw @a "):]), components)
             finally:
                 os.close(fd)
 

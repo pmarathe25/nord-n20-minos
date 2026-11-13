@@ -1,9 +1,9 @@
 # Minecraft Wiki chat on the Nord N20
 
-The bridge has answered a real chat message on the phone using the Adreno
-GPU. The feature remains disabled on the live server because the gameplay
-trial saw longer tail ticks during inference. See the
-[end-to-end trial](../reports/2026-11-09-wiki-end-to-end.md) for the measurements.
+The bridge has answered real chat messages on the phone using the Adreno
+GPU. It is enabled on the live server and can use the configured disk swap,
+with an emergency memory and temperature guard. Gameplay trials saw longer tail ticks during
+inference; see the [end-to-end trial](../reports/2026-11-09-wiki-end-to-end.md).
 
 The phone can run the existing 4B model, but it is slow for interactive chat.
 A representative warmed GPU-only request took about 39 seconds, and a
@@ -17,33 +17,92 @@ measurements do not establish an order-of-magnitude speedup. See the
 The [configuration index](wiki-inference-status.md) links the tested profiles,
 benchmarks and their deployment status.
 
-The checkout is the development version, not an exact copy of the disabled
-installation. On 2026-11-10, the installed launcher and all four installed
-Python modules differed from the checkout files listed below. The tests and
-newer launcher behavior in this document describe the checkout unless a
-specific phone trial says otherwise. Do not enable the installed bridge on the
-assumption that those changes are already present; a future deployment needs
-to install and validate a matched bundle on the phone first.
+The installed launcher, Python modules and dashboard were updated together for
+the queue and status tab. The running bridge may temporarily use the preceding
+version of its module until restart so that queued questions are not lost.
+Experimental GPU–Hexagon kernels have not been installed as a production bundle.
 
-On vanilla Java 26.3, a message starting with `@wiki ` can ask the local
-assistant a question, such as `@wiki How many copper ingots make a lightning rod?`.
+On vanilla Java 26.3, `@wiki` anywhere in a player message can ask the local
+assistant a question, such as `Hey @wiki how many copper ingots make a lightning rod?`.
 The bridge follows new player-chat lines in the server log. A background worker
 retrieves parsed Java Edition excerpts. It answers recognized ingredient,
 fuel, storage capacity, and item property questions directly when the retrieved
 evidence supplies a unique answer. Ingredient counts require the full ingredient
-name and accept common plural forms. Other questions go to the local model.
-The bridge sends the answer and its Wiki section link privately to the player
-through the existing server console FIFO. The model can make factual mistakes
+name and accept common plural forms. A narrowly phrased question about a powered
+hopper pushing items is answered directly only when the relevant locked-hopper
+rules are present in the same Wiki section and revision. Other questions go to
+the local model.
+The bridge broadcasts its answer and Wiki section link to the public chat
+through the existing server console FIFO. Private messages are not supported.
+The model can make factual mistakes
 even when it cites a passage. The Wiki cannot see the server's world, inventory,
 or player activity.
 
-The bridge allows one request at a time, with at least 30 seconds between
-requests. On a cache miss, the retriever may send search terms to Minecraft
+The same bridge also recognizes these commands at the start of a chat message:
+
+- `@pin <note>` saves the player's current position, dimension, and note.
+- `@pin_that <note>` saves the block cell the player is looking toward.
+- `@map` lists the shared saved locations in public chat.
+- `@find <query>` finds a saved location; the bridge returns its saved
+  coordinates. Simple requests with a unique literal match in a note can be
+  answered directly. A simple request that matches multiple notes is declined;
+  other requests go to the local model, which can also decline an ambiguous match.
+- `@help` lists these commands and `@wiki`.
+
+Locations are shared by all players and stored in `world/n20-pins.json`, so
+world backups and restores include them. Marker and help replies are broadcast
+to public chat. Pin and map operations are queued in arrival order; a queued
+pin captures the player's position when its turn is processed, so remain at the
+location until the save confirmation. The limit is 40 pins with notes of up
+to 160 characters, with a smaller shared size limit so the complete list fits
+the model's context. The pin records the player's position when the server
+processes the request, not the block they are looking at. If the position or
+dimension cannot be read, no pin is saved. `@find` uses the Wiki model queue
+and resource limits when it needs the model; matching can select the wrong note.
+Its prompt uses normal worker prompt caching, not a precomputed offline KV
+cache. The bridge and model must be enabled for these commands to work.
+
+`@pin_that` samples the view ray every quarter block, up to 16 blocks, and
+saves the first non-air block cell. This is an approximation: it treats a
+block's whole cell as occupied, including glass, water, plants, and partial
+blocks such as slabs; it can also miss a cell crossed only briefly near an
+edge. It does not target entities. Unloaded or out-of-range blocks may not be
+found. If the player moves, turns, changes dimension, or the ray misses, no
+pin is saved. Keep looking at the target until the public confirmation; use
+`@pin` to save the player's own position instead. Each ray briefly creates an
+effect-free area cloud as a result marker and removes it; if interrupted, the
+cloud expires automatically after five seconds while loaded.
+
+The bridge immediately acknowledges a valid question in public chat. It queues
+additional questions in arrival order, tells their senders they are queued,
+and processes one at a time, with at least 30 seconds between request starts.
+The queue is held in memory and is discarded if the bridge or server restarts.
+If the model is unavailable or resources are low, questions remain queued
+until it is ready and the resource guard permits processing. The Wiki tab on
+the phone shows model health, resource limits, the active question, its current
+stage and elapsed time, and the first 128 queued questions; additional questions
+stay in the queue. During streaming it also shows received character count;
+it does not claim a completion percentage when none is available.
+The Wiki History screen shows up to 50 completed public questions and replies,
+newest first, with paged summaries and a View button for the complete response.
+New history is retained across bridge restarts in a mode-600 file
+under the Minecraft-owned `/var/lib/n20-wiki/history` directory; previous
+conversations were not retroactively imported. The phone's Server → Log view
+has Newer and Older controls and displays the current and total page numbers.
+The total may briefly show an ellipsis while a large log is counted.
+On a cache miss, the retriever may send search terms to Minecraft
 Wiki and cache the parsed articles. An offline invocation of the bridge
 searches cached pages only. The bridge caches up to 64 sourced replies in
 memory. Reusing a reply requires the same question and the same retrieved
 evidence, including the page revisions. The bridge pauses lookups at 40 °C
-battery temperature or above, or below 900 MiB of available system memory.
+battery temperature or above. Without at least 512 MiB of free swap, the
+bridge requires 900 MiB of available RAM; with swap available it requires
+128 MiB. The launcher normally waits for 3.5 GiB of available RAM, but permits
+startup with at least 256 MiB of available RAM and 2 GiB of free swap. It
+stops the worker if RAM falls below 128 MiB while at least 512 MiB of swap is
+free, or below 900 MiB otherwise, or if the battery reaches 40 °C. The bridge
+remains available to acknowledge and queue questions while the worker is off.
+Swap can cause substantial storage traffic and gameplay stalls.
 
 ## GPU worker setup
 

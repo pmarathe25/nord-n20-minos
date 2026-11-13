@@ -89,6 +89,35 @@ Review the answers alongside the pattern-based scores.
 Use `--cases wiki/benchmark-fresh.json` for the follow-up question set.
 Use `--cases wiki/benchmark-recipes.json` to check recipe counts.
 Use `--cases wiki/benchmark-recent-chat.json` for recent armor-trim and dye questions.
+
+For an offline retrieval and production exact-answer check without a model,
+copy the parsed cache to a disposable directory and run:
+
+```sh
+python3 wiki/evaluate-retrieval.py --wiki wiki/target/release/n20-wiki \
+  --cache /tmp/wiki-eval-cache --cases wiki/benchmark-cases.json \
+  wiki/benchmark-fresh.json wiki/benchmark-recipes.json wiki/benchmark-recent-chat.json \
+  --output /tmp/wiki-retrieval-results.jsonl
+```
+
+The title and evidence checks use case-sensitive title labels and regex evidence
+labels; they are screening signals, not a factual assessment. Review passages
+and exact answers individually. Cache contents and parser revisions affect the
+result. `benchmark.py` exercises model answers; add `--bridge-exact` to take
+the bridge's exact-answer shortcut before consulting the model.
+
+For `@find`, start the same model with a local HTTP llama-server and run
+`python3 wiki/benchmark-find.py --output /tmp/find-results.jsonl`. Its 116
+synthetic queries use the bridge's actual request body, invented pins, rotated
+positions, and labeled no-match cases. The script reports match and no-match
+accuracy separately. Its repeated templates are correlated, and this suite
+does not measure private player notes or ambiguous queries. It measures the
+model alone by default. Add `--bridge` to exercise the literal-match shortcut,
+and `--suite challenge` to use 30 natural, ambiguous and misleading-note cases.
+Inspect individual outputs and finish reasons. The small focused hopper set is
+available to the Wiki benchmark as `--cases wiki/benchmark-powered.json`.
+Both model benchmarks send all fixture text to the
+specified local worker and can take substantial time on the phone.
 Use `--answer-style chat` to exercise the phone bridge's grounded prompt,
 prefix reuse, stop rule, and source validation. Its JSONL includes per-request
 model timings when llama-server reports them. The desktop benchmark calls

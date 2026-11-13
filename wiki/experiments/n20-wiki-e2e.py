@@ -14,6 +14,18 @@ import time
 from urllib.parse import unquote, urlsplit
 
 
+def parse_console_line(line):
+    prefix = b'tellraw @a '
+    if not line.startswith(prefix):
+        raise ValueError('Wiki reply was not broadcast')
+    components = json.loads(line[len(prefix):])
+    if not isinstance(components, list) or not components or not isinstance(components[0], dict):
+        raise ValueError('Invalid Wiki console reply')
+    text = components[0].get('text', '')
+    ack = text in ('[Wiki] Looking that up...', "[Wiki] Your question is queued; I'll look it up soon.")
+    return ack, components
+
+
 def ask(args, question):
     with tempfile.TemporaryDirectory(prefix="n20-wiki-e2e-") as directory:
         directory = Path(directory)
@@ -29,6 +41,8 @@ def ask(args, question):
                 sys.executable, "-B", str(args.bridge), "--offline",
                 "--wiki", str(args.wiki), "--cache", str(args.cache), "--socket", str(args.socket),
                 "--log", str(log), "--pid-file", str(pid), "--console", str(console),
+                "--status-file", str(directory / "status"), "--history-file", str(directory / "history"),
+                "--pins-file", str(directory / "pins"),
             ]
             with subprocess.Popen(command, stdout=subprocess.DEVNULL) as worker:
                 try:
@@ -39,14 +53,23 @@ def ask(args, question):
                     start = time.monotonic()
                     with log.open("a", encoding="utf-8") as stream:
                         stream.write(f"[00:00:00] [Server thread/INFO]: <WikiBench> @wiki {question}\n")
-                    if not select.select([fd], [], [], 130)[0]:
-                        raise TimeoutError("Wiki bridge did not write a reply")
-                    data = os.read(fd, 4096)
-                    elapsed = time.monotonic() - start
-                    prefix = b"tellraw WikiBench "
-                    if not data.startswith(prefix) or data.count(b"\n") != 1:
-                        raise ValueError("Invalid Wiki console reply")
-                    return elapsed, json.loads(data[len(prefix):])
+                    deadline = start + args.timeout
+                    data = b''
+                    ack_seconds = None
+                    while time.monotonic() < deadline:
+                        if not select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
+                            break
+                        data += os.read(fd, 8192)
+                        while b'\n' in data:
+                            line, data = data.split(b'\n', 1)
+                            ack, reply = parse_console_line(line)
+                            if ack:
+                                ack_seconds = time.monotonic() - start
+                            else:
+                                if ack_seconds is None:
+                                    raise ValueError('Wiki answer arrived without an acknowledgment')
+                                return time.monotonic() - start, ack_seconds, reply
+                    raise TimeoutError("Wiki bridge did not write a final reply")
                 finally:
                     if worker.poll() is None:
                         worker.terminate()
@@ -66,12 +89,13 @@ def main():
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--ids", nargs="+", required=True)
+    parser.add_argument("--timeout", type=int, default=180)
     args = parser.parse_args()
     cases = {case["id"]: case for case in json.loads(args.cases.read_text(encoding="utf-8"))}
     elapsed = []
     for case_id in args.ids:
         case = cases[case_id]
-        seconds, reply = ask(args, case["question"])
+        seconds, ack_seconds, reply = ask(args, case["question"])
         elapsed.append(seconds)
         text = reply[0]["text"].removeprefix("[Wiki] ")
         if "expect" in case:
@@ -85,7 +109,7 @@ def main():
             )
         else:
             correct = text == "I couldn't verify that from the wiki excerpts."
-        print(json.dumps({"id": case_id, "seconds": round(seconds, 3), "correct": correct,
+        print(json.dumps({"id": case_id, "seconds": round(seconds, 3), "ack_seconds": round(ack_seconds, 3), "correct": correct,
                           "reply": reply}, ensure_ascii=False), flush=True)
     print(json.dumps({"median_seconds": round(statistics.median(elapsed), 3)}), flush=True)
 

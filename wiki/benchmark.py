@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/usr/local/lib/n20"))
 from wiki_answer import GROUNDED, UNKNOWN, chat_request_body, grounded_reply, request_body
 from wiki_chat import render
+from wiki_fast import exact_answer
 
 SYSTEM = (
     "You answer player questions about Minecraft Java Edition. Give a short direct answer using "
@@ -27,7 +28,9 @@ SYSTEM = (
 )
 
 
-def generate(url, question, passages, style="direct"):
+def generate(url, question, passages, style="direct", max_tokens=None, enable_thinking=False,
+             explicit_citations=False, temperature=None, seed=None, private_state_guard=False,
+             compact_grounded=False, stop_newline=False, condition_cues=False):
     if not passages:
         return UNKNOWN, 0, "stop", {}
     if style == "chat":
@@ -36,12 +39,47 @@ def generate(url, question, passages, style="direct"):
         body = request_body(GROUNDED, question, passages, 140)
     else:
         body = request_body(SYSTEM, question, passages, 96)
+    if compact_grounded:
+        body['messages'][0]['content'] = (
+            'Answer the Minecraft Java Edition question using only the numbered wiki excerpts. '
+            'Give exactly one line: Answer: <short answer> [source number]. '
+            'Cite an excerpt that directly supports the answer. Do not infer a particular '
+            'player or server state from game defaults. If the answer is absent or asks '
+            f'about private world state, give exactly: Answer: {UNKNOWN}'
+        )
+    if condition_cues:
+        body['messages'][0]['content'] += (
+            ' Check the exact condition in the question. Pay close attention to not, without, '
+            'only, and unless. Use the specific rule when a general statement is incomplete. '
+            'Give only the answer and its citation, with no explanation of missing information.'
+        )
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    if temperature is not None:
+        body["temperature"] = temperature
+    if seed is not None:
+        body["seed"] = seed
+    if stop_newline:
+        body['stop'] = ['\n']
+    if enable_thinking:
+        body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
+    if explicit_citations:
+        body['messages'][0]['content'] += (
+            ' Put the passage number in square brackets after Support:. '
+            'Start Answer: on a separate line and include the passage number in square brackets.'
+        )
+    if private_state_guard:
+        body['messages'][0]['content'] += (
+            ' Wiki rules and default behavior cannot establish the current or past state of a particular '
+            'player, item, build, or server. Never infer that state from a default or generic rule. '
+            f'For such a question reply exactly: Answer: {UNKNOWN}'
+        )
     request = Request(
         url,
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urlopen(request, timeout=60) as response:
+    with urlopen(request, timeout=300) as response:
         result = json.load(response)
     choice = result["choices"][0]
     return (
@@ -82,12 +120,18 @@ def run(args):
                 raise RuntimeError(found["error"])
             passages = found["passages"]
             start = time.perf_counter()
-            raw, tokens, finish, timings = generate(
-                args.model_url, case["question"], passages, args.answer_style,
-            )
+            direct = exact_answer(case["question"], passages) if args.bridge_exact else None
+            if direct is None:
+                raw, tokens, finish, timings = generate(
+                    args.model_url, case["question"], passages, args.answer_style,
+                    args.max_tokens, args.enable_thinking, args.explicit_citations, args.temperature, args.seed,
+                    args.private_state_guard, args.compact_grounded, args.stop_newline, args.condition_cues,
+                )
+            else:
+                raw, tokens, finish, timings = direct, 0, 'stop', {}
             generation_ms = (time.perf_counter() - start) * 1000
             raw = raw or ""
-            answer = player_reply(raw, args.answer_style, passages)
+            answer = direct if direct is not None else player_reply(raw, args.answer_style, passages)
             abstain = "expect" not in case
             reply = re.sub(r"\[\d+\]|\*\*", "", answer).strip()
             if abstain:
@@ -103,6 +147,8 @@ def run(args):
             row = {
                 **case, **found, "answer": answer, "tokens": tokens,
                 "retrieval_ms": round(retrieval_ms, 2), "generation_ms": round(generation_ms, 2),
+                "finish_reason": finish,
+                "exact_route": direct is not None,
                 "correct": correct and finish != "length",
                 "abstain": abstain,
                 "title_hit": bool(titles.intersection(case.get("titles", []))),
@@ -143,6 +189,16 @@ def main():
     parser.add_argument("--model-url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--online", action="store_true", help="Allow Wiki API calls for cache misses")
     parser.add_argument("--answer-style", choices=["direct", "grounded", "chat"], default="direct")
+    parser.add_argument("--bridge-exact", action="store_true", help="Use the bridge's exact-answer route before calling the model")
+    parser.add_argument("--max-tokens", type=int, help="Override the output token budget for model experiments")
+    parser.add_argument("--enable-thinking", action="store_true", help="Enable the model's native reasoning template")
+    parser.add_argument("--explicit-citations", action="store_true", help="Clarify the required citation format")
+    parser.add_argument("--temperature", type=float, help="Override the sampling temperature")
+    parser.add_argument("--seed", type=int, help="Set the sampling seed")
+    parser.add_argument("--private-state-guard", action="store_true", help="Strengthen instructions for private server state")
+    parser.add_argument("--compact-grounded", action="store_true", help="Test a compact one-line grounded prompt")
+    parser.add_argument("--stop-newline", action="store_true", help="Stop generation after the first line")
+    parser.add_argument("--condition-cues", action="store_true", help="Test reminders about conditions and negation")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     target = urlsplit(args.model_url)
