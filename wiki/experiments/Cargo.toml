@@ -1,9 +1,0 @@
-[package]
-name = "n20-vulkan-probe"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-
-[dependencies]
-ash = "0.38"
-half = "2.7"

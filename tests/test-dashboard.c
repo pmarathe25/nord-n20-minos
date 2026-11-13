@@ -191,11 +191,11 @@ static void check_redesign(void){
     helper_pid=0;queued_command[0]=queued_arg[0]=0;message_until=0;
     for(int i=0;i<128;i++)snprintf(state.allow[i],sizeof(state.allow[i]),"Player_%09d",i);
     for(int i=0;i<64;i++){snprintf(state.player[i],sizeof(state.player[i]),"Player_%09d",i);snprintf(state.backup_id[i],sizeof(state.backup_id[i]),"%064x",i+1);strcpy(state.backup[i],"2026-11-09 10:30:00");}
-    const int pages[]={HOME,PLAYERS,LOGS,BACKUPS,DEVICE_SETTINGS};
+    const int pages[]={HOME,PLAYERS,LOGS,BACKUPS,DEVICE_SETTINGS,WIKI,WIKI_HISTORY,WIKI_DETAIL};
     for(size_t p=0;p<sizeof(pages)/sizeof(pages[0]);p++){
         page=pages[p];list_mode=1;list_offset=0;draw();check_layout();
         find_action(A_PAGE,HOME);find_action(A_PAGE,BACKUPS);find_action(A_PAGE,DEVICE_SETTINGS);
-        assert(page_section(page)==(page==LOGS?HOME:page));
+        assert(page_section(page)==(page==LOGS?HOME:(page==WIKI_HISTORY||page==WIKI_DETAIL)?WIKI:page));
         if(page==DEVICE_SETTINGS)assert(page_section(page)==DEVICE_SETTINGS);
     }
     page=HOME;draw();Hit hit=find_action(A_PAGE,PLAYERS);activate(&hit);draw();assert(page==PLAYERS);
@@ -215,6 +215,51 @@ static void check_redesign(void){
     for(int mode=1;mode<=2;mode++){keyboard_open=mode;draw();check_layout();}keyboard_open=0;
     for(int c=1;c<=7;c++){confirm=c;draw();check_layout();}confirm=0;
     state=saved;list_mode=list_offset=0;page=HOME;
+}
+static void check_wiki_status(void){
+    char path[]="/tmp/n20-wiki-status-test-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
+    const char *data="version\t1\nupdated\t1\nmodel\tready\ncount\t2\nactive\tAlex\tWhat is a hopper?\nphase\tgenerating\nelapsed\t17\ncharacters\t42\nqueue\tSteve\tFirst question\nqueue\tAlex\tSecond question\nhistory\tAlex\tPast question\t[Wiki] Past response\n";
+    assert(write(fd,data,strlen(data))==(ssize_t)strlen(data));close(fd);
+    WikiStatus status;assert(read_wiki_status(path,&status));
+    assert(!strcmp(status.model,"ready")&&status.count==2&&status.listed==2);
+    assert(!strcmp(status.phase,"generating")&&status.elapsed==17&&status.characters==42);
+    assert(status.history_count==1&&!strcmp(status.history_question[0],"Past question")&&!strcmp(status.history_answer[0],"[Wiki] Past response"));
+    assert(!strcmp(status.active_player,"Alex")&&!strcmp(status.question[1],"Second question"));
+    const char *saved_path=wiki_status_path;wiki_status_path=path;
+    page=WIKI_HISTORY;list_offset=0;confirm=keyboard_open=difficulty_open=notice_open=0;message_until=0;
+    draw();check_layout();Hit view=find_action(A_WIKI_DETAIL,0);activate(&view);assert(page==WIKI_DETAIL);
+    draw();check_layout();Hit back=find_action(A_PAGE,WIKI_HISTORY);activate(&back);assert(page==WIKI_HISTORY);
+    wiki_status_path=saved_path;
+    struct timespec old[2]={{.tv_sec=1},{.tv_sec=1}};assert(utimensat(AT_FDCWD,path,old,0)==0);
+    assert(!read_wiki_status(path,&status));assert(unlink(path)==0);
+}
+static void check_log_paging(void){
+    FILE *f=tmpfile();assert(f);
+    for(int i=0;i<21;i++)assert(fprintf(f,"line %02d\n",i)>0);
+    assert(fflush(f)==0);char lines[LOG_PAGE_SIZE][160]={{0}};int older=0;
+    assert(log_page(f,0,lines,&older)==8&&older&&!strcmp(lines[0],"line 20")&&!strcmp(lines[7],"line 13"));
+    assert(log_page(f,8,lines,&older)==8&&older&&!strcmp(lines[0],"line 12")&&!strcmp(lines[7],"line 05"));
+    assert(log_page(f,16,lines,&older)==5&&!older&&!strcmp(lines[0],"line 04")&&!strcmp(lines[4],"line 00"));
+    LogCount cache={0};long long total=0;assert(count_log_lines(f,&cache,&total)&&total==21);
+    assert(fseek(f,0,SEEK_END)==0&&fputs("partial",f)>=0&&fflush(f)==0);
+    assert(count_log_lines(f,&cache,&total)&&total==22);
+    assert(fseek(f,0,SEEK_END)==0&&fputs("\n\n",f)>=0&&fflush(f)==0);
+    assert(count_log_lines(f,&cache,&total)&&total==22);
+    assert(ftruncate(fileno(f),0)==0&&fseek(f,0,SEEK_SET)==0&&fputs("replacement\n",f)>=0&&fflush(f)==0);
+    assert(count_log_lines(f,&cache,&total)&&total==1);
+    fclose(f);
+    f=tmpfile();assert(f);for(int i=0;i<262145;i++)assert(fputs("abc\n",f)>=0);assert(fflush(f)==0);
+    cache=(LogCount){0};assert(!count_log_lines(f,&cache,&total));assert(count_log_lines(f,&cache,&total)&&total==262145);fclose(f);
+}
+static void check_helper_errors(void){
+    int fds[2];assert(pipe(fds)==0);
+    const char *reason="Another operation is in progress\n";
+    assert(write(fds[1],reason,strlen(reason))==(ssize_t)strlen(reason));close(fds[1]);
+    helper_error_fd=fds[0];finish_helper_error(1);
+    assert(helper_error_fd==-1&&!strcmp(message,"Another operation is in progress"));
+    assert(pipe(fds)==0);close(fds[1]);helper_error_fd=fds[0];finish_helper_error(1);
+    assert(!strcmp(message,"Request failed. Check the server helper."));
+    message_until=0;
 }
 static void check_indicators(void){
     void *reference=malloc(map_size);assert(reference);
@@ -314,7 +359,7 @@ int main(int argc,char **argv){
     /* The target's dumb buffer has 32 bytes of padding per scanline. */
     pitch=W*4+32;map_size=(size_t)pitch*H;canvas=calloc(1,map_size);assert(canvas);
     state.valid=1;state.updated=(long)time(NULL);state.max_players=10;strcpy(state.server,"online");
-    check_page(HOME);check_page(PLAYERS);check_page(DEVICE_SETTINGS);check_page(BACKUPS);check_page(LOGS);
+    check_page(HOME);check_page(PLAYERS);check_page(DEVICE_SETTINGS);check_page(BACKUPS);check_page(LOGS);check_page(WIKI);check_page(WIKI_HISTORY);check_page(WIKI_DETAIL);check_wiki_status();check_helper_errors();check_log_paging();
     page=HOME;draw();assert(hit_at(70,450)<0);
     find_action(A_PAGE,PLAYERS);find_action(A_PAGE,BACKUPS);find_action(A_PAGE,DEVICE_SETTINGS);find_action(A_PAGE,LOGS);
     for(int i=0;i<4;i++)find_action(A_DIFFICULTY,i);

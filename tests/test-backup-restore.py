@@ -1,10 +1,13 @@
 import gzip
+import atexit
 import importlib.machinery
 import os
+import shutil
 import tempfile
 from pathlib import Path
 m=importlib.machinery.SourceFileLoader('n20_admin',str(Path(__file__).resolve().parents[1] / 'runtime/usr/local/sbin/n20-admin')).load_module()
 top=Path(tempfile.mkdtemp(prefix='n20-restore-validation-',dir='/tmp'))
+atexit.register(shutil.rmtree,top,ignore_errors=True)
 top.chmod(0o755)
 m.COPY_HELPER=str(Path(__file__).resolve().parents[1] / 'runtime/usr/local/sbin/n20-backup-copy')
 m.ROOT=top/'server'; m.WORLD=m.ROOT/'world'; m.REPO=top/'backups'/'repo'; m.PASS=top/'password'; m.RUN=top/'run'; m.META=top/'meta'
@@ -19,7 +22,9 @@ m.restore(saved[:12]); assert (m.WORLD/'marker').read_text()=='original'
 old=list((m.REPO.parent/'.n20-restore').glob('.world-before-*')); assert len(old)==1 and (old[0]/'marker').read_text()=='later changes'
 assert not m.HOLD.exists() and not m.STOP.exists(); assert any('pre-restore' in s.get('tags',[]) for s in m.snapshots())
 (m.WORLD/'marker').write_text('staged checkpoint')
+(m.META/'pending-save-event.json').write_text(__import__('json').dumps({'id':'a'*32,'time':__import__('time').time()}))
 m.backup(False)
+assert not m.pending_save()[0], 'manual snapshot did not acknowledge its saved notification'
 staged=next(x['id'] for x in m.snapshots() if str(m.STAGE_WORLD) in x['paths'])
 (m.WORLD/'marker').write_text('changed after staged checkpoint')
 m.restore(staged[:12]); assert (m.WORLD/'marker').read_text()=='staged checkpoint'

@@ -13,8 +13,8 @@ The phone uses boot slot B and a reformatted userdata partition. Its bootloader 
 - `tools/` has non-installing builds, screen capture, and a Minecraft status probe; `tests/` exercises administration and backup behavior in temporary directories.
 - [Device and development notes](docs/device.md) describe dependencies, firmware, deployment, boot-image inputs, and known limitations.
 - [Minecraft Wiki chat](docs/wiki-chat.md) describes the on-device `@wiki` bridge, GPU worker, and cache maintenance.
-- `reports/` contains dated measurements and investigations; `docs/` is for durable documentation.
-- [Power measurements](reports/2026-11-08-power-baseline.md) record battery, idle-policy and earlier performance comparisons and their limitations.
+- `docs/` contains durable documentation; older investigation reports remain available in Git history.
+- [Power measurements](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-08-power-baseline.md) record battery, idle-policy and earlier performance comparisons and their limitations.
 - The tested phone stops charging at 55% and resumes at 50%; see [device notes](docs/device.md) for details and recovery.
 - `local/` holds Git-ignored device inputs and credentials on the original workstation. [Local materials](docs/local-materials.md) lists its contents and explains how to reproduce public build inputs.
 
@@ -24,11 +24,12 @@ The working phone at capture time had Wi-Fi `10.0.0.160`; its dashboard displays
 ssh -i .\local\secrets\n20_usb_key root@<phone-ip>
 ```
 
-The example server configuration enables the whitelist and enforces it; add trusted Minecraft usernames before enabling it on an existing server. The supervisor requires the server executable and bundled libraries in root-controlled `/opt/n20-minecraft/current`; see [device notes](docs/device.md) before upgrading an existing installation. The dashboard's Phone page scans and connects to open and WPA2-PSK networks. The power button turns the display off or on. The dashboard powers the panel down when idle and wakes it with the power button; touch wake remains available as a fallback if panel power-down fails. After wake, inputs are ignored for 150 ms. Wi-Fi power saving is enabled when Minecraft has no TCP clients and disabled shortly after a connection appears; the first connection can have extra latency. The repository configures USB MTP to expose `/srv/minecraft/world` read-only as Minecraft World, rather than exposing server settings and backup files. Existing installations need the updated MTP configuration and a service restart for that restriction to take effect. Stop Minecraft before copying the live world for a consistent copy. The local Restic history also requires its separate password; neither it nor that password is included here. Direct Google Drive backups are not yet implemented.
+The example server configuration enables the whitelist and enforces it; add trusted Minecraft usernames before enabling it on an existing server. The supervisor requires the server executable and bundled libraries in root-controlled `/opt/n20-minecraft/current`; see [device notes](docs/device.md) before upgrading an existing installation. The dashboard's Phone page scans and connects to open and WPA2-PSK networks. The power button turns the display off or on. The dashboard powers the panel down when idle and wakes it with the power button; touch wake remains available as a fallback if panel power-down fails. After wake, inputs are ignored for 150 ms. Wi-Fi power saving is enabled when Minecraft has no TCP clients and disabled shortly after a connection appears; the first connection can have extra latency. The repository configures USB MTP to expose `/srv/minecraft/world` read-only as Minecraft World, rather than exposing server settings and backup files. Existing installations need the updated MTP configuration and a service restart for that restriction to take effect. Stop Minecraft before copying the live world for a consistent copy. The local Restic history also requires its separate password; neither it nor that password is included here. An optional direct Google Drive uploader copies completed local snapshots; see the device notes for its safeguards and limitations.
 
-The dashboard has four direct tabs: **Server**, **Players**, **World**, and
-**Phone**. Server includes lifecycle and game settings; Players manages access;
-World provides backups and restore; Phone combines Wi-Fi and display controls.
+The dashboard has five direct tabs: **Server**, **Players**, **World**, **Wiki**,
+and **Phone**. Server includes lifecycle and game settings; Players manages access;
+World provides backups and restore; Wiki shows assistant activity and history;
+Phone combines Wi-Fi and display controls.
 Battery, Wi-Fi, and battery temperature remain visible at the top of every
 screen. See the [UI inventory and navigation](docs/ui.md).
 
@@ -69,11 +70,11 @@ python3 tests/test-restore-area.py  # root
 
 The backup tests use temporary directories and an isolated Restic repository; they require `restic`, `rsync`, `nice`, and `ionice`. They do not test real gameplay or guarantee atomic snapshots of a changing world. Run `/tmp/n20-dashboard-test --benchmark` for an isolated renderer comparison. For an optional disposable server heap comparison, run `python3 tools/benchmark-server-memory.py --jar /opt/n20-minecraft/current/server.jar --eula /srv/minecraft/eula.txt` as root; it temporarily increases device load. Set `N20_UI_METRICS=1` when launching the dashboard to log aggregate rendering time, event-to-frame-submission time, and peak RSS; neither measures whole-phone power.
 
-For a read-only battery log on the phone, run `python3 tools/measure-battery.py --duration 600 --interval 10 > /tmp/n20-battery.csv`. Compare unplugged runs with similar workloads and display states; the vendor current counter is not calibrated. See [the power baseline](reports/2026-11-08-power-baseline.md) for measurements, limitations, and the current display-wake constraint.
+For a read-only battery log on the phone, run `python3 tools/measure-battery.py --duration 600 --interval 10 > /tmp/n20-battery.csv`. Compare unplugged runs with similar workloads and display states; the vendor current counter is not calibrated. See [the power baseline](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-08-power-baseline.md) for measurements, limitations, and the current display-wake constraint.
 
 For a synthetic active-world heap comparison, run `python3 tools/benchmark-server-workload.py --jar /opt/n20-minecraft/current/server.jar --eula /srv/minecraft/eula.txt` as root. It creates disposable loopback-only worlds and temporarily adds substantial load; `--reverse` swaps the heap test order. Its results do not establish real-play latency or battery life.
 
-The [connected-client distance benchmark](reports/2026-11-09-chunk-distances.md) compares
+The [connected-client distance benchmark](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-chunk-distances.md) compares
 loading, stationary play and new-terrain movement using disposable worlds.
 Its harness temporarily stops an idle production server and restores it on
 exit. It does not measure client rendering or calibrated electrical power.

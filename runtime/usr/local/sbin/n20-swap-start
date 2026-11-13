@@ -1,0 +1,14 @@
+#!/bin/sh
+# Activate the already-provisioned swap file; never create or reformat it here.
+set -eu
+file=/var/lib/n20/swapfile
+[ ! -L /var/lib/n20 ] && [ -d /var/lib/n20 ] || exit 1
+[ "$(stat -c '%u:%g:%a' /var/lib/n20)" = 0:0:700 ] || exit 1
+[ ! -L "$file" ] || exit 1
+if [ ! -e "$file" ]; then exit 0; fi
+[ -f "$file" ] || exit 1
+[ "$(stat -c '%u:%g:%a:%s' "$file")" = 0:0:600:6442450944 ] || exit 1
+if ! awk -v file="$file" 'NR>1 && $1==file {found=1} END {exit !found}' /proc/swaps; then
+    /usr/sbin/swapon "$file"
+fi
+printf '10\n' > /proc/sys/vm/swappiness

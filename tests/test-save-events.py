@@ -1,6 +1,7 @@
 import importlib.machinery
 import json
 import os
+import select
 import socket
 import struct
 import tempfile
@@ -18,6 +19,25 @@ with tempfile.TemporaryDirectory(prefix='n20-save-secret-') as temp:
     try:m.secret();raise AssertionError('FIFO properties accepted')
     except ValueError:pass
     m.PROPS.unlink();source.rename(m.PROPS);assert m.secret()=='example'
+with tempfile.TemporaryDirectory(prefix='n20-pending-save-') as temp:
+    m.RUN=Path(temp)/'run';m.META=Path(temp)/'meta';m.EVENT=m.RUN/'save-event.json';m.PID=Path(temp)/'pid'
+    m.PID.write_text('123')
+    m.record('saved')
+    first=json.loads((m.META/'pending-save-event.json').read_text())
+    assert first['server_pid']==123 and first['id']
+    assert json.loads(m.EVENT.read_text())['id']==first['id']
+    m.record('saved')
+    assert json.loads((m.META/'pending-save-event.json').read_text())['id']!=first['id']
+with tempfile.TemporaryDirectory(prefix='n20-player-wake-') as temp:
+    m.RUN=Path(temp);m.PLAYERS=m.RUN/'players.json';m.PID=m.RUN/'pid';m.PID.write_text('123')
+    wake=m.backup_wake.Waiter(m.RUN,'scheduler')
+    try:
+        m.record_players([]);assert select.select([wake.fd],[],[],0)[0];wake.wait(0)
+        m.record_players([]);assert not select.select([wake.fd],[],[],0)[0]
+        m.record_players([{'name':'test-player'}]);assert select.select([wake.fd],[],[],0)[0]
+        activity=(m.RUN/'player-activity').read_text();assert activity.strip()
+        m.record_activity();assert (m.RUN/'player-activity').read_text()!=activity
+    finally:wake.close()
 for value in (None, [], 'x', 4, True): assert not m.valid_message(value)
 assert m.valid_message({'method':'minecraft:notification/server/saved'})
 assert m.bounded_json('{"message":"[{}]\\\""}')=={'message':'[{}]"'}

@@ -5,6 +5,7 @@
 #include <linux/input.h>
 #include <math.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -48,6 +49,13 @@
 #define PLAYER_PAGE_SIZE 6
 #define BACKUP_PAGE_SIZE 5
 #define WIFI_PAGE_SIZE 3
+#define WIKI_PAGE_SIZE 6
+#define WIKI_QUEUE_MAX 128
+#define WIKI_HISTORY_MAX 50
+#define WIKI_HISTORY_PAGE_SIZE 3
+#define WIKI_DETAIL_PAGE_SIZE 24
+#define WIKI_DETAIL_LINES_MAX 800
+#define LOG_PAGE_SIZE 8
 /* Expose the normal game configuration range, not a phone performance cap. */
 #define CHUNK_DISTANCE_MAX 32
 
@@ -72,23 +80,29 @@ static char message[128];
 static volatile sig_atomic_t exiting=0, sleep_requested=0;
 static int signal_pipe[2]={-1,-1};
 static int state_watch_fd=-1;
-enum { HOME, PLAYERS, LOGS, BACKUPS, DEVICE_SETTINGS };
+enum { HOME, PLAYERS, LOGS, BACKUPS, DEVICE_SETTINGS, WIKI, WIKI_HISTORY, WIKI_DETAIL };
 enum { A_PAGE=1, A_START, A_RESTART, A_STOP, A_CONFIRM, A_CANCEL,
     A_LIST, A_ADD, A_REMOVE, A_ALLOW, A_DIFFICULTY, A_MAX, A_VIEW, A_SIM,
     A_BRIGHT, A_TIMEOUT, A_BACKUP, A_RESTORE, A_KEY, A_ERASE, A_SUBMIT,
-    A_SHIFT, A_SCROLL, A_WIFI_SELECT, A_WIFI_SCAN, A_WIFI_DISCONNECT, A_WIFI_SPACE, A_WIFI_SHOW, A_WIFI_LEFT, A_WIFI_RIGHT, A_NOTICE };
+    A_SHIFT, A_SCROLL, A_WIFI_SELECT, A_WIFI_SCAN, A_WIFI_DISCONNECT, A_WIFI_SPACE, A_WIFI_SHOW, A_WIFI_LEFT, A_WIFI_RIGHT, A_NOTICE, A_WIKI_DETAIL };
 typedef struct { int x,y,w,h,action,value; char arg[96]; } Hit;
 static Hit hits[100], pressed_hit;
 static int hit_count, pressed_valid, down_x, down_y, drag_cancel;
 static int list_mode=1, list_offset, wifi_count, keyboard_open, keyboard_shift, difficulty_open, notice_open, idle_seconds=120;
 static char wifi_password[65], wifi_selected[65], wifi_label[80];
 static int wifi_keyboard_mode, wifi_show_password;
+static int log_has_older;
+static int wiki_history_offset;
+static int wiki_detail_offset,wiki_detail_count;
+static char wiki_detail_player[32],wiki_detail_question[1025],wiki_detail_answer[2049];
+static const char *wiki_status_path="/run/n20-wiki/status/state";
 static size_t wifi_cursor;
 static char typed_name[17], selected_name[32], selected_backup[96], selected_backup_label[96];
 static long confirm_server_pid;static unsigned long long confirm_server_start;
 static long long input_block_until, helper_due, state_read_due, display_save_due;
 static int pending_touch_down, pending_touch_up;
 static pid_t helper_pid;
+static int helper_error_fd=-1;
 static pid_t display_save_pid;
 static int helper_mutation;
 static char queued_command[32], queued_arg[96];
@@ -190,11 +204,59 @@ static const char *battery_power_label(long online,const char *status,long charg
     return "Plugged in";
 }
 static int running(void){long pid=read_long("/run/minecraft.pid",0);return pid>1&&(kill((pid_t)pid,0)==0||errno==EPERM);}
-static void recent_logs(char lines[][160],int wanted){
-    for(int i=0;i<wanted;i++)lines[i][0]=0;
-    FILE*f=fopen("/var/log/minecraft.log","r");if(!f)return;fseek(f,0,SEEK_END);long len=ftell(f);if(len>24000)fseek(f,len-24000,SEEK_SET);else rewind(f);
-    char buf[1024];int k=0;while(fgets(buf,sizeof(buf),f)){buf[strcspn(buf,"\r\n")]=0;if(!*buf)continue;snprintf(lines[k%wanted],160,"%.155s",buf);k++;}fclose(f);
-    if(k>wanted){char tmp[12][160];for(int i=0;i<wanted;i++)memcpy(tmp[i],lines[(k+i)%wanted],160);for(int i=0;i<wanted;i++)memcpy(lines[i],tmp[i],160);}
+/* Read complete log lines backwards in bounded blocks; offset counts newer lines. */
+static int log_page(FILE *f,int offset,char lines[][160],int *older){
+    char block[4096],reverse[159];size_t used=0;int skipped=0,count=0;*older=0;
+    if(fseek(f,0,SEEK_END)!=0)return 0;
+    long position=ftell(f);if(position<0)return 0;
+    while(position>0){
+        size_t length=position>(long)sizeof(block)?sizeof(block):(size_t)position;position-=(long)length;
+        if(fseek(f,position,SEEK_SET)!=0||fread(block,1,length,f)!=length)break;
+        while(length){
+            unsigned char ch=(unsigned char)block[--length];
+            if(ch=='\n'){
+                if(!used)continue;
+                if(skipped++>=offset){
+                    if(count==LOG_PAGE_SIZE){*older=1;return count;}
+                    for(size_t i=0;i<used;i++)lines[count][i]=reverse[used-1-i];
+                    lines[count][used]=0;count++;
+                }
+                used=0;
+            }else if(ch!='\r'){
+                if(used<sizeof(reverse))reverse[used++]=(char)ch;
+                else{memmove(reverse,reverse+1,sizeof(reverse)-1);reverse[sizeof(reverse)-1]=(char)ch;}
+            }
+        }
+    }
+    if(used&&skipped>=offset){
+        if(count==LOG_PAGE_SIZE)*older=1;
+        else{for(size_t i=0;i<used;i++)lines[count][i]=reverse[used-1-i];lines[count][used]=0;count++;}
+    }
+    return count;
+}
+typedef struct {dev_t dev;ino_t ino;off_t scanned,size;struct timespec mtime;long long lines;int partial,valid;} LogCount;
+static LogCount log_count;
+/* Incrementally count the log so old pages do not make the UI block on I/O. */
+static int count_log_lines(FILE *f,LogCount *cache,long long *lines){
+    struct stat st;if(fstat(fileno(f),&st)!=0||!S_ISREG(st.st_mode))return 0;
+    if(!cache->valid||cache->dev!=st.st_dev||cache->ino!=st.st_ino||st.st_size<cache->scanned||
+       (st.st_size==cache->size&&(st.st_mtim.tv_sec!=cache->mtime.tv_sec||st.st_mtim.tv_nsec!=cache->mtime.tv_nsec))){
+        memset(cache,0,sizeof(*cache));cache->dev=st.st_dev;cache->ino=st.st_ino;cache->valid=1;
+    }
+    cache->size=st.st_size;cache->mtime=st.st_mtim;
+    if(fseeko(f,cache->scanned,SEEK_SET)!=0)return 0;
+    char buf[8192];size_t budget=1024*1024;
+    while(cache->scanned<st.st_size&&budget){
+        off_t left=st.st_size-cache->scanned;size_t want=left>(off_t)sizeof(buf)?sizeof(buf):(size_t)left;
+        if(want>budget)want=budget;
+        size_t n=fread(buf,1,want,f);if(!n)break;
+        for(size_t i=0;i<n;i++){
+            if(buf[i]=='\n'){if(cache->partial)cache->lines++;cache->partial=0;}
+            else if(buf[i]!='\r')cache->partial=1;
+        }
+        cache->scanned+=(off_t)n;budget-=n;
+    }
+    *lines=cache->lines+cache->partial;return cache->scanned==st.st_size;
 }
 static int wifi_address_valid(const char *status,const char *ip){struct in_addr parsed;return !strcmp(status,"COMPLETED")&&inet_pton(AF_INET,ip,&parsed)==1&&parsed.s_addr!=INADDR_ANY;}
 static int wifi_snapshot_recent(FILE *f){struct stat st;if(fstat(fileno(f),&st)!=0)return 0;double age=difftime(time(NULL),st.st_mtime);return age>=0&&age<=45;}
@@ -283,12 +345,16 @@ static int fresh(void){long age=(long)time(NULL)-state.updated;return state.vali
 static int busy(void){return helper_mutation||queued_command[0]!=0||state.operation[0]!=0;}
 static int admin(const char *command,const char *arg){
     if(helper_pid){if(!helper_mutation&&strcmp(command,"state")&& !queued_command[0]){copy_value(queued_command,sizeof(queued_command),command);copy_value(queued_arg,sizeof(queued_arg),arg?arg:"");msg("Request queued after refresh.");return 1;}msg("Please wait for the current operation.");return 0;}
-    pid_t pid=fork();if(pid<0){msg("Could not launch server helper.");return 0;}
+    int capture=strcmp(command,"state")!=0,errors[2]={-1,-1};
+    if(capture&&pipe2(errors,O_CLOEXEC|O_NONBLOCK)<0){msg("Could not capture server helper errors.");return 0;}
+    pid_t pid=fork();if(pid<0){if(capture){close(errors[0]);close(errors[1]);}msg("Could not launch server helper.");return 0;}
     if(pid==0){
         if(drmfd>=0)close(drmfd);
-        int nullfd=open("/dev/null",O_RDWR);if(nullfd>=0){dup2(nullfd,STDIN_FILENO);dup2(nullfd,STDOUT_FILENO);dup2(nullfd,STDERR_FILENO);if(nullfd>2)close(nullfd);}
+        int nullfd=open("/dev/null",O_RDWR);if(nullfd>=0){dup2(nullfd,STDIN_FILENO);dup2(nullfd,STDOUT_FILENO);if(!capture)dup2(nullfd,STDERR_FILENO);if(nullfd>2)close(nullfd);}
+        if(capture){close(errors[0]);if(dup2(errors[1],STDERR_FILENO)<0)_exit(127);close(errors[1]);}
         execl("/usr/local/sbin/n20-admin","n20-admin",command,arg,(char *)NULL);_exit(127);
     }
+    if(capture){close(errors[1]);helper_error_fd=errors[0];}
     helper_pid=pid;helper_mutation=strcmp(command,"state")!=0;
     if(helper_mutation)msg("Request sent. Waiting for confirmation...");
     return 1;
@@ -301,6 +367,16 @@ static int start_state_watch(const char *path){
     state_watch_fd=fd;return 1;
 }
 static void stop_state_watch(void){if(state_watch_fd>=0)close(state_watch_fd);state_watch_fd=-1;}
+static void finish_helper_error(int failed){
+    char detail[sizeof(message)]={0};ssize_t n=0;
+    if(helper_error_fd>=0){n=read(helper_error_fd,detail,sizeof(detail)-1);close(helper_error_fd);helper_error_fd=-1;}
+    if(!failed)return;
+    if(n>0){
+        for(ssize_t i=0;i<n;i++)if((unsigned char)detail[i]<32)detail[i]=' ';
+        while(n>0&&detail[n-1]==' ')detail[--n]=0;
+    }
+    msg(n>0?detail:"Request failed. Check the server helper.");
+}
 static void drain_state_watch(void){
     char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));ssize_t n;
     while(state_watch_fd>=0&&(n=read(state_watch_fd,buf,sizeof(buf)))>0){
@@ -314,7 +390,7 @@ static void drain_state_watch(void){
     if(awake&&state_watch_fd<0)start_state_watch("/run/n20");
     if(awake&&now>=state_read_due){State previous=state;read_state();previous.updated=state.updated;if(memcmp(&previous,&state,sizeof(state)))invalidate_full();state_read_due=now+(state_watch_fd>=0?15000:1000);}
     if(helper_pid){int status=0;pid_t done=waitpid(helper_pid,&status,WNOHANG);if(done==helper_pid){
-        if((!WIFEXITED(status)||WEXITSTATUS(status)!=0)&&helper_mutation)msg("Request failed. Check server log.");
+        finish_helper_error((!WIFEXITED(status)||WEXITSTATUS(status)!=0)&&helper_mutation);
         int changed=helper_mutation;helper_pid=0;helper_mutation=0;State previous=state;read_state();previous.updated=state.updated;if(changed){helper_due=0;invalidate_full();}else if(memcmp(&previous,&state,sizeof(state)))invalidate_full();
         if(queued_command[0]){char command[sizeof(queued_command)],arg[sizeof(queued_arg)];copy_value(command,sizeof(command),queued_command);copy_value(arg,sizeof(arg),queued_arg);queued_command[0]=0;queued_arg[0]=0;admin(command,arg[0]?arg:NULL);}
     }}
@@ -350,7 +426,7 @@ static int confirmation_ready(int c){
     if(c==4||c==5){if(!strcmp(state.server,"recovery")||strstr(state.error,"Battery low"))return 0;if(c==5){for(int i=0;i<state.backup_count&&i<64;i++)if(!strcmp(state.backup_id[i],selected_backup))return 1;return 0;}return 1;}
     return 0;
 }
-static void heading(const char *title){int x=page==LOGS&&!notice_open&&!confirm&&!keyboard_open&&!difficulty_open?230:60;text(bold,76,x,300,WHITE,title,W-x-60);}
+static void heading(const char *title){int subpage=page==LOGS||page==WIKI_HISTORY||page==WIKI_DETAIL;int x=subpage&&!notice_open&&!confirm&&!keyboard_open&&!difficulty_open?230:60;text(bold,76,x,300,WHITE,title,W-x-60);}
 static void divider(int y){rect(60,y,960,2,BORDER);}
 static void section_label(int y,const char *label){text(bold,28,60,y,DIM,label,960);}
 static void draw_indicators(void){
@@ -623,25 +699,172 @@ static void draw_backups(void){
 }
 static void draw_logs(void){
     heading("Activity");
-    char logs[12][160];recent_logs(logs,8);int any=0;
-    for(int i=0;i<8;i++){
-        if(!logs[i][0])continue;
-        any=1;int y=480+i*195;char first[160];size_t len=0;const char *cursor=logs[i];
+    char logs[LOG_PAGE_SIZE][160]={{0}};FILE *f=fopen("/var/log/minecraft.log","r");log_has_older=0;
+    long long total=0;int counted=f?count_log_lines(f,&log_count,&total):0;
+    int count=f?log_page(f,list_offset,logs,&log_has_older):0;if(f)fclose(f);
+    if(!count&&list_offset){list_offset=0;f=fopen("/var/log/minecraft.log","r");count=f?log_page(f,0,logs,&log_has_older):0;if(f)fclose(f);}
+    for(int i=0;i<count;i++){
+        int y=480+i*185;char first[160];size_t len=0;const char *cursor=logs[i];
         /* Wrap at a glyph boundary rather than slicing UTF-8 bytes. */
         while(*cursor){const char *next=cursor;next_codepoint(&next);size_t n=(size_t)(next-cursor);if(len+n>=sizeof(first))break;memcpy(first+len,cursor,n);first[len+n]=0;if(text_width(mono,30,first)>960)break;len+=n;cursor=next;}
         first[len]=0;text(mono,30,60,y,WHITE,first,960);if(*cursor)text(mono,28,60,y+53,MUTED,cursor,960);divider(y+112);
     }
-    if(!any)text(regular,36,60,570,MUTED,"No activity",960);
+    if(!count)text(regular,36,60,570,MUTED,"No activity",960);
+    if(list_offset||log_has_older){
+        control(60,1970,300,120,PANEL,list_offset?WHITE:DIM,"Newer",list_offset?A_SCROLL:0,-LOG_PAGE_SIZE,NULL);
+        control(720,1970,300,120,PANEL,log_has_older?WHITE:DIM,"Older",log_has_older?A_SCROLL:0,LOG_PAGE_SIZE,NULL);
+    }
+    char page_label[64];if(counted)snprintf(page_label,sizeof(page_label),"%d / %lld",list_offset/LOG_PAGE_SIZE+1,total?(total-1)/LOG_PAGE_SIZE+1:1);
+    else snprintf(page_label,sizeof(page_label),"%d / ...",list_offset/LOG_PAGE_SIZE+1);
+    centered(mono,32,380,2043,320,MUTED,page_label);
 }
-static int page_section(int target){return target==LOGS?HOME:target;}
+typedef struct {
+    int valid, count, listed, resources_limited, elapsed, characters, history_count;
+    char model[24], phase[24], active_player[32], active_question[512];
+    char player[WIKI_QUEUE_MAX][32], question[WIKI_QUEUE_MAX][512];
+    char history_player[WIKI_HISTORY_MAX][32], history_question[WIKI_HISTORY_MAX][1025], history_answer[WIKI_HISTORY_MAX][2049];
+} WikiStatus;
+static int read_wiki_status(const char *path,WikiStatus *out){
+    memset(out,0,sizeof(*out));
+    int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);if(fd<0)return 0;
+    struct stat st;time_t now=time(NULL);
+    struct passwd *minecraft=getpwnam("minecraft");
+    if(fstat(fd,&st)||!S_ISREG(st.st_mode)||(st.st_uid!=0&&(!minecraft||st.st_uid!=minecraft->pw_uid))||
+       st.st_size>524288||st.st_mtime>now+5||now-st.st_mtime>10){close(fd);return 0;}
+    FILE *f=fdopen(fd,"r");if(!f){close(fd);return 0;}
+    char line[4096];int version=0,have_model=0,have_count=0;
+    while(fgets(line,sizeof(line),f)){
+        size_t len=strlen(line);if(!len||line[len-1]!='\n'){fclose(f);return 0;}line[len-1]=0;
+        char *save=NULL,*key=strtok_r(line,"\t",&save),*value=strtok_r(NULL,"\t",&save);
+        if(!key||!value)continue;
+        if(!strcmp(key,"version")){version=!strcmp(value,"1");}
+        else if(!strcmp(key,"model")){
+            if(strcmp(value,"ready")&&strcmp(value,"loading")&&strcmp(value,"waiting")&&strcmp(value,"unavailable")){fclose(f);return 0;}
+            copy_value(out->model,sizeof(out->model),value);have_model=1;
+        }else if(!strcmp(key,"count")){
+            char *end;errno=0;long count=strtol(value,&end,10);
+            if(errno||*end||count<0||count>10000000){fclose(f);return 0;}out->count=(int)count;have_count=1;
+        }else if(!strcmp(key,"resources")){
+            if(strcmp(value,"ok")&&strcmp(value,"limited")){fclose(f);return 0;}
+            out->resources_limited=!strcmp(value,"limited");
+        }else if(!strcmp(key,"phase")){
+            if(strcmp(value,"starting")&&strcmp(value,"retrieving")&&strcmp(value,"checking")&&strcmp(value,"prefill")&&strcmp(value,"generating")){fclose(f);return 0;}
+            copy_value(out->phase,sizeof(out->phase),value);
+        }else if(!strcmp(key,"elapsed")||!strcmp(key,"characters")){
+            char *end;errno=0;long n=strtol(value,&end,10);
+            if(errno||*end||n<0||n>10000000){fclose(f);return 0;}
+            if(!strcmp(key,"elapsed"))out->elapsed=(int)n;else out->characters=(int)n;
+        }else if(!strcmp(key,"active")||!strcmp(key,"queue")){
+            char *question=strtok_r(NULL,"\t",&save);if(!question)continue;
+            if(!strcmp(key,"active")){copy_value(out->active_player,sizeof(out->active_player),value);copy_value(out->active_question,sizeof(out->active_question),question);}
+            else if(out->listed<WIKI_QUEUE_MAX){int i=out->listed++;copy_value(out->player[i],sizeof(out->player[i]),value);copy_value(out->question[i],sizeof(out->question[i]),question);}
+        }else if(!strcmp(key,"history")){
+            char *question=strtok_r(NULL,"\t",&save),*answer=strtok_r(NULL,"\t",&save);
+            if(question&&answer&&out->history_count<WIKI_HISTORY_MAX){int i=out->history_count++;copy_value(out->history_player[i],sizeof(out->history_player[i]),value);copy_value(out->history_question[i],sizeof(out->history_question[i]),question);copy_value(out->history_answer[i],sizeof(out->history_answer[i]),answer);}
+        }
+    }
+    fclose(f);out->valid=version&&have_model&&have_count&&out->listed<=out->count;return out->valid;
+}
+static void draw_wiki(void){
+    WikiStatus status;heading("Wiki assistant");
+    if(!read_wiki_status(wiki_status_path,&status)){
+        card(60,405,960,250);text(bold,43,96,485,WHITE,"Bridge unavailable",850);
+        text(regular,31,96,555,MUTED,"The Wiki service is stopped or not reporting.",850);return;
+    }
+    card(60,405,960,250);text(bold,30,96,470,DIM,"MODEL",850);
+    int waiting=!strcmp(status.model,"waiting");
+    if(!strcmp(status.model,"unavailable")){
+        FILE *mem=fopen("/proc/meminfo","r");char line[128];long available=-1;
+        if(mem){while(fgets(line,sizeof(line),mem))if(sscanf(line,"MemAvailable: %ld kB",&available)==1)break;fclose(mem);}
+        if(available>=0&&available<3670016)waiting=1;
+    }
+    const char *model=!strcmp(status.model,"ready")?"Ready":!strcmp(status.model,"loading")?"Loading":waiting?"Waiting for resources":"Unavailable";
+    text(bold,43,96,535,!strcmp(status.model,"ready")?GREEN:AMBER,model,850);
+    char activity[160];
+    if(status.resources_limited)snprintf(activity,sizeof(activity),"Limited by memory or temperature");
+    else if(*status.active_player){
+        const char *phase=!strcmp(status.phase,"retrieving")?"Searching Wiki":!strcmp(status.phase,"checking")?"Checking evidence":!strcmp(status.phase,"prefill")?"Preparing model reply":!strcmp(status.phase,"generating")?"Generating reply":"Starting request";
+        if(!strcmp(status.phase,"generating"))snprintf(activity,sizeof(activity),"%s  ·  %d s  ·  %d chars",phase,status.elapsed,status.characters);
+        else snprintf(activity,sizeof(activity),"%s  ·  %d s",phase,status.elapsed);
+    }else snprintf(activity,sizeof(activity),"Waiting for a question");
+    text(regular,30,96,603,status.resources_limited?AMBER:MUTED,activity,850);
+    control(760,685,260,110,PANEL,WHITE,"History",A_PAGE,WIKI_HISTORY,NULL);
+    section_label(735,"CURRENT REQUEST");
+    if(*status.active_player){text(bold,35,60,805,WHITE,status.active_player,960);text(regular,31,60,860,MUTED,status.active_question,960);}
+    else text(regular,34,60,815,MUTED,"No active request",960);
+    char label[80];snprintf(label,sizeof(label),"QUEUED QUESTIONS  %d",status.count);section_label(1000,label);
+    list_offset=page_offset(list_offset,status.listed,WIKI_PAGE_SIZE);
+    if(!status.listed)text(regular,34,60,1080,MUTED,"No questions waiting",960);
+    for(int i=0;i<WIKI_PAGE_SIZE&&list_offset+i<status.listed;i++){
+        int item=list_offset+i,y=1040+i*150;
+        text(bold,32,60,y+48,WHITE,status.player[item],960);
+        text(regular,29,60,y+100,MUTED,status.question[item],960);divider(y+130);
+    }
+    if(status.count>status.listed)text(regular,27,60,1980,AMBER,"Showing the first 128 queued questions.",960);
+    pagination(2010,status.listed,WIKI_PAGE_SIZE);
+}
+static int history_text(const char *s,int y,int bottom,uint32_t color){
+    while(*s&&y<bottom){
+        char line[256];size_t len=0,last_space=0;const char *cursor=s;
+        while(*cursor){const char *next=cursor;next_codepoint(&next);size_t part=(size_t)(next-cursor);if(len+part>=sizeof(line))break;memcpy(line+len,cursor,part);line[len+part]=0;if(text_width(regular,29,line)>950&&len)break;len+=part;if(*cursor==' ')last_space=len;cursor=next;}
+        if(*cursor&&last_space){len=last_space;cursor=s+last_space;}if(!len)break;
+        line[len]=0;text(regular,29,60,y,color,line,960);s=cursor;while(*s==' ')s++;y+=48;
+    }
+    return y;
+}
+static void history_identity(const char *player,const char *question,const char *answer,char *out,size_t size){
+    uint64_t hash=UINT64_C(14695981039346656037);const char *parts[]={player,question,answer};
+    for(size_t i=0;i<3;i++){for(const unsigned char *p=(const unsigned char *)parts[i];*p;p++)hash=(hash^*p)*UINT64_C(1099511628211);hash=(hash^255)*UINT64_C(1099511628211);}
+    snprintf(out,size,"%016llx",(unsigned long long)hash);
+}
+static void draw_wiki_history(void){
+    WikiStatus status;heading("Wiki history");control(60,205,130,120,PANEL,MUTED,"<",A_PAGE,WIKI,NULL);
+    if(!read_wiki_status(wiki_status_path,&status)){text(regular,34,60,500,MUTED,"Wiki history unavailable",960);return;}
+    int count=status.history_count;list_offset=page_offset(list_offset,count,WIKI_HISTORY_PAGE_SIZE);
+    if(!count){text(regular,34,60,500,MUTED,"No completed questions yet",960);return;}
+    section_label(405,"RECENT QUESTIONS");
+    for(int row=0;row<WIKI_HISTORY_PAGE_SIZE&&list_offset+row<count;row++){
+        int item=list_offset+row,y=445+row*450;
+        char identity[24];history_identity(status.history_player[item],status.history_question[item],status.history_answer[item],identity,sizeof(identity));
+        text(bold,34,60,y+45,WHITE,status.history_player[item],680);
+        control(800,y,220,110,PANEL,WHITE,"View",A_WIKI_DETAIL,item,identity);
+        history_text(status.history_question[item],y+115,y+215,WHITE);
+        history_text(status.history_answer[item],y+245,y+390,MUTED);
+        divider(y+415);
+    }
+    pagination(1900,count,WIKI_HISTORY_PAGE_SIZE);
+}
+static int append_detail_lines(char lines[][256],int count,const char *s){
+    while(*s&&count<WIKI_DETAIL_LINES_MAX){
+        char line[256];size_t len=0,last_space=0;const char *cursor=s;
+        while(*cursor){const char *next=cursor;next_codepoint(&next);size_t part=(size_t)(next-cursor);if(len+part>=sizeof(line))break;memcpy(line+len,cursor,part);line[len+part]=0;if(text_width(regular,29,line)>950&&len)break;len+=part;if(*cursor==' ')last_space=len;cursor=next;}
+        if(*cursor&&last_space){len=last_space;cursor=s+last_space;}if(!len)break;
+        line[len]=0;copy_value(lines[count++],256,line);s=cursor;while(*s==' ')s++;
+    }
+    return count;
+}
+static void draw_wiki_detail(void){
+    heading("Wiki answer");control(60,205,130,120,PANEL,MUTED,"<",A_PAGE,WIKI_HISTORY,NULL);
+    text(bold,34,60,440,WHITE,wiki_detail_player,960);
+    char lines[WIKI_DETAIL_LINES_MAX][256];int count=0;copy_value(lines[count++],256,"QUESTION");
+    count=append_detail_lines(lines,count,wiki_detail_question);if(count<WIKI_DETAIL_LINES_MAX)copy_value(lines[count++],256,"RESPONSE");
+    count=append_detail_lines(lines,count,wiki_detail_answer);wiki_detail_count=count;
+    wiki_detail_offset=page_offset(wiki_detail_offset,count,WIKI_DETAIL_PAGE_SIZE);
+    for(int i=0;i<WIKI_DETAIL_PAGE_SIZE&&wiki_detail_offset+i<count;i++){
+        const char *line=lines[wiki_detail_offset+i];int label=!strcmp(line,"QUESTION")||!strcmp(line,"RESPONSE");
+        text(label?bold:regular,label?27:29,60,510+i*55,label?DIM:WHITE,line,960);
+    }
+    int saved=list_offset;list_offset=wiki_detail_offset;pagination(1900,count,WIKI_DETAIL_PAGE_SIZE);list_offset=saved;
+}
+static int page_section(int target){return target==LOGS?HOME:(target==WIKI_HISTORY||target==WIKI_DETAIL)?WIKI:target;}
 static void draw_navigation(void){
-    static const char *labels[]={"Server","Players","World","Phone"};static const int targets[]={HOME,PLAYERS,BACKUPS,DEVICE_SETTINGS};
+    static const char *labels[]={"Server","Players","World","Wiki","Phone"};static const int targets[]={HOME,PLAYERS,BACKUPS,WIKI,DEVICE_SETTINGS};
     rect(0,2210,W,190,BG);rect(60,2210,960,2,BORDER);
-    for(int i=0;i<4;i++){
-        int x=20+i*265,selected=page_section(page)==targets[i];
-        if(selected)rounded(x+10,2240,245,120,28,GREEN_DARK);
-        centered(selected?bold:regular,36,x,2315,265,selected?GREEN:MUTED,labels[i]);
-        add_hit(x,2230,265,150,A_PAGE,targets[i],NULL);
+    for(int i=0;i<5;i++){
+        int x=20+i*208,selected=page_section(page)==targets[i];
+        if(selected)rounded(x+6,2240,196,120,28,GREEN_DARK);
+        centered(selected?bold:regular,32,x,2315,208,selected?GREEN:MUTED,labels[i]);
+        add_hit(x,2230,208,150,A_PAGE,targets[i],NULL);
     }
 }
 static void draw(void){
@@ -654,6 +877,9 @@ static void draw(void){
         case PLAYERS:draw_players();break;
         case DEVICE_SETTINGS:draw_phone();break;
         case BACKUPS:draw_backups();break;
+        case WIKI:draw_wiki();break;
+        case WIKI_HISTORY:draw_wiki_history();break;
+        case WIKI_DETAIL:draw_wiki_detail();break;
         default:draw_logs();break;
     }
     const char *notice=message_until>now_ms()?message:state.error[0]?state.error:state.operation[0]?state.operation:!fresh()?"Waiting for current server data...":"";
@@ -663,16 +889,17 @@ static void draw(void){
 /* Page content needing periodic refresh, in addition to the shared status bar. */
 static int periodic_page(void){
     if(notice_open||confirm||keyboard_open||difficulty_open)return 0;
-    return page==HOME||page==BACKUPS||page==LOGS||page==DEVICE_SETTINGS;
+    return page==HOME||page==BACKUPS||page==LOGS||page==DEVICE_SETTINGS||page==WIKI||page==WIKI_HISTORY||page==WIKI_DETAIL;
 }
 static int redraw_needed(long long now){
-    int periodic=last_draw&&periodic_page()&&now-last_draw>=5000;
+    int interval=(page==WIKI||page==WIKI_HISTORY)?1000:5000;
+    int periodic=last_draw&&periodic_page()&&now-last_draw>=interval;
     refresh_indicators(now);if(periodic)invalidate_full();
     return !last_draw || last_fresh!=fresh() || last_message_visible!=(message_until>now) ||
-           last_server!=running() || (periodic_page() && now-last_draw>=5000);
+           last_server!=running() || (periodic_page() && now-last_draw>=interval);
 }/* Cap awake waits at five seconds for process status and stale-state checks. */
 static int poll_timeout(long long now){
-    long long due=awake?now+5000:-1;
+    long long due=awake?now+((page==WIKI||page==WIKI_HISTORY)?1000:5000):-1;
     if(awake){
         if(state_read_due<due)due=state_read_due;
         if(!helper_pid&&helper_due<due)due=helper_due;
@@ -692,11 +919,24 @@ static int poll_timeout(long long now){
 }
 static void activate(const Hit *hit){
     int a=hit->action,v=hit->value;const char *arg=hit->arg;char n[32];
-    if(a==A_PAGE){page=v;list_offset=0;return;}
+    if(a==A_PAGE){int from=page;page=v;list_offset=(from==WIKI_DETAIL&&v==WIKI_HISTORY)?wiki_history_offset:0;return;}
+    if(a==A_WIKI_DETAIL&&page==WIKI_HISTORY){
+        WikiStatus wiki;if(!read_wiki_status(wiki_status_path,&wiki)||v<0||v>=wiki.history_count){msg("Wiki history changed; please try again.");return;}
+        char identity[24];history_identity(wiki.history_player[v],wiki.history_question[v],wiki.history_answer[v],identity,sizeof(identity));
+        if(strcmp(identity,arg)){msg("Wiki history changed; please try again.");return;}
+        copy_value(wiki_detail_player,sizeof(wiki_detail_player),wiki.history_player[v]);
+        copy_value(wiki_detail_question,sizeof(wiki_detail_question),wiki.history_question[v]);
+        copy_value(wiki_detail_answer,sizeof(wiki_detail_answer),wiki.history_answer[v]);
+        wiki_history_offset=list_offset;wiki_detail_offset=0;page=WIKI_DETAIL;return;
+    }
     if(a==A_CANCEL){if(notice_open){notice_open=0;return;}confirm=0;keyboard_open=0;difficulty_open=0;wifi_show_password=0;wifi_cursor=0;explicit_bzero(wifi_password,sizeof(wifi_password));return;}
     if(a==A_NOTICE){notice_open=1;return;}
     if(a==A_LIST){list_mode=v;list_offset=0;return;}
     if(a==A_SCROLL&&page==DEVICE_SETTINGS){list_offset=page_offset(list_offset+v,wifi_count,WIFI_PAGE_SIZE);return;}
+    if(a==A_SCROLL&&page==WIKI){WikiStatus wiki;if(read_wiki_status(wiki_status_path,&wiki))list_offset=page_offset(list_offset+v,wiki.listed,WIKI_PAGE_SIZE);return;}
+    if(a==A_SCROLL&&page==WIKI_HISTORY){WikiStatus wiki;if(read_wiki_status(wiki_status_path,&wiki))list_offset=page_offset(list_offset+v,wiki.history_count,WIKI_HISTORY_PAGE_SIZE);return;}
+    if(a==A_SCROLL&&page==WIKI_DETAIL){wiki_detail_offset=page_offset(wiki_detail_offset+v,wiki_detail_count,WIKI_DETAIL_PAGE_SIZE);return;}
+    if(a==A_SCROLL&&page==LOGS){if(v<0||log_has_older)list_offset=bounded(list_offset+v,0,100000000);return;}
     if(a==A_SCROLL){int count=page==BACKUPS?bounded(state.backup_count,0,64):list_mode?bounded(state.allow_count,0,128):bounded(state.players,0,64);int step=page==BACKUPS?BACKUP_PAGE_SIZE:PLAYER_PAGE_SIZE;list_offset=page_offset(list_offset+v,count,step);return;}
     if(a==A_KEY){char *target=keyboard_open==2?wifi_password:typed_name;size_t max=keyboard_open==2?64:16,len=strlen(target);if(len<max){size_t at=keyboard_open==2?wifi_cursor:len;if(at>len)at=len;memmove(target+at+1,target+at,len-at+1);target[at]=(char)v;if(keyboard_open==2)wifi_cursor=at+1;}return;}
     if(a==A_WIFI_SPACE&&keyboard_open==2){size_t len=strlen(wifi_password);if(len<64){size_t at=wifi_cursor>len?len:wifi_cursor;memmove(wifi_password+at+1,wifi_password+at,len-at+1);wifi_password[at]=' ';wifi_cursor=at+1;}return;}

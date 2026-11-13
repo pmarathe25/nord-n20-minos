@@ -64,7 +64,7 @@ Wi-Fi power-saving policy are unchanged by the range expansion.
 
 For general survival play, start with **24 view / 10 simulation**, using 8 as
 a lower-load alternative. Simulation 10 preserves the usual default radius.
-MinOS's reference configuration defaults to 24/10.
+MinOS's reference configuration defaults to 32/10; 24/10 is a lower-load alternative.
 Vanilla defaults to 10 view / 10 simulation; the two settings serve different purposes. See the
 [server properties reference](https://docs.papermc.io/paper/reference/server-properties/).
 
@@ -75,7 +75,7 @@ does not keep all distant mobs, farms and mechanisms active. Different game
 systems have additional ticking and spawning rules; distance alone is not a
 guarantee that a particular farm runs. Distant Horizons does not extend simulation.
 These are starting points, not validated maxima for arbitrary worlds or players.
-The [tuning comparison](../reports/2026-11-09-server-tuning.md) evaluates ways to
+The [tuning comparison](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-server-tuning.md) evaluates ways to
 improve the 24/10 workload without reducing simulation distance.
 
 View 32 remained comfortable while stationary in the test world, but increased
@@ -85,14 +85,14 @@ particularly for memory; a small 8–12 view is not an inherent requirement of
 this phone. The client's render distance must also permit the desired view.
 The UI exposes the larger range without silently changing existing settings.
 
-The [distance benchmark](../reports/2026-11-09-chunk-distances.md) now measures a simulated connected
+The [distance benchmark](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-chunk-distances.md) now measures a simulated connected
 player, stationary play and repeated movement into new terrain. It uses
 disposable worlds and leaves production settings unchanged. Its limits matter:
 there is no rendered client, player-built base, farm, combat or multi-player
 workload, and the unplugged vendor-current comparison is a relative proxy
 without calibrated electrical units.
 It establishes neither a universal gameplay maximum nor a battery-life curve.
-The [earlier measurements](../reports/2026-11-08-power-baseline.md) cover heap sizes and idle policies.
+The [earlier measurements](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-08-power-baseline.md) cover heap sizes and idle policies.
 
 The benchmark also confirms that raising the vanilla configuration to 256
 does not bypass the effective view-distance clamp. Detailed measurements belong

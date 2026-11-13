@@ -1,0 +1,137 @@
+#!/usr/bin/python3
+"""Replicate completed local world snapshots to a dedicated Google Drive folder."""
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'lib'/'n20'))
+import backup_wake
+
+REPO = Path('/srv/backups/world-history')
+PASS = Path('/etc/n20-backup.pass')
+CONFIG = Path('/etc/n20-drive/rclone.conf')
+META = Path('/var/lib/n20')
+RUN = Path('/run/n20')
+BASE = Path('/srv/backups')
+REMOTE = 'minecraft_drive:Minecraft Server'
+RESTIC = '/usr/bin/restic'
+RCLONE = '/usr/bin/rclone'
+HEX = re.compile(r'^[0-9a-f]{64}$')
+SOURCES = {'/srv/backups/.n20-staging/world', '/srv/minecraft/world'}
+MIN_FREE = 10 * 1024**3
+RETRY_INTERVAL = 15 * 60
+FALLBACK_INTERVAL = 24 * 3600
+
+
+def run(args, *, input_data=None, timeout=3600):
+    result = subprocess.run(args, input=input_data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=timeout)
+    if result.returncode:
+        # Avoid logging paths from the world or remote output, which may be private.
+        raise RuntimeError(f'{Path(args[0]).name} failed (exit {result.returncode})')
+    return result.stdout
+
+
+def restic(*args):
+    return run([RESTIC, '-r', str(REPO), '--password-file', str(PASS), '--no-cache', *args])
+
+
+def rclone(*args, input_data=None):
+    return run([RCLONE, '--config', str(CONFIG), '--low-level-retries', '3',
+                '--transfers', '2', '--checkers', '4', '--bwlimit', '2M', *args], input_data=input_data)
+
+
+def check_tree(root):
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError('Restored world directory is unavailable')
+    for directory, names, files in os.walk(root, followlinks=False):
+        for name in names + files:
+            path = Path(directory) / name
+            if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                raise RuntimeError('Snapshot contains a link or unsupported file')
+
+
+def backup_once():
+    if not CONFIG.is_file() or not PASS.is_file():
+        raise RuntimeError('Backup configuration or repository password is missing')
+    if shutil.disk_usage(BASE).free < MIN_FREE:
+        raise RuntimeError('Less than 10 GiB free; Drive backup postponed')
+    META.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (META / 'drive-backup.lock').open('a') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('Drive backup already running')
+        snapshots = json.loads(restic('snapshots', '--json'))
+        if not snapshots: raise RuntimeError('No local snapshots available')
+        state_path = META / 'drive-backup-last.json'
+        try: previous = json.loads(state_path.read_text())
+        except (FileNotFoundError, ValueError): previous = {}
+        prev = previous.get('snapshot', '')
+        uploaded = set(previous.get('uploaded', []))
+        if isinstance(prev, str) and HEX.fullmatch(prev): uploaded.add(prev)
+        snapshots.sort(key=lambda s: datetime.datetime.fromisoformat(s['time'].replace('Z', '+00:00')))
+        count = 0
+        failures = 0
+        for item in snapshots:
+            snap, paths = item.get('id', ''), item.get('paths')
+            if not isinstance(snap, str) or not HEX.fullmatch(snap) or not isinstance(paths, list) or len(paths) != 1 or paths[0] not in SOURCES:
+                failures += 1; continue
+            if snap in uploaded: continue
+            try:
+                with tempfile.TemporaryDirectory(prefix='.n20-drive-stage-', dir=BASE) as temporary:
+                    restic('restore', snap, '--target', temporary, '--verify')
+                    world = Path(temporary) / paths[0].lstrip('/')
+                    check_tree(world)
+                    dest = f'{REMOTE}/snapshots/{snap}/world'
+                    args = ['copy', str(world), dest, '--checksum', '--create-empty-src-dirs']
+                    if isinstance(prev, str) and HEX.fullmatch(prev):
+                        args += ['--copy-dest', f'{REMOTE}/snapshots/{prev}/world']
+                    if shutil.disk_usage(BASE).free < MIN_FREE:
+                        raise RuntimeError('Insufficient free space after restore')
+                    rclone(*args)
+                    rclone('check', str(world), dest, '--checksum')
+                    marker = json.dumps({'snapshot': snap, 'source_time': item['time'],
+                                         'completed_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}) + '\n'
+                    rclone('rcat', f'{REMOTE}/snapshots/{snap}/COMPLETE.json', input_data=marker)
+                uploaded.add(snap)
+                prev = snap
+                temporary_state = META / '.drive-backup-last.tmp'
+                with temporary_state.open('w') as out:
+                    os.chmod(temporary_state, 0o600)
+                    json.dump({'snapshot': snap, 'uploaded': sorted(uploaded)}, out)
+                    out.flush(); os.fsync(out.fileno())
+                os.replace(temporary_state, state_path)
+                count += 1
+            except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                failures += 1
+        if failures: raise RuntimeError(f'{failures} snapshot(s) could not be copied or verified')
+        return f'{count} snapshot(s) copied and verified' if count else 'Already uploaded'
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ('once', 'scheduler'):
+        raise SystemExit('Usage: n20-drive-backup once|scheduler')
+    if sys.argv[1] == 'once':
+        print(backup_once()); return
+    os.nice(10)
+    wake=backup_wake.waiter(RUN,'drive')
+    try:
+        while True:
+            timeout=FALLBACK_INTERVAL
+            try:
+                result = backup_once()
+                if result != 'Already uploaded': print(result, flush=True)
+            except Exception as exc:
+                print(f'Drive backup postponed: {exc}', file=sys.stderr, flush=True)
+                timeout=RETRY_INTERVAL
+            wake.wait(timeout)
+    finally: wake.close()
+
+
+if __name__ == '__main__': main()

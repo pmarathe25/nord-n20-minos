@@ -4,6 +4,7 @@ import datetime as dt
 import fcntl
 import ipaddress
 import json
+import math
 import os
 import pwd
 import re
@@ -18,6 +19,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'lib'/'n20'))
+import backup_wake
 
 ROOT = Path('/srv/minecraft')
 BUNDLE = Path('/opt/n20-minecraft/current')
@@ -54,6 +57,8 @@ MIN_FREE = 10 * 1024**3
 MAX_REPO = 20 * 1024**3
 NORMAL_INTERVAL = 15 * 60
 BUSY_INTERVAL = 5 * 60
+IDLE_INTERVAL = 24 * 3600
+IDLE_RETRY = 15 * 60
 NAME = re.compile(r'[A-Za-z0-9_]{3,16}\Z')
 HEX = re.compile(r'[0-9a-f]{8,64}\Z')
 
@@ -388,6 +393,8 @@ def create_snapshot(tag, source=None, live=False):
     if live: args += ['--tag', 'live']
     args += ['--exclude', 'session.lock', str(source)]
     run_restic(args)
+    try: backup_wake.signal(RUN,'drive')
+    except OSError: pass  # A missed wake is recovered by the periodic scan.
     return refresh_cache()
 
 def run_backup_copy(cmd, timeout=300):
@@ -476,12 +483,14 @@ def backup(scheduled=False):
     if low_battery_held(): raise AdminError('Battery low; backup postponed')
     if shutil.disk_usage('/srv').free < MIN_FREE: raise AdminError('Less than 10 GiB free; backup postponed')
     started=time.monotonic()
+    pending_id,_=pending_save()
     try:
         copied_signature=copy_quiescent_world()
         create_snapshot('auto' if scheduled else 'manual', STAGE_WORLD, live=True)
         atomic(LAST,str(int(time.time()))+'\n')
         atomic(LAST_SIG,json.dumps(copied_signature,separators=(',',':'))+'\n')
         atomic(META/'last-backup-seconds',str(round(time.monotonic()-started,2))+'\n')
+        acknowledge_save(pending_id)
     finally:
         clear_stage()
     # Never force a player disconnect; defer expensive pruning until no players are online.
@@ -762,37 +771,99 @@ def locked(action):
         try: action()
         finally: OP.unlink(missing_ok=True)
 
+def close_inherited_operation_lock():
+    # A scheduler launched from another management operation can inherit that
+    # operation's flock and otherwise block every later backup indefinitely.
+    try: target=LOCK.stat()
+    except FileNotFoundError: return
+    for entry in Path('/proc/self/fd').iterdir():
+        try:
+            fd=int(entry.name)
+            if fd <= 2: continue
+            info=os.fstat(fd)
+            if (info.st_dev,info.st_ino)==(target.st_dev,target.st_ino): os.close(fd)
+        except (OSError,ValueError): continue
+
+def pending_save():
+    try:
+        event=json.loads(read(META/'pending-save-event.json','{}'))
+        ident=event.get('id',''); when=float(event.get('time',0))
+        if isinstance(ident,str) and HEX.fullmatch(ident) and math.isfinite(when) and when>0:
+            return ident,when
+    except (ValueError,TypeError,AttributeError): pass
+    return '',0
+
+def acknowledge_save(ident):
+    if not ident: return
+    with (META/'pending-save.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if pending_save()[0]==ident: (META/'pending-save-event.json').unlink(missing_ok=True)
+
 def scheduler(once=False):
     lower_priority()
     directories()
-    last_event_seen=0
-    while True:
+    close_inherited_operation_lock()
+    wake=None if once else backup_wake.waiter(RUN,'scheduler')
+    idle_next=None
+    last_activity=read(RUN/'player-activity','')
+    try:
+      while True:
+        timeout=20
         try:
             if time.time() > 1704067200 and not restore_held() and not low_battery_held():
-                try: event=json.loads(read(SAVE_EVENT,'{}')); event_time=float(event.get('time',0))
-                except (ValueError,TypeError): event={}; event_time=0
-                if (event_time > last_event_seen and -5 <= time.time()-event_time <= 120
-                    and event.get('server_pid')==int(read(PID,'0'))):
-                    # The notification can precede asynchronous writes. Allow them
-                    # to settle, then back up only if the on-disk world changed.
-                    last_event_seen=event_time
+                pending_id,pending_event_time=pending_save()
+                try: online=online_count(mc_status())
+                except (OSError,ValueError,EOFError,IndexError): online=None
+                now_mono=time.monotonic()
+                activity=read(RUN/'player-activity','')
+                activity_changed=bool(activity and activity!=last_activity)
+                if activity_changed: last_activity=activity
+                idle_check=False
+                if online==0:
+                    if idle_next is None or activity_changed:
+                        idle_next=now_mono+60
+                    idle_check=now_mono>=idle_next
+                else:
+                    idle_next=None
+                allow_event=bool(pending_event_time) and (online!=0 or idle_check)
+                if allow_event or idle_check:
                     try: last=int(read(LAST,'0'))
                     except ValueError: last=0
                     try: old=json.loads(read(LAST_SIG,'{}'))
                     except (ValueError,TypeError): old={}
                     current=world_signature()
                     changes=changed_files(old,current)
-                    try: online=online_count(mc_status())
-                    except (OSError,ValueError,EOFError,IndexError): online=None
                     # At least 8 changed files signals heavier write activity.
                     interval=BUSY_INTERVAL if changes>=8 else NORMAL_INTERVAL
-                    if online==0 and changes>0: interval=60
-                    if changes>0 and event_time>last and time.time()-last>=interval:
-                        try: locked(lambda:backup(scheduled=True))
-                        except AdminError as exc: set_error(exc)
-        except Exception as exc: set_error('Backup scheduler: '+str(exc))
+                    if online==0: interval=60
+                    attempted=False
+                    if changes>0 and (idle_check or (allow_event and pending_event_time>last)) and time.time()-last>=interval:
+                        attempted=True
+                        try:
+                            locked(lambda:backup(scheduled=True))
+                            acknowledge_save(pending_id)
+                            if online==0:
+                                idle_next=time.monotonic()+IDLE_INTERVAL
+                        except AdminError as exc:
+                            set_error(exc)
+                            if online==0:
+                                idle_next=time.monotonic()+IDLE_RETRY
+                    if idle_check and not attempted:
+                        if changes>0 and time.time()-last<interval:
+                            idle_next=time.monotonic()+max(1,interval-(time.time()-last))
+                        else:
+                            idle_next=time.monotonic()+IDLE_INTERVAL
+                if online==0 and idle_next is not None:
+                    timeout=max(0,idle_next-time.monotonic())
+            else: timeout=300
+        except Exception as exc:
+            set_error('Backup scheduler: '+str(exc))
+            if idle_next is not None:
+                idle_next=time.monotonic()+IDLE_RETRY;timeout=IDLE_RETRY
         if once: return
-        time.sleep(20)
+        wake.wait(timeout)
+    finally:
+        if wake is not None: wake.close()
 
 def low_battery_pause():
     if restore_held() or low_battery_held() or not pid_running() or STOP.exists(): return

@@ -99,7 +99,7 @@ Indicator tests cover every page and form, changing/unavailable telemetry,
 header-only repaint parity, and no reads or added wake deadline while asleep.
 The existing administration and Wi-Fi security tests validate the unchanged
 backend contracts. Dated test and deployment results belong in
-[the verification report](../reports/2026-11-09-ui-verification.md).
+[the verification report](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-ui-verification.md).
 
 To render review frames without opening DRM, connecting to a network or running
 server commands:

@@ -157,9 +157,11 @@ the discrepancy but does not prove semantic equivalence. These builds used the
 phone's own compiler and libraries and are
 not an independent integrity verification of the toolchain or vendor binaries.
 
-The dashboard has four direct tabs: Server, Players, World, and Phone. Server
-contains status, the join address, lifecycle controls, inline game settings,
-and a Log button. Players opens the whitelist, with an Online view alongside.
+The dashboard has five direct tabs: Server, Players, World, Wiki, and Phone. Wiki
+shows the assistant's model status, request progress, waiting queue, and recent
+question-and-answer history. Server contains status, the join address,
+lifecycle controls, inline game settings, and a paged Log view. Players opens
+the whitelist, with an Online view alongside.
 World opens backup history and restore. Phone combines Wi-Fi, brightness and
 screen sleep. A persistent top bar shows battery percentage, charging, Wi-Fi
 connection state, and battery temperature on every page and form. Its reads
@@ -167,9 +169,10 @@ reuse the existing awake cadence and stop while the screen is off. Only changed
 indicator rows repaint on otherwise static pages. Existing display power and
 Wi-Fi power policy behavior is unchanged.
 Confirmation buttons recheck current data and, for stop/restart, the server
-process identity. On Wi-Fi send failure the password form stays open.
+process identity. Failed server actions show the helper's reason, such as
+another operation already being in progress. On Wi-Fi send failure the password form stays open.
 See [UI design and validation](ui.md) for navigation and fixtures, and the
-[dated verification report](../reports/2026-11-09-ui-verification.md) for
+[dated verification report](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-ui-verification.md) for
 deployment checks and short screen-off activity measurements.
 
 A live listener check found Minecraft's management port bound to the IPv4
@@ -263,7 +266,18 @@ loopback, key-only SSH enabled, and the Java process running as the Minecraft
 user with an empty capability bounding set and `no_new_privs`. This is a
 point-in-time check, not a guarantee about later configuration changes.
 
-The updated dashboard uses the power button to wake the panel after powering it down. It reopens the DRM connection to make the panel visible again; touch does not wake a powered-down panel. If power-down fails, the dashboard falls back to zero brightness with touch wake. In either case a 150 ms guard follows display wake. This version was installed and physically tested on the device; see [the power baseline](../reports/2026-11-08-power-baseline.md). Power usage, OLED wear, multiplayer load, and fully depleted-battery startup have not been characterized. A normal reboot restored Wi-Fi, the server and USB MTP. On unplugged reboots Wi-Fi and the dashboard returned, but the clock required operator correction before the server could start; see the timekeeper notes below. Wi-Fi internet, DNS and NTP also worked with USB networking temporarily disabled.
+The updated dashboard uses the power button to wake the panel after powering it down. It reopens the DRM connection to make the panel visible again; touch does not wake a powered-down panel. If power-down fails, the dashboard falls back to zero brightness with touch wake. In either case a 150 ms guard follows display wake. This version was installed and physically tested on the device; see [the power baseline](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-08-power-baseline.md). Power usage, OLED wear, multiplayer load, and fully depleted-battery startup have not been characterized. A normal reboot restored Wi-Fi, the server and USB MTP. On unplugged reboots Wi-Fi and the dashboard returned, but the clock required operator correction before the server could start; see the timekeeper notes below. Wi-Fi internet, DNS and NTP also worked with USB networking temporarily disabled.
+
+## Swap
+
+The phone has a root-owned, mode-600, 6 GiB swap file at
+`/var/lib/n20/swapfile` on userdata. The supervisor invokes
+`n20-swap-start` on startup; it validates the file and activates it without
+creating or reformatting it. The helper sets swappiness to 10. Removing or
+replacing the swap file while it is active is unsafe; disable it first and
+allow time for its contents to return to RAM. Swap uses flash storage and can
+increase I/O latency and writes. The Wiki launcher uses a swap-aware emergency
+RAM guard; using the model under memory pressure can affect gameplay.
 
 ## Development dependencies
 
@@ -385,6 +399,65 @@ server availability still require operator attention.
 
 ## Backups and USB
 
+The optional `n20-drive-backup` service copies completed local Restic world
+snapshots into `Minecraft Server/snapshots/<snapshot-id>/world` in Google
+Drive. It restores to a private temporary directory, rejects symlinks and
+unsupported files, uploads with rclone, and checks the entire copy before
+writing `COMPLETE.json`. A directory without that marker is incomplete and
+must not be used for recovery. A background process is notified when a local
+snapshot is created and copies retained local snapshots it has not already
+copied. It also performs a daily fallback scan; failures retry after 15 minutes.
+Unchanged files are copied within Drive where possible. `n20-drive-backup once`
+requests an immediate scan. A snapshot pruned before a scan can be missed. It
+does not force a Minecraft save or make the
+underlying snapshot atomic. Cloud copies are readable files, not encrypted
+archives; their original Unix ownership and all metadata are not preserved.
+
+Cloud copies are independent of the dashboard's local restore list. To recover,
+download a completed snapshot's `world` directory to an isolated location and
+inspect it before replacing anything; stop the server and preserve the current
+world and local Restic repository first. A single file was downloaded and
+compared with its source after the initial upload; a full cloud recovery has
+not been tested. Cloud snapshots are not automatically deleted, so they will
+consume increasing Drive quota, including server-side copies of unchanged
+files. Monitor capacity and review old snapshots before removing them.
+
+The phone's root-only `/etc/n20-drive/rclone.conf` contains a Google OAuth
+refresh token and must stay outside Git and shared logs. The configured
+`drive.file` grant allows access to files the app creates and files explicitly
+selected for it. It does not enforce a single-folder boundary; do not grant
+the broader `drive` scope. A separate Google account with access only to a
+shared backup folder provides a stronger boundary around the owner's other
+Drive files. The local Restic repository and its password still require
+separate off-device protection. The public OAuth homepage and privacy policy
+are hosted from the `codex/minecraft-backup-pages` GitHub Pages branch until
+the page changes are integrated into the main branch and Pages is repointed.
+
+The save monitor persists the latest save notification in root-only
+`/var/lib/n20/pending-save-event.json`. The scheduler retains it through
+failures and restarts until a snapshot succeeds; it clears only the notification
+it observed before that snapshot, so a newer notification is not lost. Manual
+world snapshots acknowledge notifications observed before their copy as well. When
+no players have been observed for at least 60 seconds, the scheduler also
+checks for changed on-disk world files independently of notifications. After
+the first successful snapshot or unchanged check in an empty period, it checks
+at most once every 24 hours until player activity resumes. A failed idle
+snapshot retries after 15 minutes. Unchanged files do not trigger a snapshot;
+metadata changes can still count as changes. The status query must establish
+zero players for this idle path. Both backup workers wait on kernel file
+events rather than polling while idle. Separate event channels keep player and
+save notifications from waking the Drive worker; a newly completed snapshot wakes
+the Drive worker. If inotify is unavailable, the workers fall
+back to polling with a maximum five-minute wait. These checks do not force a Minecraft save
+and cannot capture changes that remain only in server memory. At startup the
+scheduler closes any inherited descriptor for its own operation lock,
+preventing an inherited lock from blocking later backups.
+
+The save monitor also records player-join activity, so a brief visit can restart
+the one-minute idle check even if the player has already left by the next
+status query. If monitoring misses a visit, the daily changed-file check remains
+a fallback; it cannot recover changes Minecraft never wrote to disk.
+
 Retention keeps the latest 24 automatic snapshots, the latest automatic snapshot
 in each of the last 14 days with snapshots, and the latest automatic snapshot
 in every week with snapshots indefinitely. All manual snapshots are retained;
@@ -395,7 +468,7 @@ online. The 20 GiB repository threshold and 10 GiB free-space reserve still
 postpone new backups, so indefinite retention requires storage monitoring and
 eventual capacity or policy decisions.
 
-`n20-save-events` watches the local Minecraft management API. `n20-admin` schedules low-priority Restic snapshots after ordinary save events and checks for quiet files; it does not force a server save for automatic backups. This reduces, but does not eliminate, inconsistent online copies. The quiet-file check includes directory entries, symlinks, permissions and change timestamps as well as file sizes and modification times. An updated signature format can cause one additional snapshot after upgrade. The copier pins the world root directory, rejects a symlink at that path, and aborts if the root is replaced during copying. The copy runs as the Minecraft account without capabilities in a private mount namespace; it cannot copy files the account cannot read. The pre-restore checkpoint uses the same copy path. This requires `/usr/local/sbin/n20-backup-copy`, `unshare`, `setpriv` and mount-namespace support; if they are unavailable, the backup fails rather than falling back to a root copy. A compromised game process can still alter the world data it owns. A read-only phone check on 2026-11-08 found no unreadable regular files, unsearchable directories, or nested mounts in the current world; it did not create a live backup. Restic history is local to `/srv/backups/world-history` and uses the separate `/etc/n20-backup.pass`; keep both off-device for disaster recovery. Automatic Google Drive replication is not configured. Restore staging and retained pre-restore worlds are kept under root-only `/srv/backups/.n20-restore` on the same filesystem as the world; keep retained worlds until their recovery value has been assessed. New restore holds are recorded in root-only `/var/lib/n20/restore-hold`; the supervisor also honors a legacy `/srv/minecraft/.n20-restore-hold` until an operator resolves it. If either exists after an interruption, retain the hold and inspect its recorded recovery paths before resuming the server. The low-battery hold is likewise kept in `/var/lib/n20/low-battery-hold`; a legacy hold in the server directory is still honored and cleared only when the charging threshold is met. Previous preferences were direct phone-to-Drive incremental backups using the owner's Google Cloud project, without an additional encrypted cloud archive.
+`n20-save-events` watches the local Minecraft management API. `n20-admin` schedules low-priority Restic snapshots after ordinary save events or changed-file checks while idle and checks for quiet files; it does not force a server save for automatic backups. This reduces, but does not eliminate, inconsistent online copies. The quiet-file check includes directory entries, symlinks, permissions and change timestamps as well as file sizes and modification times. An updated signature format can cause one additional snapshot after upgrade. The copier pins the world root directory, rejects a symlink at that path, and aborts if the root is replaced during copying. The copy runs as the Minecraft account without capabilities in a private mount namespace; it cannot copy files the account cannot read. The pre-restore checkpoint uses the same copy path. This requires `/usr/local/sbin/n20-backup-copy`, `unshare`, `setpriv` and mount-namespace support; if they are unavailable, the backup fails rather than falling back to a root copy. A compromised game process can still alter the world data it owns. A read-only phone check on 2026-11-08 found no unreadable regular files, unsearchable directories, or nested mounts in the current world; it did not create a live backup. Restic history is local to `/srv/backups/world-history` and uses the separate `/etc/n20-backup.pass`; keep both off-device for disaster recovery. Google Drive replication is described above. Restore staging and retained pre-restore worlds are kept under root-only `/srv/backups/.n20-restore` on the same filesystem as the world; keep retained worlds until their recovery value has been assessed. New restore holds are recorded in root-only `/var/lib/n20/restore-hold`; the supervisor also honors a legacy `/srv/minecraft/.n20-restore-hold` until an operator resolves it. If either exists after an interruption, retain the hold and inspect its recorded recovery paths before resuming the server. The low-battery hold is likewise kept in `/var/lib/n20/low-battery-hold`; a legacy hold in the server directory is still honored and cleared only when the charging threshold is met. Previous preferences were direct phone-to-Drive incremental backups using the owner's Google Cloud project, without an additional encrypted cloud archive.
 
 `n20-mtp-start` adds an MTP function to the existing USB ACM/NCM gadget. It requires the compiled `n20-mtp-sandbox` and `n20-mtp-refresh` in `/usr/local/sbin`, plus the patched responder at `/usr/local/lib/n20/umtprd`; install all three before updating the startup script. The sandbox fails closed if the patched responder is missing. Build instructions, source provenance and rollback guidance are in [the responder patch notes](../third_party/umtp-responder/README.md). The sandbox starts the responder under reserved numeric UID and GID 61123, a private network and mount namespace, a read-only chroot, `no_new_privs`, and only `CAP_DAC_OVERRIDE`. When the world directory is replaced, the monitor withdraws the old export and the refresh helper reconnects MTP after a safe replacement appears. This briefly resets USB networking. A disposable-world test confirmed that Windows re-enumerated the replacement; an in-progress copy is not a consistent snapshot. A game process that is already compromised can still expose files it owns by deliberately hard-linking or copying them into the world; the sandbox does not protect against that. The UID and GID must not be assigned to another account.
 

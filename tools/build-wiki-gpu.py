@@ -17,7 +17,7 @@ import tarfile
 
 REVISION = 'cd959bae99ff4bed22bef2604f45241c09bbb8c8'  # llama.cpp b12110
 ROOT = Path(__file__).resolve().parents[1]
-EXPERIMENTS = ROOT / 'wiki' / 'experiments'
+GPU_INPUTS = ROOT / 'wiki' / 'gpu-worker'
 PATCHES = (
     'llama-b12110-n20-opencl.patch',
     'llama-b12110-n20-activation-image.patch',
@@ -69,8 +69,8 @@ def main():
         archive.extractall(src, filter='data')
     snapshot.unlink()
     for patch in PATCHES:
-        run('git', '-C', src, 'apply', '--check', EXPERIMENTS / patch)
-        run('git', '-C', src, 'apply', EXPERIMENTS / patch)
+        run('git', '-C', src, 'apply', '--check', GPU_INPUTS / patch)
+        run('git', '-C', src, 'apply', GPU_INPUTS / patch)
     build = output / 'build'
     cmake_args = [args.cmake, '-S', src, '-B', build, '-G', 'Ninja',
                   '-DCMAKE_TOOLCHAIN_FILE=' + str(ndk / 'build/cmake/android.toolchain.cmake'),
@@ -98,10 +98,10 @@ def main():
         shutil.copy2(build / 'bin' / name, binary_dir / name)
     shutil.copy2(src / 'LICENSE', bundle / 'llama.cpp-LICENSE')
     for name in KERNELS:
-        shutil.copy2(EXPERIMENTS / name, kernel_dir / name)
+        shutil.copy2(GPU_INPUTS / name, kernel_dir / name)
     (kernel_dir / 'n20-q2-prefill-64.cl').write_bytes(
-        b'#define N20_PARTIAL 64\n' + (EXPERIMENTS / 'n20-q2-prefill.cl').read_bytes())
-    manifest = {'upstream_revision': REVISION, 'patches_sha256': {p: digest(EXPERIMENTS / p) for p in PATCHES},
+        b'#define N20_PARTIAL 64\n' + (GPU_INPUTS / 'n20-q2-prefill.cl').read_bytes())
+    manifest = {'upstream_revision': REVISION, 'patches_sha256': {p: digest(GPU_INPUTS / p) for p in PATCHES},
                 'bundle_sha256': {str(p.relative_to(bundle)).replace(os.sep, '/'): digest(p)
                                   for p in sorted(bundle.rglob('*')) if p.is_file()},
                 'note': 'Build inputs and staged files only; device runtime, firmware and model are not included.'}

@@ -24,7 +24,7 @@ The existing Java runtime is 25. Start with its default collector and the
 current 512 MiB initial / 2 GiB maximum heap, then compare specific changes.
 For the measured one-player terrain workload, four-processor pool sizing
 improves the CPU/tail-latency tradeoff; adding Lithium provides a smaller
-additional improvement. See the [tuning report](../reports/2026-11-09-server-tuning.md)
+additional improvement. See the [tuning report](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-server-tuning.md)
 before applying those results to a different world or version.
 [Java's collector guide](https://docs.oracle.com/en/java/javase/25/gctuning/available-collectors.html)
 describes the throughput/latency tradeoffs. Avoid importing large collections
@@ -71,5 +71,5 @@ LOD delivery. The repository's headless client tests normal Minecraft server
 work and optional-client compatibility; it does not request or render DH LODs.
 
 See [distance guidance](chunk-distances.md), [benchmark instructions](benchmarking.md)
-and [dated measurement reports](../reports/README.md). Keep results and version
+and [dated measurement reports](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/README.md). Keep results and version
 pins in reports; retain only operating guidance here.

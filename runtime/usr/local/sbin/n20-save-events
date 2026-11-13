@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Watch the local Minecraft management socket for completed world saves."""
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -8,14 +9,19 @@ import secrets
 import socket
 import stat
 import struct
+import sys
+import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'lib'/'n20'))
+import backup_wake
 
 RUN=Path('/run/n20')
 PID=Path('/run/minecraft.pid')
 PROPS=Path('/srv/minecraft/server.properties')
 EVENT=RUN/'save-event.json'
 PLAYERS=RUN/'players.json'
+META=Path('/var/lib/n20')
 GUID='258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 def secret():
@@ -126,13 +132,32 @@ def record(event):
     RUN.mkdir(mode=0o700,parents=True,exist_ok=True)
     try: serverpid=int(PID.read_text().strip())
     except (OSError, ValueError): serverpid=0
-    content=json.dumps({'time':time.time(),'monotonic':time.monotonic(),'server_pid':serverpid,'event':event})+'\n'
+    content=json.dumps({'id':secrets.token_hex(16),'time':time.time(),'monotonic':time.monotonic(),'server_pid':serverpid,'event':event})+'\n'
+    META.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (META/'pending-save.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        fd,name=tempfile.mkstemp(prefix='.pending-save-',dir=META)
+        try:
+            os.fchmod(fd,0o600)
+            with os.fdopen(fd,'w',encoding='utf-8') as out:
+                out.write(content);out.flush();os.fsync(out.fileno())
+            os.replace(name,META/'pending-save-event.json')
+        finally:
+            if os.path.exists(name): os.unlink(name)
     temp=RUN/('save-event.'+str(os.getpid())+'.tmp')
     temp.write_text(content,encoding='utf-8'); os.chmod(temp,0o600); os.replace(temp,EVENT)
+    try: backup_wake.signal(RUN,'scheduler')
+    except OSError: pass
     print('Minecraft save completed; queued event',flush=True)
 
 def query_players(sock):
     send_frame(sock,b'{"jsonrpc":"2.0","id":2,"method":"minecraft:players"}')
+
+def record_activity():
+    RUN.mkdir(mode=0o700,parents=True,exist_ok=True)
+    temp=RUN/('player-activity.'+str(os.getpid())+'.tmp')
+    temp.write_text(secrets.token_hex(16)+'\n',encoding='ascii')
+    os.chmod(temp,0o600);os.replace(temp,RUN/'player-activity')
 
 def record_players(result):
     if not isinstance(result,list): return
@@ -140,9 +165,17 @@ def record_players(result):
     try: serverpid=int(PID.read_text().strip())
     except (OSError,ValueError): serverpid=0
     names=[x.get('name') for x in result if isinstance(x,dict) and isinstance(x.get('name'),str)]
+    try:
+        old=json.loads(PLAYERS.read_text(encoding='utf-8'))
+        changed=old.get('server_pid')!=serverpid or len(old.get('players',[]))!=len(names)
+    except (OSError,ValueError,TypeError,AttributeError): changed=True
+    if changed and names: record_activity()
     content=json.dumps({'time':time.time(),'server_pid':serverpid,'players':names})+'\n'
     temp=RUN/('players.'+str(os.getpid())+'.tmp')
     temp.write_text(content,encoding='utf-8');os.chmod(temp,0o600);os.replace(temp,PLAYERS)
+    if changed:
+        try: backup_wake.signal(RUN,'scheduler')
+        except OSError: pass
     print('Updated connected player list: '+str(len(names)),flush=True)
 
 def valid_message(message):
@@ -163,6 +196,10 @@ def main():
                     method=message.get('method')
                     if method=='minecraft:notification/server/saved': record('saved')
                     if message.get('id')==2 and 'result' in message: record_players(message['result'])
+                    if method=='minecraft:notification/players/joined': record_activity()
+                    if method in ('minecraft:notification/players/joined','minecraft:notification/players/left','minecraft:notification/server/started'):
+                        try: backup_wake.signal(RUN,'scheduler')
+                        except OSError: pass
                     if method in ('minecraft:notification/players/joined','minecraft:notification/players/left','minecraft:notification/server/started') or (method=='minecraft:notification/server/status' and time.monotonic()-last_query>=30):
                         query_players(sock);last_query=time.monotonic()
         except (OSError,ValueError,EOFError,RecursionError) as exc:
