@@ -33,16 +33,22 @@ class WikiResourcePolicyTests(unittest.TestCase):
             self.assertFalse(allowed(4000000, 400, 3670016))
             self.assertFalse(allowed(4000000, "bad", 3670016))
             self.assertFalse(allowed(None, 200, 3670016))
-            memory.write_text("MemAvailable: 262144 kB\nSwapFree: 2097152 kB\n")
+            memory.write_text("MemAvailable: 344064 kB\nSwapFree: 2097152 kB\n")
             self.assertEqual(subprocess.run(["sh", "-c", functions + "\nmodel_start_memory_ok"],
                                             check=False).returncode, 0)
-            memory.write_text("MemAvailable: 262143 kB\nSwapFree: 2097152 kB\n")
+            memory.write_text("MemAvailable: 344063 kB\nSwapFree: 2097152 kB\n")
             self.assertNotEqual(subprocess.run(["sh", "-c", functions + "\nmodel_start_memory_ok"],
                                                check=False).returncode, 0)
-            memory.write_text("MemAvailable: 131072 kB\nSwapFree: 524288 kB\n")
+            memory.write_text("MemAvailable: 212992 kB\nSwapFree: 524288 kB\n")
             self.assertEqual(subprocess.run(["sh", "-c", functions + "\nmodel_running_memory_ok"],
                                             check=False).returncode, 0)
-            memory.write_text("MemAvailable: 131071 kB\nSwapFree: 524288 kB\n")
+            memory.write_text("MemAvailable: 212991 kB\nSwapFree: 524288 kB\n")
+            self.assertNotEqual(subprocess.run(["sh", "-c", functions + "\nmodel_running_memory_ok"],
+                                               check=False).returncode, 0)
+            memory.write_text("MemAvailable: 1003520 kB\nSwapFree: 0 kB\n")
+            self.assertEqual(subprocess.run(["sh", "-c", functions + "\nmodel_running_memory_ok"],
+                                            check=False).returncode, 0)
+            memory.write_text("MemAvailable: 1003519 kB\nSwapFree: 0 kB\n")
             self.assertNotEqual(subprocess.run(["sh", "-c", functions + "\nmodel_running_memory_ok"],
                                                check=False).returncode, 0)
 

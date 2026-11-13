@@ -32,6 +32,11 @@ name and accept common plural forms. A narrowly phrased question about a powered
 hopper pushing items is answered directly only when the relevant locked-hopper
 rules are present in the same Wiki section and revision. Other questions go to
 the local model.
+For explicit comparisons, if the initial retrieval has already reached its
+four-passage limit and contains at least 1,500 bytes of evidence, the bridge
+also retrieves the two named topics separately and adds distinct passages up
+to a bounded prompt size. Other Wiki requests keep their original retrieval
+path; this targeted expansion does not guarantee a better answer.
 The bridge broadcasts its answer and Wiki section link to the public chat
 through the existing server console FIFO. Private messages are not supported.
 The model can make factual mistakes
@@ -42,36 +47,61 @@ The same bridge also recognizes these commands at the start of a chat message:
 
 - `@pin <note>` saves the player's current position, dimension, and note.
 - `@pin_that <note>` saves the block cell the player is looking toward.
-- `@map` lists the shared saved locations in public chat.
-- `@find <query>` finds a saved location; the bridge returns its saved
-  coordinates. Simple requests with a unique literal match in a note can be
-  answered directly. A simple request that matches multiple notes is declined;
-  other requests go to the local model, which can also decline an ambiguous match.
+- `@map` lists all shared saved locations in public chat, sorted alphabetically
+  without regard to letter case. `@map <search>` finds every note containing
+  the complete search phrase, ignoring case. If no note matches, the local model
+  interprets the request. Add `?` at the end to use the model even when the
+  phrase matches. The older `@find <search>` remains an alias for searches.
 - `@help` lists these commands and `@wiki`.
+
+For each listed or matched location, the bridge also privately tells the
+requesting player an approximate direction and distance based on a fresh
+position, dimension and facing query immediately before each page of directions.
+No direction is given across dimensions. If the player cannot be queried, the
+bridge reports that privately. Large results are sent as multiple pages.
+
+For example, `@map village` lists every pin whose note contains the word
+"village"; `@map village?` asks the model to interpret the request instead.
+The whole search phrase must occur in a note for the direct match, so
+`@map village well` does not directly match "village with a well".
 
 Locations are shared by all players and stored in `world/n20-pins.json`, so
 world backups and restores include them. Marker and help replies are broadcast
 to public chat. Pin and map operations are queued in arrival order; a queued
 pin captures the player's position when its turn is processed, so remain at the
-location until the save confirmation. The limit is 40 pins with notes of up
-to 160 characters, with a smaller shared size limit so the complete list fits
-the model's context. The pin records the player's position when the server
-processes the request, not the block they are looking at. If the position or
-dimension cannot be read, no pin is saved. `@find` uses the Wiki model queue
-and resource limits when it needs the model; matching can select the wrong note.
+location until the save confirmation. The limit is 10,000 pins with notes of up
+to 160 characters. `@pin` records the player's position when the server
+processes the request. If the position or
+dimension cannot be read, no pin is saved. Direct `@map` matches can answer
+while the model is busy or unavailable; requests needing the model use the Wiki
+model queue and resource limits. The model sees notes and local identifiers,
+not coordinates; large maps are split into bounded chunks and every chunk is
+searched. The bridge accumulates the results and looks up coordinates itself.
+Many chunks can take a long time, and a failed chunk fails the search rather
+than presenting incomplete results. Matching can select the wrong note.
 Its prompt uses normal worker prompt caching, not a precomputed offline KV
-cache. The bridge and model must be enabled for these commands to work.
+cache. The bridge must be enabled for these commands to work.
 
-`@pin_that` samples the view ray every quarter block, up to 16 blocks, and
-saves the first non-air block cell. This is an approximation: it treats a
-block's whole cell as occupied, including glass, water, plants, and partial
-blocks such as slabs; it can also miss a cell crossed only briefly near an
-edge. It does not target entities. Unloaded or out-of-range blocks may not be
-found. If the player moves, turns, changes dimension, or the ray misses, no
-pin is saved. Keep looking at the target until the public confirmation; use
-`@pin` to save the player's own position instead. Each ray briefly creates an
-effect-free area cloud as a result marker and removes it; if interrupted, the
-cloud expires automatically after five seconds while loaded.
+`@pin_that` captures the player's eye position, facing and dimension as soon as
+the bridge processes the chat request. The vanilla chat log does not include
+the player's position or facing at the exact instant of the message, so a very
+quick movement before that capture can still affect the result. Once the
+server says the view was captured, the player may move or turn. The scan uses
+that fixed snapshot even if other pin requests are queued.
+
+The ray samples every half block for the first 16 blocks, then every four
+blocks up to 512. After a distant coarse hit, it resamples the preceding four
+blocks at half-block intervals. It saves the first sampled, loaded block cell that
+is not air or glass. It passes through clear, tinted and stained glass blocks
+and panes. This is an approximation: it treats a block's whole cell as occupied,
+including water, plants, and partial blocks such as slabs, and can miss cells
+crossed between coarse samples. A thin wall can be missed entirely and a block
+behind it pinned instead; refinement cannot recover a missed coarse hit. It
+does not target entities or force-load chunks, so visible but unavailable chunks
+may not be searchable. Longer scans issue more commands and can cause a delay
+or game tick stalls on the phone. If the capture or scan fails, no pin is saved.
+The capture briefly creates an effect-free area cloud at the player's eyes and
+removes it; if interrupted, the cloud expires after ten seconds while loaded.
 
 The bridge immediately acknowledges a valid question in public chat. It queues
 additional questions in arrival order, tells their senders they are queued,
@@ -96,11 +126,11 @@ searches cached pages only. The bridge caches up to 64 sourced replies in
 memory. Reusing a reply requires the same question and the same retrieved
 evidence, including the page revisions. The bridge pauses lookups at 40 °C
 battery temperature or above. Without at least 512 MiB of free swap, the
-bridge requires 900 MiB of available RAM; with swap available it requires
-128 MiB. The launcher normally waits for 3.5 GiB of available RAM, but permits
-startup with at least 256 MiB of available RAM and 2 GiB of free swap. It
-stops the worker if RAM falls below 128 MiB while at least 512 MiB of swap is
-free, or below 900 MiB otherwise, or if the battery reaches 40 °C. The bridge
+bridge requires 980 MiB of available RAM; with swap available it requires
+208 MiB. The launcher normally waits for 3.5 GiB of available RAM, but permits
+startup with at least 336 MiB of available RAM and 2 GiB of free swap. It
+stops the worker if RAM falls below 208 MiB while at least 512 MiB of swap is
+free, or below 980 MiB otherwise, or if the battery reaches 40 °C. The bridge
 remains available to acknowledge and queue questions while the worker is off.
 Swap can cause substantial storage traffic and gameplay stalls.
 
@@ -167,7 +197,13 @@ Install the files into root-controlled paths.
 | `/var/lib/n20-wiki/cache` | Parsed articles and SQLite index, mode 0700 owned by `minecraft` |
 | `/var/lib/n20-wiki/shaders/opencl` | OpenCL kernel cache, mode 0700 owned by UID and GID 61124 |
 
-The model serves one client slot over a local Unix socket. Its CPU threads
+The model serves one client slot over a local Unix socket with a 4,096-token
+context. A [workstation slot-state audit](../reports/2026-11-11-wiki-slot-state-size.md)
+estimated about 32 KiB of KV state per
+token for this model; increasing the context from 1,536 tokens may therefore
+require roughly 80 MiB more, excluding other runtime allocations. The higher
+memory guards provide additional reserve, but the actual phone cost and gameplay
+impact still need measurement. Its CPU threads
 are restricted to efficiency cores and run at reduced priority. It requests
 the OpenCL GPU explicitly and releases the model from memory after 90
 seconds of inactivity. A request that wakes the model pays the reload cost.
@@ -180,9 +216,11 @@ misses the reply cache may need more prefill. See the
 The bridge lets the worker generate through its normal end-of-generation token,
 so a blank line before the answer does not cut the reply short. It reads model
 output as it arrives and extracts the answer and its cited passage
-after the worker reports a normal stop. The bridge allows up to 75 seconds for
-the first text, 15 seconds between text updates, and 105 seconds total for
-the model request. The separate retrieval step can take up to 20 seconds.
+after the worker reports a normal stop. Ordinary Wiki prompts allow up to 75
+seconds for the first text, 15 seconds between text updates, and 105 seconds
+total for the model request. Longer prompts get additional first-text and total
+time; requests allowing longer output also get additional total time. Each
+retrieval step can take up to 20 seconds.
 When the model deadline expires, the bridge closes the connection and sends
 the player an unavailable message. See the [streaming deadline trial](../reports/2026-11-10-wiki-stream-deadline.md)
 for the phone comparison. The model worker has its own UID. The bridge runs

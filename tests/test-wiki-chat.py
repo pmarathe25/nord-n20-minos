@@ -66,6 +66,34 @@ def model_socket(handler, media_type=b"text/event-stream"):
 
 
 class WikiChatTests(unittest.TestCase):
+    def test_long_model_prompts_get_more_time_without_changing_short_deadlines(self):
+        import wiki_chat
+        short = {'messages': [{'role': 'user', 'content': 'question'}], 'max_tokens': 140}
+        long = {'messages': [{'role': 'user', 'content': 'x' * 3000}], 'max_tokens': 512}
+        self.assertEqual(wiki_chat.model_deadlines(short), (wiki_chat.MODEL_FIRST_REPLY_SECONDS, wiki_chat.MODEL_TOTAL_SECONDS))
+        first, total = wiki_chat.model_deadlines(long)
+        self.assertGreater(first, wiki_chat.MODEL_FIRST_REPLY_SECONDS)
+        self.assertGreater(total, wiki_chat.MODEL_TOTAL_SECONDS)
+
+    def test_extended_context_only_for_saturated_comparisons(self):
+        import wiki_chat
+        def passage(title, text):
+            return {'title': title, 'revision': 1, 'section': 'Usage', 'anchor': 'Usage', 'text': text}
+        base = [passage(f'Page {i}', ('evidence ' * 50) + str(i)) for i in range(4)]
+        other = passage('Second topic', 'Other comparison evidence.')
+        question = 'Compare iron swords with diamond swords'
+        with patch('wiki_chat.find_passages', side_effect=[[base[0]], [other]]) as find:
+            expanded = wiki_chat.expand_wiki_passages(SimpleNamespace(), question, base)
+        self.assertEqual(find.call_count, 2)
+        self.assertEqual(expanded[:4], base)
+        self.assertEqual(expanded[-1], other)
+        self.assertLessEqual(len(json.dumps(wiki_chat.chat_request_body(question, expanded)['messages'], ensure_ascii=False).encode('utf-8')), 3000)
+        with patch('wiki_chat.find_passages') as find:
+            small = base[:2]
+            self.assertIs(wiki_chat.expand_wiki_passages(SimpleNamespace(), question, small), small)
+            self.assertIs(wiki_chat.expand_wiki_passages(SimpleNamespace(), 'How does a hopper work?', base), base)
+            find.assert_not_called()
+
     def test_chat_acknowledges_and_processes_requests_in_order(self):
         from concurrent.futures import Future
 
@@ -187,7 +215,7 @@ class WikiChatTests(unittest.TestCase):
 
         def fixture(path, *args, **kwargs):
             if str(path) == "/proc/meminfo":
-                return "MemAvailable: 200000 kB\nSwapFree: 1000000 kB\n"
+                return "MemAvailable: 220000 kB\nSwapFree: 1000000 kB\n"
             if str(path) == "/sys/class/power_supply/battery/temp":
                 return "280\n"
             return original(path, *args, **kwargs)

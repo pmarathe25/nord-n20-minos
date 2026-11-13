@@ -106,7 +106,7 @@ and exact answers individually. Cache contents and parser revisions affect the
 result. `benchmark.py` exercises model answers; add `--bridge-exact` to take
 the bridge's exact-answer shortcut before consulting the model.
 
-For `@find`, start the same model with a local HTTP llama-server and run
+For `@map` searches, start the same model with a local HTTP llama-server and run
 `python3 wiki/benchmark-find.py --output /tmp/find-results.jsonl`. Its 116
 synthetic queries use the bridge's actual request body, invented pins, rotated
 positions, and labeled no-match cases. The script reports match and no-match

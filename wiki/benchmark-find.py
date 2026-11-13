@@ -1,4 +1,4 @@
-"""Score synthetic @find queries against a local llama-server.
+"""Score synthetic @map queries against a local llama-server.
 
 The locations are invented and never read the player's world. Scores measure
 selection and abstention, not semantic correctness beyond the fixture labels.
@@ -7,14 +7,13 @@ import argparse
 from collections import Counter
 import json
 from pathlib import Path
-import re
 import sys
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'runtime/usr/local/lib/n20'))
-from wiki_chat import exact_marker, marker_request_body
+from wiki_chat import direct_marker_indices, literal_marker_hits, marker_request_body, parse_marker_selection
 
 NOTES = [
     ('desert village by the well', 'desert village'),
@@ -77,8 +76,10 @@ def challenge_cases():
     for i, (notes, query, expected) in enumerate(CHALLENGE, 1):
         markers = [{'note': note, 'pos': [10 * n, 64, -10 * n],
                     'dimension': 'minecraft:overworld'} for n, note in enumerate(notes, 1)]
-        yield {'id': f'challenge-{i:02}', 'category': 'match' if expected else 'abstain',
-               'query': query, 'markers': markers, 'expected': expected}
+        _, hits = literal_marker_hits(markers, query)
+        expected_matches = [n + 1 for n in hits] if hits else ([expected] if expected else [])
+        yield {'id': f'challenge-{i:02}', 'category': 'match' if expected_matches else 'abstain',
+               'query': query, 'markers': markers, 'expected': expected, 'expected_matches': expected_matches}
 
 
 def cases():
@@ -111,10 +112,11 @@ def main():
     counts = Counter()
     with args.output.open('w', encoding='utf-8') as out:
         for case in (cases() if args.suite == 'standard' else challenge_cases()):
-            direct = exact_marker(case['markers'], case['query']) if args.bridge else None
+            expected = case.get('expected_matches', [case['expected']] if case['expected'] else [])
+            direct = direct_marker_indices(case['markers'], case['query']) if args.bridge else None
             if direct is not None:
-                selected = direct + 1
-                correct = selected == case['expected']
+                selected = [index + 1 for index in direct]
+                correct = sorted(selected) == sorted(expected)
                 counts[case['category']] += 1
                 counts[case['category'] + '_correct'] += correct
                 out.write(json.dumps({**case, 'raw': None, 'finish_reason': None,
@@ -127,12 +129,9 @@ def main():
             with urlopen(request, timeout=300) as response:
                 choice = json.load(response)['choices'][0]
             raw = choice['message']['content'] or ''
-            # Match the bridge's strict number parsing, including out-of-range replies.
-            value = raw.strip()
-            selected = int(value) if re.fullmatch(r'[0-9]{1,2}', value) else None
-            if selected is not None and not 0 <= selected <= len(case['markers']):
-                selected = None
-            correct = choice['finish_reason'] == 'stop' and selected == case['expected']
+            indices = parse_marker_selection(raw.strip(), len(case['markers']))
+            selected = None if indices is None else [index + 1 for index in indices]
+            correct = choice['finish_reason'] == 'stop' and selected is not None and sorted(selected) == sorted(expected)
             counts[case['category']] += 1
             counts[case['category'] + '_correct'] += correct
             out.write(json.dumps({**case, 'raw': raw, 'finish_reason': choice['finish_reason'],
