@@ -314,6 +314,7 @@ class MarkerTests(unittest.TestCase):
             self.capture_direction('Alex')
         self.assertTrue(any('Death 1: 5, 65, 10' in text for _, text, _ in self.replies))
         self.assertTrue(any('[Death] Directions:' in text for _, text, _ in self.replies))
+        self.assertTrue(any('compass: 5 blocks east, 10 blocks south, 1 block up' in text for _, text, _ in self.replies))
         self.assertTrue(all(not kwargs.get('broadcast') for _, _, kwargs in self.replies))
 
     def test_search_directions_include_nearest_landmark(self):
@@ -324,6 +325,24 @@ class MarkerTests(unittest.TestCase):
         self.capture_direction('Alex')
         private = [text for _, text, kw in self.replies if not kw.get('broadcast')]
         self.assertTrue(any('From village: 6 blocks east, 4 blocks north, 5 blocks up' in text for text in private))
+        self.assertTrue(any('compass: 10 blocks east, 10 blocks south, 6 blocks up' in text for text in private))
+
+    def test_search_omits_landmark_when_target_is_closest_to_player(self):
+        target = {'note': 'target', 'pos': [3, 64, 0], 'dimension': 'minecraft:overworld'}
+        other = {'note': 'village', 'pos': [10, 64, 0], 'dimension': 'minecraft:overworld'}
+        distant_dimension = {'note': 'nether', 'pos': [0, 64, 0], 'dimension': 'minecraft:the_nether'}
+        self.service.enqueue_listing('Alex', [target], [target, other, distant_dimension])
+        self.service.advance()
+        self.capture_direction('Alex')
+        private = '\n'.join(text for _, text, kw in self.replies if not kw.get('broadcast'))
+        self.assertIn('compass: 3 blocks east', private)
+        self.assertNotIn('From village:', private)
+
+    def test_nearest_landmark_rule_includes_ties_and_requires_same_dimension(self):
+        target = {'note': 'target', 'pos': [3, 64, 0], 'dimension': 'minecraft:overworld'}
+        tied = {'note': 'other', 'pos': [-3, 64, 0], 'dimension': 'minecraft:overworld'}
+        self.assertTrue(m.closest_to_player(target, [target, tied], [0, 64, 0], 'minecraft:overworld'))
+        self.assertFalse(m.closest_to_player(target, [target, tied], [0, 64, 0], 'minecraft:the_nether'))
 
     def test_pin_that_saves_hit_and_waits_before_map(self):
         with patch.object(m, 'console_raycast') as cast:

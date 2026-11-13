@@ -661,6 +661,25 @@ def relative_direction(marker, position, rotation, dimension):
     return "go " + " and ".join(parts) + f" (about {round(math.sqrt(dx * dx + dy * dy + dz * dz))} blocks away)"
 
 
+def compass_direction(target, position):
+    dx, dy, dz = (target['pos'][i] - position[i] for i in range(3))
+    parts = []
+    for value, positive, negative in ((dx, 'east', 'west'), (dz, 'south', 'north'), (dy, 'up', 'down')):
+        blocks = round(abs(value))
+        if blocks:
+            parts.append(f"{blocks} {'block' if blocks == 1 else 'blocks'} {positive if value > 0 else negative}")
+    return ', '.join(parts) if parts else 'at the same location'
+
+
+def closest_to_player(target, landmarks, position, dimension):
+    if target['dimension'] != dimension or target not in landmarks:
+        return False
+    distance = sum((target['pos'][i] - position[i]) ** 2 for i in range(3))
+    return not any(landmark['dimension'] == dimension and
+                   sum((landmark['pos'][i] - position[i]) ** 2 for i in range(3)) < distance
+                   for landmark in landmarks)
+
+
 def landmark_direction(target, landmarks, exclude_target=False):
     """Describe the nearest same-dimension landmark to a target location."""
     nearest = None
@@ -678,13 +697,7 @@ def landmark_direction(target, landmarks, exclude_target=False):
             nearest, nearest_distance = landmark, distance
     if nearest is None:
         return None
-    dx, dy, dz = (target['pos'][i] - nearest['pos'][i] for i in range(3))
-    parts = []
-    for value, positive, negative in ((dx, 'east', 'west'), (dz, 'south', 'north'), (dy, 'up', 'down')):
-        blocks = round(abs(value))
-        if blocks:
-            parts.append(f"{blocks} blocks {positive if value > 0 else negative}")
-    return f"From {nearest['note']}: " + (', '.join(parts) if parts else 'at the same location')
+    return f"From {nearest['note']}: " + compass_direction(target, nearest['pos'])
 
 
 def direct_marker_indices(markers, question):
@@ -1040,9 +1053,14 @@ class MarkerQueue:
                 self.send_private(player, "[Map] Couldn't determine your current position and facing for directions.")
                 return
             lines = [marker['note'] + ": " + relative_direction(marker, position, rotation, dimensions[0])
+                     + ('; compass: ' + compass_direction(marker, position)
+                        if marker['dimension'] == dimensions[0] else '')
                      for marker in pending["markers"]]
             if pending.get('landmarks') is not None:
                 for index, marker in enumerate(pending['markers']):
+                    if (not pending.get('death') and
+                            closest_to_player(marker, pending['landmarks'], position, dimensions[0])):
+                        continue
                     nearby = landmark_direction(marker, pending['landmarks'], exclude_target=not pending.get('death'))
                     if nearby:
                         lines[index] += '\n  ' + nearby
@@ -1126,7 +1144,8 @@ class MarkerQueue:
                     rendered = '[Map] ' + '\n'.join(marker_text(item) for item in proposed)
                     worst = '[Map] Directions:\n' + '\n'.join(
                         item['note'] + ': ' + max('in ' + item['dimension'] + '; direction unavailable from here',
-                                                   'go down and forward and to your right (about 99999999 blocks away)', key=len)
+                                                   'go down and forward and to your right (about 99999999 blocks away); '
+                                                   'compass: 60000000 blocks east, 60000000 blocks south, 60000000 blocks down', key=len)
                         for item in proposed)
                     if request.get('landmarks') is not None:
                         worst += ''.join('\n  ' + (landmark_direction(item, request['landmarks'], True) or '')

@@ -58,11 +58,14 @@ The same bridge also recognizes these commands at the start of a chat message:
 For each matched location in a search, the bridge also privately tells the
 requesting player an approximate direction and distance based on a fresh
 position, dimension and facing query immediately before each page of directions.
+Directions also give compass and vertical offsets from the player's position.
 No direction is given across dimensions. If the player cannot be queried, the
 bridge reports that privately. Large results are sent as multiple pages. Plain
 `@map` lists locations without directions.
 For `@map <search>`, directions also describe the closest other saved landmark
 in the same dimension, using east, west, north, south and vertical distances.
+When the target is already one of the player's closest landmarks, the bridge
+omits the directions from another landmark.
 The unfiltered `@map` listing does not include these landmark comparisons.
 
 Death tracking uses Minecraft scoreboard objectives `n20_death` (death count)
