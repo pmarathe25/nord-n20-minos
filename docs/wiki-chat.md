@@ -47,18 +47,34 @@ The same bridge also recognizes these commands at the start of a chat message:
 
 - `@pin <note>` saves the player's current position, dimension, and note.
 - `@pin_that <note>` saves the block cell the player is looking toward.
+- `@death` privately lists up to five recorded deaths and gives directions.
 - `@map` lists all shared saved locations in public chat, sorted alphabetically
   without regard to letter case. `@map <search>` finds every note containing
   the complete search phrase, ignoring case. If no note matches, the local model
   interprets the request. Add `?` at the end to use the model even when the
-  phrase matches. The older `@find <search>` remains an alias for searches.
+  phrase matches.
 - `@help` lists these commands and `@wiki`.
 
-For each listed or matched location, the bridge also privately tells the
+For each matched location in a search, the bridge also privately tells the
 requesting player an approximate direction and distance based on a fresh
 position, dimension and facing query immediately before each page of directions.
 No direction is given across dimensions. If the player cannot be queried, the
-bridge reports that privately. Large results are sent as multiple pages.
+bridge reports that privately. Large results are sent as multiple pages. Plain
+`@map` lists locations without directions.
+For `@map <search>`, directions also describe the closest other saved landmark
+in the same dimension, using east, west, north, south and vertical distances.
+The unfiltered `@map` listing does not include these landmark comparisons.
+
+Death tracking uses Minecraft scoreboard objectives `n20_death` (death count)
+and `n20_seen` (last recorded count), and stores per-UUID history in
+`world/n20-deaths.json`. After detecting a respawn, the bridge waits at least
+one second before privately sending the latest location and fresh directions.
+Landmark comparisons for deaths include any saved location in the same
+dimension. Polling and the console queue can add to that delay. The server only
+retains the latest death location itself: if a player dies multiple times before
+the bridge can record it, the intervening locations cannot be recovered.
+Death detection and real-player respawn timing have not yet been verified in
+an in-game trial.
 
 For example, `@map village` lists every pin whose note contains the word
 "village"; `@map village?` asks the model to interpret the request instead.
@@ -89,17 +105,21 @@ quick movement before that capture can still affect the result. Once the
 server says the view was captured, the player may move or turn. The scan uses
 that fixed snapshot even if other pin requests are queued.
 
-The ray samples every half block for the first 16 blocks, then every four
-blocks up to 512. After a distant coarse hit, it resamples the preceding four
-blocks at half-block intervals. It saves the first sampled, loaded block cell that
-is not air or glass. It passes through clear, tinted and stained glass blocks
-and panes. This is an approximation: it treats a block's whole cell as occupied,
-including water, plants, and partial blocks such as slabs, and can miss cells
-crossed between coarse samples. A thin wall can be missed entirely and a block
-behind it pinned instead; refinement cannot recover a missed coarse hit. It
-does not target entities or force-load chunks, so visible but unavailable chunks
-may not be searchable. Longer scans issue more commands and can cause a delay
-or game tick stalls on the phone. If the capture or scan fails, no pin is saved.
+The ray traverses each block cell it crosses, up to 512 blocks, and saves the
+first cell that is not air, clear glass, or a clear glass pane. It targets tinted
+glass, stained glass, and stained glass panes. The traversal treats each cell as fully occupied, so
+water, plants and partial blocks such as slabs may be targeted even where the
+crosshair would pass through their shape. It does not target entities. If a cell
+is unavailable because its chunk is not loaded, the scan stops without saving;
+it does not force-load chunks or guess past the gap.
+
+The bridge manages scans asynchronously in batches of at most 12 cells,
+spaced at least 20 ms apart, and rotates unfinished scans through the queue so
+multiple players can pin concurrently. Up to 128 marker operations can wait in
+the queue. Minecraft still executes each block check on its server thread; the
+batching limits each burst but cannot guarantee there will be no gameplay impact.
+Long scans take longer, particularly when multiple players are pinning. If the
+capture or scan fails, no pin is saved.
 The capture briefly creates an effect-free area cloud at the player's eyes and
 removes it; if interrupted, the cloud expires after ten seconds while loaded.
 

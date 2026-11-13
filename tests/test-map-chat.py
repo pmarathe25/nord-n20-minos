@@ -1,5 +1,6 @@
 """Exercise marker commands without touching a real server or world."""
 import json
+import math
 import os
 from collections import deque
 import re
@@ -64,11 +65,15 @@ class MarkerTests(unittest.TestCase):
         self.service.handle(PREFIX + f'System chat: Found no elements matching {token}')
         self.service.advance()
 
-    def finish_scan(self, hit=None):
-        token = self.service.inflight[0]['token']
-        if hit is not None:
-            self.service.handle(PREFIX + f'System chat: Number provider returned value {m.ray_sample_base(token) + hit}')
+    def finish_scan(self, hit=None, missing=None):
+        batch = self.service.inflight[0]
+        token = batch['token']
+        for index in range(len(batch['cells'])):
+            if index != missing:
+                value = m.ray_sample_base(token) + 2 * index + (index == hit)
+                self.service.handle(PREFIX + f'System chat: Number provider returned value {value}')
         self.service.handle(PREFIX + f'System chat: Found no elements matching {token}')
+        self.service.next_ray_batch = 0
         self.service.advance()
 
     def test_concurrent_pins_and_map_are_ordered_and_broadcast(self):
@@ -164,11 +169,9 @@ class MarkerTests(unittest.TestCase):
             while self.service.pending:
                 self.capture_direction('Alex')
         public = '\n'.join(text for _, text, kw in self.replies if kw.get('broadcast'))
-        private = '\n'.join(text for _, text, kw in self.replies if not kw.get('broadcast'))
         for n in range(1000):
             self.assertIn(f'place {n:04d}:', public)
-            self.assertIn(f'place {n:04d}:', private)
-        self.assertEqual(self.direction_queries.call_count, 50)
+        self.direction_queries.assert_not_called()
 
     def test_keyword_find_can_bypass_busy_or_unavailable_model(self):
         markers = [{'note': 'Small village with a well', 'pos': [1, 2, 3], 'dimension': 'minecraft:overworld'},
@@ -208,7 +211,6 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             self.assertFalse(requests)
             self.assertTrue(any('village:' in text for _, text, _ in self.replies))
-            self.capture_direction('Alex')
             for query in ('village', 'village?'):
                 line = PREFIX + '<Alex> @map ' + query
                 self.service.handle(line)
@@ -219,11 +221,19 @@ class MarkerTests(unittest.TestCase):
             self.assertIsNone(m.take_fast_find(self.args, requests))
             self.assertEqual(requests[0][2], '@map village?')
 
+    def test_removed_find_command_is_not_queued(self):
+        requests = deque()
+        line = PREFIX + '<Alex> @find village'
+        self.service.handle(line)
+        m.accept_chat(line, self.args, requests, None, 0, True)
+        self.assertFalse(requests)
+        self.assertFalse(self.service.queue)
+
     def test_map_directions_use_fresh_snapshot_and_are_private(self):
         markers = [{'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'},
                    {'note': 'nether', 'pos': [10, 70, 10], 'dimension': 'minecraft:the_nether'}]
         with patch.object(m, 'load_markers', return_value=markers):
-            self.service.handle(PREFIX + '<Alex> @map')
+            self.service.enqueue_listing('Alex', markers, markers)
             self.service.advance()
             self.direction_queries.assert_called_once()
             self.assertFalse(any('go ' in text for _, text, _ in self.replies))
@@ -233,11 +243,87 @@ class MarkerTests(unittest.TestCase):
         self.assertTrue(any('go up and forward and to your left' in text for text, _ in private))
         self.assertTrue(any('another' in text or 'direction unavailable' in text for text, _ in private))
 
+    def test_map_without_search_does_not_request_directions(self):
+        markers = [{'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}]
+        with patch.object(m, 'load_markers', return_value=markers):
+            self.service.handle(PREFIX + '<Alex> @map')
+            self.service.advance()
+        self.direction_queries.assert_not_called()
+        self.assertTrue(any('target:' in text for _, text, _ in self.replies))
+
     def test_directions_rotate_with_player_facing(self):
         marker = {'pos': [10, 64, 0], 'dimension': 'minecraft:overworld'}
         self.assertIn('left', m.relative_direction(marker, [0, 64, 0], [0, 0], 'minecraft:overworld'))
         self.assertIn('back', m.relative_direction(marker, [0, 64, 0], [90, 0], 'minecraft:overworld'))
         self.assertIn('right', m.relative_direction(marker, [0, 64, 0], [180, 0], 'minecraft:overworld'))
+
+    def test_nearest_landmark_excludes_target_and_other_dimensions(self):
+        target = {'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}
+        near = {'note': 'village', 'pos': [4, 65, 14], 'dimension': 'minecraft:overworld'}
+        far = {'note': 'far', 'pos': [100, 70, 10], 'dimension': 'minecraft:overworld'}
+        other = {'note': 'other', 'pos': [10, 70, 10], 'dimension': 'minecraft:the_nether'}
+        self.assertEqual(m.landmark_direction(target, [target, far, other, near], True),
+                         'From village: 6 blocks east, 4 blocks north, 5 blocks up')
+        self.assertIsNone(m.landmark_direction(target, [target, other], True))
+        self.assertEqual(m.landmark_direction(target, [target], False), 'From target: at the same location')
+
+    def test_death_locations_and_multiple_players_are_persisted(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        token = 'n20_pin_' + 'a' * 32
+        batch = {'kind': 'death_poll', 'server': (42, '1'), 'token': token, 'players': {}}
+        self.service.pending = {'action': 'death_poll'}
+        self.service.inflight.append(batch)
+        with patch.object(m, 'console_write') as write:
+            for name, number in [('Alex', 1), ('Steve', 2)]:
+                self.service.handle(PREFIX + f'{name} has the following entity data: [I; 0, 0, 0, {number}]')
+                self.service.handle(PREFIX + f'{name} has the following entity data: {{pos: [I; {number}, 64, -4], dimension: "minecraft:overworld"}}')
+                self.service.handle(PREFIX + f'{name} has {number} [n20_death]')
+                self.service.handle(PREFIX + f'{name} has {number} [n20_death]')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+        saved = m.load_deaths(self.args.deaths_file)
+        self.assertEqual(len(saved), 2)
+        self.assertEqual(saved['0' * 31 + '1']['deaths'][0]['pos'], [1, 64, -4])
+        self.assertEqual(len(self.service.death_notices), 2)
+        self.assertEqual(write.call_count, 2)
+        self.assertGreaterEqual(self.service.death_notices[0][0], time.monotonic() + .9)
+
+    def test_death_history_caps_at_five_and_deduplicates_retry(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        identity = '0' * 31 + '1'
+        with patch.object(m, 'console_write'):
+            for score in [1, 2, 3, 4, 5, 6, 6]:
+                self.service.finish_death_query({'kind': 'death_poll', 'server': (42, '1'),
+                    'players': {'Alex': {'uuid': identity, 'location': {'pos': [score, 64, 0],
+                    'dimension': 'minecraft:overworld'}, 'scores': [score, score]}}})
+        saved = m.load_deaths(self.args.deaths_file)[identity]
+        self.assertEqual([death['pos'][0] for death in saved['deaths']], [6, 5, 4, 3, 2])
+        self.assertEqual(len(self.service.death_notices), 6)
+
+    def test_death_command_uses_uuid_and_private_directions(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        identity = '0' * 31 + '1'
+        m.save_markers(self.args.deaths_file, {identity: {'score': 1, 'deaths': [
+            {'pos': [5, 65, 10], 'dimension': 'minecraft:overworld'}]}})
+        with patch.object(m, 'console_write'):
+            self.service.handle(PREFIX + '<Alex> @death')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'Alex has the following entity data: [I; 0, 0, 0, 1]')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.advance()
+            self.capture_direction('Alex')
+        self.assertTrue(any('Death 1: 5, 65, 10' in text for _, text, _ in self.replies))
+        self.assertTrue(any('[Death] Directions:' in text for _, text, _ in self.replies))
+        self.assertTrue(all(not kwargs.get('broadcast') for _, _, kwargs in self.replies))
+
+    def test_search_directions_include_nearest_landmark(self):
+        target = {'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}
+        near = {'note': 'village', 'pos': [4, 65, 14], 'dimension': 'minecraft:overworld'}
+        self.service.enqueue_listing('Alex', [target], [target, near])
+        self.service.advance()
+        self.capture_direction('Alex')
+        private = [text for _, text, kw in self.replies if not kw.get('broadcast')]
+        self.assertTrue(any('From village: 6 blocks east, 4 blocks north, 5 blocks up' in text for text in private))
 
     def test_pin_that_saves_hit_and_waits_before_map(self):
         with patch.object(m, 'console_raycast') as cast:
@@ -247,9 +333,9 @@ class MarkerTests(unittest.TestCase):
             cast.assert_called_once()
             # Camera changes after capture must not alter the captured ray.
             self.service.handle(PREFIX + 'System chat: Alex has the following entity data: [180.0f, 0.0f]')
-            self.finish_scan(hit=5)  # 3 blocks along captured south-facing ray.
-        self.assertEqual(m.load_markers(self.args.pins_file)[0]['pos'], [1.0, 65.0, 5.0])
-        self.assertTrue(any('village gate: 1, 65, 5' in text for _, text, _ in self.replies))
+            self.finish_scan(hit=2)
+        self.assertEqual(m.load_markers(self.args.pins_file)[0]['pos'], [1, 65, 4])
+        self.assertTrue(any('village gate: 1, 65, 4' in text for _, text, _ in self.replies))
         self.assertTrue(all(kw.get('broadcast') is True for _, _, kw in self.replies))
 
     def test_pin_that_missing_capture_and_missing_target_do_not_save(self):
@@ -260,10 +346,11 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             self.service.handle(PREFIX + '<Alex> @pin_that test')
             self.capture_view('Alex')
+            self.service.pending['cells'] = self.service.pending['cells'][:3]
             self.finish_scan()
         self.assertFalse(self.args.pins_file.exists())
         self.assertTrue(any('Could not capture' in text for _, text, _ in self.replies))
-        self.assertTrue(any('No loaded block was found' in text for _, text, _ in self.replies))
+        self.assertTrue(any('No block was found' in text for _, text, _ in self.replies))
 
     def test_multiple_players_capture_views_before_queued_scans(self):
         with patch.object(m, 'console_raycast') as scan:
@@ -275,20 +362,86 @@ class MarkerTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 1)
             self.finish_scan(hit=1)
             self.assertEqual(scan.call_count, 2)
-            self.finish_scan(hit=1)
+            self.finish_scan(hit=0)
         markers = m.load_markers(self.args.pins_file)
         self.assertEqual([item['note'] for item in markers], ['first', 'second'])
         self.assertAlmostEqual(markers[0]['pos'][2], 3.0)
         self.assertAlmostEqual(markers[1]['pos'][0], 9.0)
 
-    def test_far_hit_is_refined_using_captured_view(self):
+    def test_scans_yield_between_batches_to_other_players(self):
+        with patch.object(m, 'console_raycast') as scan:
+            self.service.handle(PREFIX + '<Alex> @pin_that first')
+            self.service.handle(PREFIX + '<Steve> @pin_that second')
+            self.capture_view('Alex')
+            self.capture_view('Steve', eye='[10.0d, 70.0d, 20.0d]')
+            self.finish_scan()  # Alex's first batch is transparent.
+            self.assertEqual(self.service.pending['player'], 'Steve')
+            self.finish_scan(hit=1)
+            self.assertEqual(self.service.pending['player'], 'Alex')
+            self.finish_scan(hit=0)
+        self.assertEqual(scan.call_count, 3)
+        self.assertEqual([p['note'] for p in m.load_markers(self.args.pins_file)], ['second', 'first'])
+
+    def test_ray_batches_are_paced(self):
+        with patch.object(m, 'console_raycast') as scan, patch.object(m.time, 'monotonic', return_value=100.0):
+            self.service.handle(PREFIX + '<Alex> @pin_that first')
+            self.capture_view('Alex')
+            token = self.service.inflight[0]['token']
+            for index in range(len(self.service.inflight[0]['cells'])):
+                value = m.ray_sample_base(token) + 2 * index
+                self.service.handle(PREFIX + f'System chat: Number provider returned value {value}')
+            self.service.handle(PREFIX + f'System chat: Found no elements matching {token}')
+            self.service.advance()
+            self.assertEqual(scan.call_count, 1)
+        with patch.object(m, 'console_raycast') as later, patch.object(m.time, 'monotonic', return_value=100.06):
+            self.service.advance()
+            later.assert_called_once()
+
+    def test_busy_console_retries_the_same_batch(self):
+        with patch.object(m, 'console_raycast', side_effect=[BlockingIOError(), None]) as scan:
+            self.service.handle(PREFIX + '<Alex> @pin_that first')
+            self.capture_view('Alex')
+            self.assertIsNone(self.service.pending)
+            self.assertEqual(len(self.service.queue), 1)
+            self.service.next_ray_batch = 0
+            self.service.advance()
+            self.assertEqual(scan.call_args_list[0].args[3], scan.call_args_list[1].args[3])
+            self.finish_scan(hit=0)
+        self.assertEqual(m.load_markers(self.args.pins_file)[0]['note'], 'first')
+
+    def test_voxel_traversal_covers_diagonals_and_negative_boundaries(self):
+        south = {'eye': [0.5, 64.5, 0.5], 'rotation': [0, 0], 'dimension': 'minecraft:overworld'}
+        self.assertEqual(m.ray_voxels(south, 3), [(0, 64, 0), (0, 64, 1), (0, 64, 2), (0, 64, 3)])
+        diagonal = {'eye': [0.5, 64.5, 0.5], 'rotation': [-45, 0], 'dimension': 'minecraft:overworld'}
+        self.assertEqual(m.ray_voxels(diagonal, 3), [(0, 64, 0), (1, 64, 1), (2, 64, 2)])
+        west = {'eye': [0.0, 64.5, 0.5], 'rotation': [90, 0], 'dimension': 'minecraft:overworld'}
+        self.assertEqual(m.ray_voxels(west, 2), [(-1, 64, 0), (-2, 64, 0)])
+
+    def test_voxel_traversal_contains_dense_ray_samples(self):
+        for yaw, pitch in ((0, 0), (17, 11), (-45, -20), (90, 45), (178, 89)):
+            snapshot = {'eye': [-3.2, 64.7, 1.3], 'rotation': [yaw, pitch], 'dimension': 'minecraft:overworld'}
+            cells = set(m.ray_voxels(snapshot, 8))
+            for step in range(800):
+                point = m.ray_position(snapshot, step / 100)
+                self.assertIn(tuple(map(math.floor, point)), cells)
+
+    def test_long_dimension_names_use_a_smaller_atomic_batch(self):
+        dimension = 'x:' + 'a' * 254
+        with patch.object(m, 'console_raycast') as scan, patch.object(m, 'RAY_BATCH_SIZE', 20):
+            self.service.handle(PREFIX + '<Alex> @pin_that target')
+            self.capture_view('Alex', dimension=dimension)
+            snapshot, token, cells = scan.call_args.args[1:]
+            self.assertLess(len(cells), m.RAY_BATCH_SIZE)
+            self.assertLessEqual(len(''.join(m.raycast_commands(snapshot, token, cells)).encode('ascii')), 4096)
+
+    def test_unloaded_cell_before_a_hit_does_not_save(self):
         with patch.object(m, 'console_raycast') as scan:
             self.service.handle(PREFIX + '<Alex> @pin_that far target')
             self.capture_view('Alex')
-            self.finish_scan(hit=37)  # Coarse sample at 40 blocks.
-            self.assertEqual(scan.call_count, 2)
-            self.finish_scan(hit=2)  # Refined sample at 37.5 blocks.
-        self.assertAlmostEqual(m.load_markers(self.args.pins_file)[0]['pos'][2], 39.5)
+            self.finish_scan(hit=2, missing=1)
+            self.assertEqual(scan.call_count, 1)
+        self.assertFalse(self.args.pins_file.exists())
+        self.assertTrue(any('unavailable block' in text for _, text, _ in self.replies))
 
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires a POSIX FIFO')
     def test_console_query_writes_distinct_read_only_barrier(self):
@@ -305,7 +458,7 @@ class MarkerTests(unittest.TestCase):
                                                 f'data get storage n20:{token} {token}'])
 
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires a POSIX FIFO')
-    def test_long_raycast_waits_for_console_fifo_space(self):
+    def test_ray_batch_is_written_atomically(self):
         fifo = Path(self.tmp.name) / 'console'
         os.mkfifo(fifo)
         reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
@@ -329,11 +482,33 @@ class MarkerTests(unittest.TestCase):
         thread.start()
         token = 'n20_pin_' + 'f' * 32
         snapshot = {'eye': [0, 65, 0], 'rotation': [0, 0], 'dimension': 'minecraft:overworld'}
-        distances = [step / 2 for step in range(1, 33)] + list(range(20, 513, 4))
-        m.console_raycast(fifo, snapshot, token, distances)
+        cells = m.ray_voxels(snapshot)[:m.RAY_BATCH_SIZE]
+        m.console_raycast(fifo, snapshot, token, cells)
         thread.join(5)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(b''.join(chunks).decode('ascii'), ''.join(m.raycast_commands(snapshot, token, distances)))
+        self.assertEqual(b''.join(chunks).decode('ascii'), ''.join(m.raycast_commands(snapshot, token, cells)))
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires a POSIX FIFO')
+    def test_full_console_does_not_block_or_partially_write_a_ray_batch(self):
+        fifo = Path(self.tmp.name) / 'console'
+        os.mkfifo(fifo)
+        fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, fd)
+        written = 0
+        while True:
+            try:
+                written += os.write(fd, b'x' * 4096)
+            except BlockingIOError:
+                break
+        snapshot = {'eye': [0, 65, 0], 'rotation': [0, 0], 'dimension': 'minecraft:overworld'}
+        started = time.monotonic()
+        with self.assertRaises(BlockingIOError):
+            m.console_raycast(fifo, snapshot, 'n20_pin_' + 'a' * 32, m.ray_voxels(snapshot)[:3])
+        self.assertLess(time.monotonic() - started, 1)
+        actual = bytearray()
+        while len(actual) < written:
+            actual.extend(os.read(fd, written - len(actual)))
+        self.assertEqual(actual, b'x' * written)
 
     @unittest.skipUnless(hasattr(os, 'fork'), 'requires a Unix FIFO and fork')
     def test_bridge_sends_map_results_publicly_and_directions_privately_without_model(self):

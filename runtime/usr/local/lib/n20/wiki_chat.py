@@ -373,21 +373,20 @@ def reply(path, player, components, broadcast=False):
         os.close(fd)
 
 
-MARKER_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(pin_that|pin|map|help)(?:\s+(.*))?$")
+MARKER_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(pin_that|pin|map|death|help)(?:\s+(.*))?$")
 MARKER_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) has the following entity data: (.+)$")
 RAY_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?(n20_pin_[0-9a-f]{32}) has the following entity data: (.+)$")
 RAY_SAMPLE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Number provider returned value ([0-9]+)$")
 MARKER_BARRIER = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Found no elements matching (n20_pin_[0-9a-f]{32})$")
+DEATH_SCORE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) has (-?\d+) \[n20_death\]$")
 MAX_PINS = 10000
 MAX_MARKER_FILE_BYTES = 24 * 1024 * 1024
 MAX_MARKER_PROMPT_BYTES = 2600  # Per-batch text budget, not a storage limit.
 MAX_MARKER_QUEUE = 128
 RAYCAST_RANGE = 512
-GLASS_COLORS = ('white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
-                'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black')
-RAY_TRANSPARENT = (['air', 'cave_air', 'void_air', 'glass', 'tinted_glass', 'glass_pane'] +
-                   [color + '_stained_glass' for color in GLASS_COLORS] +
-                   [color + '_stained_glass_pane' for color in GLASS_COLORS])
+RAY_BATCH_SIZE = 12
+RAY_BATCH_INTERVAL = 0.02
+RAY_TRANSPARENT = ['air', 'cave_air', 'void_air', 'glass', 'glass_pane']
 
 
 def load_markers(path):
@@ -440,6 +439,53 @@ def save_markers(path, markers):
             os.unlink(temporary)
 
 
+def load_deaths(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}
+    with os.fdopen(fd, 'r', encoding='utf-8') as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > MAX_MARKER_FILE_BYTES:
+            raise ValueError('unsafe death history')
+        value = json.load(source)
+    if not isinstance(value, dict) or len(value) > 10000:
+        raise ValueError('invalid death history')
+    for key, entry in value.items():
+        if (not re.fullmatch(r'[0-9a-f]{32}', key) or not isinstance(entry, dict) or
+                not isinstance(entry.get('score'), int) or not isinstance(entry.get('deaths'), list) or
+                len(entry['deaths']) > 5):
+            raise ValueError('invalid death history')
+        for death in entry['deaths']:
+            if (not isinstance(death, dict) or not isinstance(death.get('pos'), list) or len(death['pos']) != 3 or
+                    any(type(v) != int or abs(v) > 30000000 for v in death['pos']) or
+                    not isinstance(death.get('dimension'), str) or len(death['dimension']) > 256 or
+                    not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', death['dimension'])):
+                raise ValueError('invalid death location')
+    return value
+
+
+def death_uuid(value):
+    match = re.fullmatch(r'\[I;\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\]', value)
+    if not match:
+        return None
+    values = [int(part) for part in match.groups()]
+    if any(part < -2147483648 or part > 2147483647 for part in values):
+        return None
+    return ''.join(f'{part & 0xffffffff:08x}' for part in values)
+
+
+def death_location(value):
+    pos = re.search(r'(?:^|[,{]\s*)pos:\s*\[I;\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\]', value)
+    dimension = re.search(r'(?:^|[,{]\s*)dimension:\s*"([a-z0-9_.-]+:[a-z0-9_./-]+)"', value)
+    if not pos or not dimension or len(dimension[1]) > 256:
+        return None
+    coords = [int(part) for part in pos.groups()]
+    if any(abs(part) > 30000000 for part in coords):
+        return None
+    return {'pos': coords, 'dimension': dimension[1]}
+
+
 def console_write(path, command):
     command = command.encode("ascii")
     fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -482,59 +528,69 @@ def console_view_capture(path, player, token):
     console_write(path, view_capture_commands(player, token))
 
 
-def ray_position(snapshot, distance):
-    x, y, z = snapshot['eye']
+def ray_direction(snapshot):
     yaw, pitch = (math.radians(v) for v in snapshot['rotation'])
-    vector = (-math.sin(yaw) * math.cos(pitch), -math.sin(pitch), math.cos(yaw) * math.cos(pitch))
-    return [base + direction * distance for base, direction in zip((x, y, z), vector)]
+    return (-math.sin(yaw) * math.cos(pitch), -math.sin(pitch), math.cos(yaw) * math.cos(pitch))
+
+
+def ray_position(snapshot, distance):
+    return [base + direction * distance for base, direction in zip(snapshot['eye'], ray_direction(snapshot))]
+
+
+def ray_voxels(snapshot, distance=RAYCAST_RANGE):
+    """Walk every block cell crossed by the captured ray, nearest first."""
+    eye = snapshot['eye']
+    direction = ray_direction(snapshot)
+    direction = [0.0 if abs(value) < 1e-12 else value for value in direction]
+    cell = [math.floor(value) for value in eye]
+    steps = [1 if value > 0 else -1 if value < 0 else 0 for value in direction]
+    delta = [abs(1 / value) if value else math.inf for value in direction]
+    boundary = [((cell[i] + 1 - eye[i]) / direction[i] if steps[i] > 0 else
+                 (cell[i] - eye[i]) / direction[i] if steps[i] < 0 else math.inf)
+                for i in range(3)]
+    current = 0.0
+    cells = []
+    while current < distance:
+        next_crossing = min(boundary)
+        # Do not include cells touched only at a boundary or corner.
+        if next_crossing > current:
+            cells.append(tuple(cell))
+        if next_crossing >= distance:
+            break
+        for axis in range(3):
+            if math.isclose(boundary[axis], next_crossing, rel_tol=0.0, abs_tol=1e-12):
+                cell[axis] += steps[axis]
+                boundary[axis] += delta[axis]
+        current = next_crossing
+    return cells
 
 
 def ray_sample_base(token):
     return (1 << 30) + ((int(token[-8:], 16) & 0x3fffff) << 8)
 
 
-def raycast_commands(snapshot, token, distances):
-    """Query sampled positions in the captured dimension without changing blocks."""
-    if len(distances) > 256:
+def raycast_commands(snapshot, token, cells):
+    """Check loaded cells in the captured dimension without changing blocks."""
+    if len(cells) > RAY_BATCH_SIZE:
         raise ValueError('too many ray samples')
     transparent = json.dumps({"type": "minecraft:location_check", "predicate": {
         "block": {"blocks": RAY_TRANSPARENT}}}, separators=(",", ":"))
     result = []
-    for i, distance in enumerate(distances):
-        coords = ray_position(snapshot, distance)
-        at = ' '.join(f'{coordinate:.8f}' for coordinate in coords)
-        value = ray_sample_base(token) + i
+    for i, cell in enumerate(cells):
+        at = ' '.join(f'{coordinate + 0.5:.1f}' for coordinate in cell)
+        value = ray_sample_base(token) + 2 * i
+        classifier = json.dumps({'type': 'minecraft:conditional', 'condition': json.loads(transparent),
+                                 'on_true': value, 'on_false': value + 1}, separators=(',', ':'))
         result.append(f"execute in {snapshot['dimension']} positioned {at} "
-                      f"if blocks ~ ~ ~ ~ ~ ~ ~ ~ ~ all unless predicate {transparent} "
-                      f'run compute default integer {{type:"minecraft:constant",value:{value}}}\n')
+                      f"if blocks ~ ~ ~ ~ ~ ~ ~ ~ ~ all "
+                      f'run compute default integer {classifier}\n')
     result.append(barrier_command(token))
     return result
 
 
-def console_raycast(path, snapshot, token, distances):
-    # Wait briefly for space instead of dropping a long scan on a full FIFO.
-    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISFIFO(info.st_mode) or info.st_uid != os.geteuid():
-            raise ValueError("unsafe console")
-        limit = os.fpathconf(fd, "PC_PIPE_BUF")
-        deadline = time.monotonic() + 8
-        for line in raycast_commands(snapshot, token, distances):
-            command = line.encode("ascii")
-            if len(command) > limit:
-                raise ValueError("ray command exceeds atomic FIFO write size")
-            while True:
-                try:
-                    if os.write(fd, command) != len(command):
-                        raise OSError("incomplete console write")
-                    break
-                except BlockingIOError:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
-                        raise TimeoutError("ray console is busy")
-    finally:
-        os.close(fd)
+def console_raycast(path, snapshot, token, cells):
+    # One atomic, nonblocking write keeps this batch separate from view captures.
+    console_write(path, ''.join(raycast_commands(snapshot, token, cells)))
 
 
 def marker_request_body(markers, question):
@@ -603,6 +659,32 @@ def relative_direction(marker, position, rotation, dimension):
     if not parts:
         return "nearby"
     return "go " + " and ".join(parts) + f" (about {round(math.sqrt(dx * dx + dy * dy + dz * dz))} blocks away)"
+
+
+def landmark_direction(target, landmarks, exclude_target=False):
+    """Describe the nearest same-dimension landmark to a target location."""
+    nearest = None
+    nearest_distance = math.inf
+    skipped = False
+    for landmark in landmarks:
+        if exclude_target and not skipped and landmark == target:
+            skipped = True
+            continue
+        if landmark['dimension'] != target['dimension']:
+            continue
+        delta = [target['pos'][i] - landmark['pos'][i] for i in range(3)]
+        distance = sum(value * value for value in delta)
+        if distance < nearest_distance:
+            nearest, nearest_distance = landmark, distance
+    if nearest is None:
+        return None
+    dx, dy, dz = (target['pos'][i] - nearest['pos'][i] for i in range(3))
+    parts = []
+    for value, positive, negative in ((dx, 'east', 'west'), (dz, 'south', 'north'), (dy, 'up', 'down')):
+        blocks = round(abs(value))
+        if blocks:
+            parts.append(f"{blocks} blocks {positive if value > 0 else negative}")
+    return f"From {nearest['note']}: " + (', '.join(parts) if parts else 'at the same location')
 
 
 def direct_marker_indices(markers, question):
@@ -690,6 +772,10 @@ class MarkerQueue:
         self.queue = deque()
         self.pending = None
         self.inflight = deque()
+        self.next_ray_batch = 0.0
+        self.death_server = None
+        self.next_death_poll = 0.0
+        self.death_notices = []
 
     def send(self, player, message):
         try:
@@ -707,22 +793,23 @@ class MarkerQueue:
             print("Map directions could not reach the Minecraft console", flush=True)
             return False
 
-    def enqueue_directions(self, player, markers):
+    def enqueue_directions(self, player, markers, landmarks=None, death=False):
         if not markers:
             return
         server = server_identity(self.args.pid_file)
         if not server or len(self.queue) >= MAX_MARKER_QUEUE:
             self.send_private(player, "[Map] Directions are temporarily unavailable.")
             return
-        self.queue.appendleft({"server": server, "player": player, "action": "directions", "markers": markers})
+        self.queue.appendleft({"server": server, "player": player, "action": "directions", "markers": markers,
+                               "landmarks": landmarks, "death": death})
 
-    def enqueue_listing(self, player, markers):
+    def enqueue_listing(self, player, markers, landmarks=None):
         server = server_identity(self.args.pid_file)
         if not server or len(self.queue) >= MAX_MARKER_QUEUE:
             self.send(player, "[Map] Location listing is temporarily unavailable.")
             return
         self.queue.appendleft({'server': server, 'player': player, 'action': 'listing',
-                               'markers': markers, 'offset': 0})
+                               'markers': markers, 'offset': 0, 'landmarks': landmarks})
 
     def pin_pending(self):
         return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that')) or
@@ -735,6 +822,17 @@ class MarkerQueue:
             self.inflight.clear()
         batch = self.inflight[0] if self.inflight else None
         data = MARKER_DATA.fullmatch(line)
+        if batch and batch['kind'] in ('death_poll', 'death_lookup') and data:
+            values = batch.setdefault('players', {}).setdefault(data[1], {})
+            uuid = death_uuid(data[2])
+            location = death_location(data[2])
+            if uuid:
+                values['uuid'] = uuid
+            if location:
+                values['location'] = location
+        score = DEATH_SCORE.fullmatch(line)
+        if batch and batch['kind'] == 'death_poll' and score:
+            batch.setdefault('players', {}).setdefault(score[1], {}).setdefault('scores', []).append(int(score[2]))
         ray = RAY_DATA.fullmatch(line)
         if batch and batch['kind'] == 'capture' and ray and ray[1] == batch['token']:
             number = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)d"
@@ -743,9 +841,12 @@ class MarkerQueue:
                 batch['eye'] = [float(v) for v in pos.groups()]
         sample = RAY_SAMPLE.fullmatch(line)
         if batch and batch['kind'] == 'ray' and sample:
-            index = int(sample[1]) - ray_sample_base(batch['token'])
-            if 0 <= index < len(batch['distances']):
-                batch['hits'].add(index)
+            encoded = int(sample[1]) - ray_sample_base(batch['token'])
+            index, hit = divmod(encoded, 2)
+            if 0 <= index < len(batch['cells']):
+                if index in batch['results']:
+                    batch['invalid'] = True
+                batch['results'][index] = bool(hit)
         if batch and batch['kind'] in ('capture', 'request') and data and data[1] == batch['player']:
             value = data[2]
             number = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)d"
@@ -781,6 +882,9 @@ class MarkerQueue:
             elif batch['kind'] == 'request':
                 self.pending = None
                 self.finish(batch['request'])
+            elif batch['kind'] in ('death_poll', 'death_lookup'):
+                self.pending = None
+                self.finish_death_query(batch)
             else:
                 self.pending = None
         match = MARKER_CHAT.fullmatch(line)
@@ -793,7 +897,7 @@ class MarkerQueue:
         if not server:
             return
         if action == "help":
-            self.send(player, "[Help] @wiki <question> | @pin <note> | @pin_that <note> | @map [search] | @help")
+            self.send(player, "[Help] @wiki <question> | @pin <note> | @pin_that <note> | @map [search] | @death | @help")
         elif action in ("pin", "pin_that") and (not note or not note.strip() or len(note.strip()) > 160):
             self.send(player, f"[Map] Use @{action} followed by a note (up to 160 characters).")
         elif len(self.queue) >= MAX_MARKER_QUEUE:
@@ -829,23 +933,100 @@ class MarkerQueue:
 
     def finish_ray(self, batch):
         request = batch['request']
-        hits = batch['hits']
-        if not hits:
-            if request.get('fallback') is None:
-                self.send(request['player'], f"[Map] No loaded block was found within {RAYCAST_RANGE} blocks; try @pin instead.")
+        if batch.get('invalid'):
+            self.send(request['player'], "[Map] The view ray received conflicting results; no location was saved.")
+            return
+        for index, cell in enumerate(batch['cells']):
+            if index not in batch['results']:
+                self.send(request['player'], "[Map] The view ray reached an unavailable block; no location was saved.")
                 return
-            request['pos'] = request['fallback']
+            if batch['results'][index]:
+                request['pos'] = list(cell)
+                request['dimension'] = request['snapshot']['dimension']
+                self.finish(request)
+                return
+        request['offset'] += len(batch['cells'])
+        if request['offset'] >= len(request['cells']):
+            self.send(request['player'], f"[Map] No block was found within {RAYCAST_RANGE} blocks; try @pin instead.")
+            return
+        self.queue.append(request)
+
+    def show_deaths(self, player, deaths):
+        if not deaths:
+            self.send_private(player, '[Death] No saved death locations.')
+            return
+        markers = [{'note': 'Death ' + str(index + 1), **death}
+                   for index, death in enumerate(deaths)]
+        try:
+            landmarks = load_markers(self.args.pins_file)
+        except (OSError, ValueError, TypeError):
+            landmarks = []
+        self.send_private(player, '[Death] ' + '\n'.join(marker_text(marker) for marker in markers))
+        self.enqueue_directions(player, markers, landmarks, death=True)
+
+    def finish_death_query(self, batch):
+        path = getattr(self.args, 'deaths_file', None)
+        if path is None:
+            return
+        try:
+            history = load_deaths(path)
+            if batch['kind'] == 'death_lookup':
+                player = batch['player']
+                identity = batch.get('players', {}).get(player, {}).get('uuid')
+                if not identity:
+                    self.send_private(player, '[Death] Could not identify your player; please try again.')
+                else:
+                    self.show_deaths(player, history.get(identity, {}).get('deaths', []))
+                return
+            for player, data in batch.get('players', {}).items():
+                identity, location, scores = data.get('uuid'), data.get('location'), data.get('scores', [])
+                if not identity or not location or len(scores) != 2 or scores[0] != scores[1] or scores[0] < 1:
+                    continue
+                score = scores[0]
+                previous = history.get(identity)
+                if previous is None or previous['score'] != score:
+                    deaths = [location] + (previous['deaths'] if previous else [])
+                    history[identity] = {'score': score, 'deaths': deaths[:5]}
+                    save_markers(path, history)
+                    self.death_notices.append((time.monotonic() + 1, batch['server'], player, location))
+                # Acknowledge only the observed score, after durable storage. A
+                # later death therefore stays visible to the next poll.
+                console_write(self.args.console, f'scoreboard players set {player} n20_seen {score}\n')
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            print('Death history could not be read or saved; will retry', flush=True)
+
+    def poll_deaths(self, server):
+        path = getattr(self.args, 'deaths_file', None)
+        if path is None or not server or self.pending or self.inflight or self.queue:
+            return
+        now = time.monotonic()
+        if now < self.next_death_poll:
+            return
+        token = 'n20_pin_' + secrets.token_hex(16)
+        if self.death_server != server:
+            commands = ('scoreboard objectives add n20_death deathCount\n'
+                        'scoreboard objectives add n20_seen dummy\n')
+            kind = 'death_setup'
         else:
-            distance = batch['distances'][min(hits)]
-            request['pos'] = ray_position(request['snapshot'], distance)
-            if request.get('phase') != 'fine' and distance > 16:
-                request['fallback'] = request['pos']
-                request['phase'] = 'fine'
-                request['distances'] = [distance - 4 + step / 2 for step in range(1, 9)]
-                self.queue.appendleft(request)
-                return
-        request['dimension'] = request['snapshot']['dimension']
-        self.finish(request)
+            ready = '@a[nbt=!{Health:0.0f}]'
+            select = f'execute as {ready} if score @s n20_death > @s n20_seen run '
+            commands = (f'execute as @a unless score @s n20_seen matches -2147483648..2147483647 run scoreboard players set @s n20_seen 0\n'
+                        + select + 'scoreboard players get @s n20_death\n'
+                        + select + 'data get entity @s UUID\n'
+                        + select + 'data get entity @s LastDeathLocation\n'
+                        + select + 'scoreboard players get @s n20_death\n')
+            kind = 'death_poll'
+        try:
+            console_write(self.args.console, commands + barrier_command(token))
+        except (OSError, ValueError):
+            self.next_death_poll = now + 1
+            return
+        self.pending = {'server': server, 'action': kind}
+        self.inflight.append({'kind': kind, 'server': server, 'token': token,
+                              'deadline': now + 30, 'players': {}})
+        if kind == 'death_setup':
+            self.death_server = server
+        self.next_death_poll = now + 0.25
 
     def finish(self, pending):
         player = pending["player"]
@@ -860,8 +1041,14 @@ class MarkerQueue:
                 return
             lines = [marker['note'] + ": " + relative_direction(marker, position, rotation, dimensions[0])
                      for marker in pending["markers"]]
-            if not self.send_private(player, "[Map] Directions:\n" + "\n".join(lines)):
-                self.enqueue_directions(player, pending['markers'])
+            if pending.get('landmarks') is not None:
+                for index, marker in enumerate(pending['markers']):
+                    nearby = landmark_direction(marker, pending['landmarks'], exclude_target=not pending.get('death'))
+                    if nearby:
+                        lines[index] += '\n  ' + nearby
+            label = 'Death' if pending.get('death') else 'Map'
+            if not self.send_private(player, f"[{label}] Directions:\n" + "\n".join(lines)):
+                self.enqueue_directions(player, pending['markers'], pending.get('landmarks'), pending.get('death', False))
             return
         if "pos" not in pending or "dimension" not in pending:
             self.send(player, "[Map] Could not read your location. Please try again.")
@@ -881,6 +1068,11 @@ class MarkerQueue:
 
     def advance(self):
         server = server_identity(self.args.pid_file)
+        due = [item for item in self.death_notices if item[0] <= time.monotonic()]
+        self.death_notices = [item for item in self.death_notices if item[0] > time.monotonic()]
+        for _, origin, player, death in due:
+            if origin == server:
+                self.show_deaths(player, [death])
         if self.inflight and self.inflight[0]['server'] != server:
             self.pending = None
             self.inflight.clear()
@@ -888,7 +1080,9 @@ class MarkerQueue:
             for batch in self.inflight:
                 if batch['kind'] == 'capture':
                     batch['request']['capture_state'] = 'failed'
-            if self.pending and self.pending.get('action') == 'directions':
+            if self.pending and self.pending.get('action') in ('death_poll', 'death_setup'):
+                self.death_server = None
+            elif self.pending and self.pending.get('action') == 'directions':
                 self.send_private(self.pending['player'], "[Map] Couldn't read your current position for directions.")
             elif self.pending and self.pending.get('action'):
                 self.send(self.pending['player'], "[Map] Location lookup timed out; please try again.")
@@ -913,6 +1107,17 @@ class MarkerQueue:
                 except (OSError, ValueError, TypeError):
                     self.send(player, "[Map] Location service is unavailable.")
                 continue
+            if request['action'] == 'death':
+                token = 'n20_pin_' + secrets.token_hex(16)
+                try:
+                    console_write(self.args.console, f'data get entity {player} UUID\n' + barrier_command(token))
+                except (OSError, ValueError):
+                    self.send_private(player, '[Death] Location history is unavailable.')
+                    continue
+                self.pending = request
+                self.inflight.append({'kind': 'death_lookup', 'server': server, 'player': player,
+                                      'token': token, 'deadline': time.monotonic() + 30, 'players': {}})
+                continue
             if request['action'] == 'listing':
                 start = request['offset']
                 page = []
@@ -923,6 +1128,9 @@ class MarkerQueue:
                         item['note'] + ': ' + max('in ' + item['dimension'] + '; direction unavailable from here',
                                                    'go down and forward and to your right (about 99999999 blocks away)', key=len)
                         for item in proposed)
+                    if request.get('landmarks') is not None:
+                        worst += ''.join('\n  ' + (landmark_direction(item, request['landmarks'], True) or '')
+                                         for item in proposed)
                     if page and max(len(json.dumps(rendered, ensure_ascii=True)),
                                     len(json.dumps(worst, ensure_ascii=True))) > 2800:
                         break
@@ -934,7 +1142,8 @@ class MarkerQueue:
                 request['offset'] += len(page)
                 if request['offset'] < len(request['markers']):
                     self.queue.append(request)
-                self.enqueue_directions(player, page)
+                if request.get('landmarks') is not None:
+                    self.enqueue_directions(player, page, request['landmarks'])
                 continue
             if request['action'] == 'pin_that' and request.get('capture_state') != 'ready':
                 self.send(player, "[Map] Could not capture your view. Please try again.")
@@ -944,13 +1153,33 @@ class MarkerQueue:
                      'request': request, 'deadline': time.monotonic() + (60 if request['action'] == 'pin_that' else 30)}
             try:
                 if request["action"] == "pin_that":
-                    distances = request.get('distances') or ([step / 2 for step in range(1, 33)] + list(range(20, RAYCAST_RANGE + 1, 4)))
-                    batch.update(kind='ray', distances=distances, hits=set())
-                    console_raycast(self.args.console, request['snapshot'], token, distances)
+                    if time.monotonic() < self.next_ray_batch:
+                        self.queue.append(request)
+                        return
+                    if 'cells' not in request:
+                        request['cells'] = ray_voxels(request['snapshot'])
+                        request['offset'] = 0
+                    cells = request['cells'][request['offset']:request['offset'] + RAY_BATCH_SIZE]
+                    if not cells:
+                        self.send(player, "[Map] Could not construct the view ray; no location was saved.")
+                        continue
+                    # Reserve space for an atomic FIFO write on the device.
+                    while len(cells) > 1 and len(''.join(raycast_commands(request['snapshot'], token, cells)).encode('ascii')) > 4096:
+                        cells = cells[:-1]
+                    batch.update(kind='ray', cells=cells, results={})
+                    console_raycast(self.args.console, request['snapshot'], token, cells)
+                    self.next_ray_batch = time.monotonic() + RAY_BATCH_INTERVAL
                 elif request["action"] == "directions":
                     console_direction_query(self.args.console, player, token)
                 else:
                     console_query(self.args.console, player, token)
+            except BlockingIOError:
+                if request['action'] == 'pin_that':
+                    self.queue.append(request)
+                    self.next_ray_batch = time.monotonic() + RAY_BATCH_INTERVAL
+                    return
+                self.send_private(player, "[Map] Directions are temporarily unavailable.") if request['action'] == 'directions' else self.send(player, "[Map] Location service is unavailable.")
+                continue
             except (OSError, ValueError):
                 if request['action'] == 'directions':
                     self.send_private(player, "[Map] Directions are temporarily unavailable.")
@@ -974,7 +1203,7 @@ class MarkerQueue:
 
 
 def marker_search_query(question):
-    for prefix in ("@map ", "@find "):
+    for prefix in ("@map ",):
         if question.startswith(prefix):
             return question[len(prefix):]
     return None
@@ -982,7 +1211,7 @@ def marker_search_query(question):
 
 def accept_chat(line, args, requests, pending, next_request, can_run=True):
     """Queue a valid request and immediately acknowledge it to its sender."""
-    match = re.fullmatch(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(map|find)\s+(\S.*)", line)
+    match = re.fullmatch(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(map)\s+(\S.*)", line)
     if match:
         player, question = match[1], "@" + match[2] + " " + match[3]
     else:
@@ -1234,7 +1463,11 @@ def run(args):
 
     def record_reply(player, question, components):
         if marker_search_query(question) is not None and isinstance(components, MarkerResults):
-            marker_queue.enqueue_listing(player, components.markers)
+            try:
+                landmarks = load_markers(args.pins_file)
+            except (OSError, ValueError, TypeError):
+                landmarks = []
+            marker_queue.enqueue_listing(player, components.markers, landmarks)
         else:
             reply(args.console, player, components, broadcast=True)
         answer = "".join(item.get("text", "") for item in components)[:512]
@@ -1273,6 +1506,7 @@ def run(args):
                         marker_queue.handle(line)
                         accept_chat(line, args, requests, pending, next_request, can_run)
                     marker_queue.advance()
+                    marker_queue.poll_deaths(server_identity(args.pid_file))
                 except (OSError, ValueError):
                     pass
                 if not marker_queue.pin_pending():
@@ -1301,7 +1535,9 @@ def run(args):
                     except (OSError, ValueError):
                         print("Wiki dashboard status could not be written", flush=True)
                     next_status = now + 1
-                for fd, event in poll.poll(250):
+                ray_waiting = any(item.get('action') == 'pin_that' and item.get('capture_state') == 'ready'
+                                  for item in marker_queue.queue)
+                for fd, event in poll.poll(20 if ray_waiting else 250):
                     if event & select.POLLIN:
                         try:
                             os.read(fd, 16384)
@@ -1326,6 +1562,7 @@ def main():
     parser.add_argument("--status-file", type=Path, default=Path("/run/n20-wiki/status/state"))
     parser.add_argument("--history-file", type=Path, default=Path("/var/lib/n20-wiki/history/requests.json"))
     parser.add_argument("--pins-file", type=Path, default=Path("/srv/minecraft/world/n20-pins.json"))
+    parser.add_argument("--deaths-file", type=Path, default=Path("/srv/minecraft/world/n20-deaths.json"))
     run(parser.parse_args())
 
 
