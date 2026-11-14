@@ -439,23 +439,6 @@ def save_markers(path, markers):
             os.unlink(temporary)
 
 
-def load_map_options(path):
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return set()
-    with os.fdopen(fd, 'r', encoding='utf-8') as source:
-        info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > 262144:
-            raise ValueError('unsafe map options')
-        data = json.load(source)
-    if (not isinstance(data, list) or len(data) > 10000 or
-            any(not isinstance(name, str) or not re.fullmatch(r'[a-z0-9_]{1,16}', name) for name in data) or
-            len(set(data)) != len(data)):
-        raise ValueError('invalid map options')
-    return set(data)
-
-
 def load_deaths(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -897,20 +880,18 @@ class MarkerQueue:
         self.queue.appendleft({'server': server, 'player': player, 'action': 'listing',
                                'markers': markers, 'offset': 0, 'landmarks': landmarks})
 
-    def map_options_path(self):
-        return getattr(self.args, 'map_options_file', self.args.pins_file.parent / 'n20-map-options.json')
-
-    def map_landmarks(self, player):
+    def map_landmarks(self, enabled):
+        if not enabled:
+            return []
         try:
-            if player.casefold() in load_map_options(self.map_options_path()):
-                return load_markers(self.args.pins_file)
+            return load_markers(self.args.pins_file)
         except (OSError, ValueError, TypeError):
-            print('Map landmark options could not be read', flush=True)
+            print('Map landmarks could not be read', flush=True)
         return []
 
     def pin_pending(self):
-        return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that', 'unpin', 'rename', 'map_landmark_toggle')) or
-                any(item.get('action') in ('pin', 'pin_that', 'unpin', 'rename', 'map_landmark_toggle') for item in self.queue))
+        return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that', 'unpin', 'rename')) or
+                any(item.get('action') in ('pin', 'pin_that', 'unpin', 'rename') for item in self.queue))
 
     def handle(self, line):
         server = server_identity(self.args.pid_file)
@@ -991,12 +972,9 @@ class MarkerQueue:
             return
         player, action, note = match.groups()
         if action == "map" and note and note.strip():
-            target = note.strip()
-            if target == '--from-landmark':
-                if server and len(self.queue) < MAX_MARKER_QUEUE:
-                    self.queue.append({'server': server, 'player': player, 'action': 'map_landmark_toggle'})
-                elif server:
-                    self.send_private(player, '[Map] The location queue is full; please try again.')
+            target, from_landmark = parse_map_query(note)
+            if from_landmark and not target:
+                self.send_private(player, '[Map] Use @map --from-landmark <search>.')
                 return True
             if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', target):
                 return  # Other searches use the normal model/lookup queue.
@@ -1005,14 +983,15 @@ class MarkerQueue:
             if len(self.queue) >= MAX_MARKER_QUEUE:
                 self.send(player, '[Map] The location queue is full; please try again.')
             else:
-                self.queue.append({'server': server, 'player': player, 'action': 'player_lookup', 'target': target})
+                self.queue.append({'server': server, 'player': player, 'action': 'player_lookup', 'target': target,
+                                   'from_landmark': from_landmark, 'question': '@map ' + note.strip()})
                 self.send(player, '[Map] Looking that up...')
             return True
         server = server_identity(self.args.pid_file)
         if not server:
             return
         if action == "help":
-            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --from-landmark (toggle) | @death | @help')
+            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --from-landmark <search> | @death | @help')
         elif action == 'rename' and parse_rename(note) is None:
             self.send(player, '[Map] Use @rename "old note" "new note" (new notes: up to 160 characters).')
         elif action == 'unpin' and (not note or not note.strip() or len(note.strip()) > 256):
@@ -1154,11 +1133,11 @@ class MarkerQueue:
             position = pending.get('pos', [])
             if (len(dimensions) != 2 or dimensions[0] != dimensions[1] or len(position) != 3 or
                     not all(math.isfinite(v) and abs(v) <= 30000000 for v in position)):
-                self.player_misses.append((pending['server'], player, '@map ' + pending['target']))
+                self.player_misses.append((pending['server'], player, pending['question']))
                 return
             marker = {'note': pending.get('target_name', pending['target']),
                       'pos': position, 'dimension': dimensions[0]}
-            self.enqueue_listing(player, [marker], self.map_landmarks(player))
+            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark']))
             return
         if pending["action"] == "directions":
             dimensions = pending.get("dimensions", [])
@@ -1232,24 +1211,6 @@ class MarkerQueue:
                 return
             self.queue.popleft()
             player = request["player"]
-            if request['action'] == 'map_landmark_toggle':
-                try:
-                    path = self.map_options_path()
-                    enabled = load_map_options(path)
-                    name = player.casefold()
-                    if name in enabled:
-                        enabled.remove(name)
-                        state = 'off'
-                    else:
-                        if len(enabled) >= 10000:
-                            raise ValueError('map options limit reached')
-                        enabled.add(name)
-                        state = 'on'
-                    save_markers(path, sorted(enabled))
-                    self.send_private(player, f'[Map] Directions from landmarks are {state}.')
-                except (OSError, ValueError, TypeError):
-                    self.send_private(player, '[Map] Could not change landmark directions.')
-                continue
             if request["action"] == "map":
                 try:
                     markers = load_markers(self.args.pins_file)
@@ -1393,10 +1354,16 @@ class MarkerQueue:
             pass
 
 
+def parse_map_query(text):
+    pattern = r'(?<!\S)--from-landmark(?!\S)'
+    from_landmark = re.search(pattern, text) is not None
+    return re.sub(pattern, '', text).strip(), from_landmark
+
+
 def marker_search_query(question):
     for prefix in ("@map ",):
         if question.startswith(prefix):
-            return question[len(prefix):]
+            return parse_map_query(question[len(prefix):])[0]
     return None
 
 
@@ -1652,7 +1619,8 @@ def run(args):
 
     def record_reply(player, question, components):
         if marker_search_query(question) is not None and isinstance(components, MarkerResults):
-            marker_queue.enqueue_listing(player, components.markers, marker_queue.map_landmarks(player))
+            _, from_landmark = parse_map_query(question[len('@map '):])
+            marker_queue.enqueue_listing(player, components.markers, marker_queue.map_landmarks(from_landmark))
         else:
             reply(args.console, player, components, broadcast=True)
         answer = "".join(item.get("text", "") for item in components)[:512]
@@ -1750,7 +1718,6 @@ def main():
     parser.add_argument("--status-file", type=Path, default=Path("/run/n20-wiki/status/state"))
     parser.add_argument("--history-file", type=Path, default=Path("/var/lib/n20-wiki/history/requests.json"))
     parser.add_argument("--pins-file", type=Path, default=Path("/srv/minecraft/world/n20-pins.json"))
-    parser.add_argument("--map-options-file", type=Path, default=Path("/srv/minecraft/world/n20-map-options.json"))
     parser.add_argument("--deaths-file", type=Path, default=Path("/srv/minecraft/world/n20-deaths.json"))
     run(parser.parse_args())
 

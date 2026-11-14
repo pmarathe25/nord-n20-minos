@@ -68,9 +68,9 @@ The same bridge also recognizes these commands at the start of a chat message:
   current position and provides private directions. If no such player is online,
   the query falls back to saved-location search. An online player name takes
   precedence over a saved location with the same name.
-- `@map --from-landmark` toggles landmark-relative directions for the player
-  issuing the command. They are off by default, and the setting persists across
-  bridge restarts and is stored with the world backups.
+- `@map --from-landmark <search>` includes landmark-relative directions for that
+  search. The option also works after the search, and does not change later
+  requests.
 - `@help` lists these commands and `@wiki`.
 
 For each matched location in a search, the bridge also privately tells the
@@ -80,7 +80,7 @@ Directions also give compass and vertical offsets from the player's position.
 No direction is given across dimensions. If the player cannot be queried, the
 bridge reports that privately. Large results are sent as multiple pages. Plain
 `@map` lists locations without directions.
-When landmark-relative directions are enabled, `@map <search>` also describes
+When `--from-landmark` is included, the search also describes
 the closest other saved landmark in the same dimension, using east, west, north,
 south and vertical distances. When the target is already one of the player's
 closest landmarks, the bridge omits directions from another landmark.
