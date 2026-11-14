@@ -324,6 +324,22 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(list(self.service.player_misses), [((42, '1'), 'Alex', '@map Steve')])
         self.assertFalse(any('Steve:' in text for _, text, _ in self.replies))
 
+    def test_map_online_player_respects_landmark_option(self):
+        near = {'note': 'village', 'pos': [4, 65, 14], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [near])
+        self.service.handle(PREFIX + '<Alex> @map --from-landmark')
+        self.service.advance()
+        self.service.handle(PREFIX + '<Alex> @map Steve')
+        self.service.advance()
+        token = self.service.inflight[0]['token']
+        for value in ('"minecraft:overworld"', '[10.0d, 70.0d, 10.0d]', '"minecraft:overworld"'):
+            self.service.handle(PREFIX + f'Steve has the following entity data: {value}')
+        self.service.handle(PREFIX + f'Found no elements matching {token}')
+        self.service.advance()
+        self.capture_direction('Alex')
+        self.assertTrue(any('From village: 6 blocks east, 4 blocks north, 5 blocks up' in text
+                            and not kw.get('broadcast') for _, text, kw in self.replies))
+
     def test_map_player_dimension_change_does_not_report_mixed_location(self):
         self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve'))
         self.service.advance()
@@ -448,6 +464,39 @@ class MarkerTests(unittest.TestCase):
         private = [text for _, text, kw in self.replies if not kw.get('broadcast')]
         self.assertTrue(any('From village: 6 blocks east, 4 blocks north, 5 blocks up' in text for text in private))
         self.assertTrue(any('compass: 10 blocks east, 10 blocks south, 6 blocks up' in text for text in private))
+
+    def test_landmark_option_is_per_player_persistent_and_toggles(self):
+        target = {'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}
+        near = {'note': 'village', 'pos': [4, 65, 14], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [target, near])
+        self.assertEqual(self.service.map_landmarks('Alex'), [])
+        self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --from-landmark'))
+        self.assertTrue(self.service.pin_pending())
+        self.service.advance()
+        self.assertEqual(self.service.map_landmarks('alex'), [target, near])
+        self.assertEqual(self.service.map_landmarks('Steve'), [])
+        restarted = m.MarkerQueue(self.args)
+        self.assertEqual(restarted.map_landmarks('Alex'), [target, near])
+        self.assertTrue(restarted.handle(PREFIX + '<Alex> @map --from-landmark'))
+        restarted.advance()
+        self.assertEqual(restarted.map_landmarks('Alex'), [])
+        self.assertTrue(any('landmarks are on' in text and not kw.get('broadcast') for _, text, kw in self.replies))
+        self.assertTrue(any('landmarks are off' in text and not kw.get('broadcast') for _, text, kw in self.replies))
+
+    def test_map_defaults_to_compass_without_landmark_guidance(self):
+        target = {'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}
+        near = {'note': 'village', 'pos': [4, 65, 14], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [target, near])
+        self.service.enqueue_listing('Alex', [target], self.service.map_landmarks('Alex'))
+        self.service.advance()
+        self.capture_direction('Alex')
+        private = '\n'.join(text for _, text, kw in self.replies if not kw.get('broadcast'))
+        self.assertIn('compass:', private)
+        self.assertNotIn('From village:', private)
+
+    def test_help_lists_landmark_toggle(self):
+        self.service.handle(PREFIX + '<Alex> @help')
+        self.assertTrue(any('@map --from-landmark' in text for _, text, _ in self.replies))
 
     def test_search_omits_landmark_when_target_is_closest_to_player(self):
         target = {'note': 'target', 'pos': [3, 64, 0], 'dimension': 'minecraft:overworld'}
