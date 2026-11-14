@@ -71,6 +71,10 @@ The same bridge also recognizes these commands at the start of a chat message:
 - `@map --from-landmark <search>` includes landmark-relative directions for that
   search. The option also works after the search, and does not change later
   requests.
+- `@map --biome <name>` searches for a biome in the player's current dimension,
+  for example `@map --biome mangrove swamp`. It accepts Minecraft biome IDs,
+  including namespaced custom IDs, and suggests similar built-in names when a
+  search fails. `--from-landmark` can be included for landmark directions.
 - `@help` lists these commands and `@wiki`.
 
 For each matched location in a search, the bridge also privately tells the
@@ -85,6 +89,15 @@ the closest other saved landmark in the same dimension, using east, west, north,
 south and vertical distances. When the target is already one of the player's
 closest landmarks, the bridge omits directions from another landmark.
 The unfiltered `@map` listing does not include these landmark comparisons.
+
+Biome searches use Minecraft's `/locate biome` command at the player's position
+when the queued request runs. Minecraft executes that search on the server
+thread, so a difficult search can briefly slow gameplay. The returned point is
+the server's sampled biome location, including the searched elevation; it is
+not necessarily a safe surface destination. Searches can fail if the biome is
+unknown or cannot be found nearby in the current dimension. Suggestions use
+the built-in biome data in the installed server JAR and may not include custom
+datapack biomes.
 
 Death tracking uses Minecraft scoreboard objectives `n20_death` (death count)
 and `n20_seen` (last recorded count), and stores per-UUID history in

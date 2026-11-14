@@ -12,6 +12,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+import zipfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/usr/local/lib/n20"))
@@ -314,6 +315,80 @@ class MarkerTests(unittest.TestCase):
         self.assertTrue(any('Steve:' in text and 'compass:' in text and not kw.get('broadcast')
                             for _, text, kw in self.replies))
         self.assertEqual(self.service.player_misses, deque())
+
+    def test_biome_search_uses_map_listing_and_fresh_directions(self):
+        landmark = {'note': 'village', 'pos': [10, 64, 10], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [landmark])
+        with patch.object(m, 'console_biome_query') as query:
+            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --biome --from-landmark mangrove swamp'))
+            self.service.advance()
+            self.assertEqual(query.call_args.args[2], 'minecraft:mangrove_swamp')
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'System chat: The nearest minecraft:mangrove_swamp is at [20, 64, -30] (36 blocks away)')
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.advance()
+            self.assertTrue(any('mangrove swamp biome: 20, 64, -30' in text and kw.get('broadcast')
+                                for _, text, kw in self.replies))
+            self.capture_direction('Alex')
+        self.assertTrue(any('From village:' in text and 'compass:' in text and not kw.get('broadcast')
+                            for _, text, kw in self.replies))
+
+    def test_biome_failures_suggest_typos_and_never_fall_back_to_model(self):
+        with patch.object(m, 'console_biome_query'), patch.object(m, 'biome_suggestions', return_value=['swamp']):
+            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --biome swmap'))
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            for _ in range(2):
+                self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.assertTrue(any('Did you mean swamp?' in text and not kw.get('broadcast')
+                                for _, text, kw in self.replies))
+            self.assertFalse(self.service.player_misses)
+
+    def test_biome_queries_are_serialized_for_multiple_players(self):
+        with patch.object(m, 'console_biome_query') as query:
+            self.service.handle(PREFIX + '<Alex> @map --biome swamp')
+            self.service.handle(PREFIX + '<Steve> @map --biome desert')
+            self.service.advance()
+            self.assertEqual(query.call_args.args[1:3], ('Alex', 'minecraft:swamp'))
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'The nearest minecraft:swamp is at [1, 64, 2] (3 blocks away)')
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.advance()
+            self.capture_direction('Alex')
+            self.assertEqual(query.call_args.args[1:3], ('Steve', 'minecraft:desert'))
+
+    def test_biome_suggestions_and_command_validation(self):
+        repo = Path(self.tmp.name) / 'versions'
+        (repo / 'test').mkdir(parents=True)
+        with zipfile.ZipFile(repo / 'test/server-test.jar', 'w') as jar:
+            jar.writestr('data/minecraft/worldgen/biome/swamp.json', '{}')
+            jar.writestr('data/minecraft/worldgen/biome/mangrove_swamp.json', '{}')
+        self.assertEqual(m.biome_suggestions('minecraft:swmap', repo), ['swamp'])
+        self.assertEqual(m.biome_suggestions('minecraft:swamp', repo), [])
+        self.assertEqual(m.biome_suggestions('custom:swmap', repo), [])
+        with patch.object(m, 'console_write') as write:
+            m.console_biome_query('pipe', 'Alex', 'minecraft:swamp', 'token')
+            self.assertIn('execute at Alex run locate biome minecraft:swamp\n', write.call_args.args[1])
+            with self.assertRaises(ValueError):
+                m.console_biome_query('pipe', 'Alex', 'minecraft:swamp\nstop', 'token')
+
+    def test_biome_lookup_rejects_changed_dimension_and_bad_input(self):
+        self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --biome'))
+        self.assertTrue(any('Use @map --biome' in text for _, text, _ in self.replies))
+        with patch.object(m, 'console_biome_query'):
+            self.service.handle(PREFIX + '<Alex> @map --biome swamp')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'The nearest minecraft:swamp is at [1, 64, 2] (3 blocks away)')
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:the_nether"')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+        self.assertTrue(any('Could not determine your dimension' in text for _, text, _ in self.replies))
 
     def test_map_offline_player_falls_back_to_normal_search(self):
         self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve'))

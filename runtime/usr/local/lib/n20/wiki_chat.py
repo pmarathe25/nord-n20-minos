@@ -5,6 +5,7 @@ import argparse
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
+import difflib
 import http.client
 from itertools import islice
 import json
@@ -20,6 +21,7 @@ import subprocess
 import tempfile
 from threading import Condition, Lock, Thread
 import time
+import zipfile
 from urllib.parse import quote
 
 from wiki_answer import UNKNOWN, chat_request_body, grounded_reply
@@ -378,6 +380,7 @@ MARKER_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:Syst
 RAY_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?(n20_pin_[0-9a-f]{32}) has the following entity data: (.+)$")
 RAY_SAMPLE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Number provider returned value ([0-9]+)$")
 MARKER_BARRIER = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Found no elements matching (n20_pin_[0-9a-f]{32})$")
+BIOME_RESULT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?The nearest ([a-z0-9_.-]+:[a-z0-9_./-]+) is at \[(-?\d+), (-?\d+), (-?\d+)\] \(\d+ blocks away\)$")
 DEATH_SCORE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) has (-?\d+) \[n20_death\]$")
 MAX_PINS = 10000
 MAX_MARKER_FILE_BYTES = 24 * 1024 * 1024
@@ -520,6 +523,32 @@ def console_player_location_query(path, player, token):
         raise ValueError('invalid player name')
     console_write(path, f'data get entity {player} Dimension\ndata get entity {player} Pos\n'
                   f'data get entity {player} Dimension\n' + barrier_command(token))
+
+
+def console_biome_query(path, player, biome, token):
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', player) or not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', biome):
+        raise ValueError('invalid biome query')
+    console_write(path, f'data get entity {player} Dimension\n'
+                  f'execute at {player} run locate biome {biome}\n'
+                  f'data get entity {player} Dimension\n' + barrier_command(token))
+
+
+def biome_suggestions(biome, repo=Path('/opt/n20-minecraft/current/repo/versions')):
+    """Suggest built-in IDs from the installed server, without ruling out datapacks."""
+    if not biome.startswith('minecraft:'):
+        return []
+    try:
+        jars = list(repo.glob('*/server-*.jar'))
+        if len(jars) != 1:
+            return []
+        with zipfile.ZipFile(jars[0]) as jar:
+            prefix = 'data/minecraft/worldgen/biome/'
+            names = [name[len(prefix):-5] for name in jar.namelist()
+                     if name.startswith(prefix) and name.endswith('.json') and '/' not in name[len(prefix):]]
+        name = biome.split(':', 1)[1]
+        return [] if name in names else difflib.get_close_matches(name, names, n=3, cutoff=.6)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return []
 
 
 def view_capture_commands(player, token):
@@ -899,6 +928,10 @@ class MarkerQueue:
             self.pending = None
             self.inflight.clear()
         batch = self.inflight[0] if self.inflight else None
+        biome_result = BIOME_RESULT.fullmatch(line)
+        if (batch and batch['kind'] == 'request' and batch['request']['action'] == 'biome_lookup'
+                and biome_result and biome_result[1] == batch['request']['biome']):
+            batch['request'].setdefault('biome_results', []).append([int(v) for v in biome_result.groups()[1:]])
         data = MARKER_DATA.fullmatch(line)
         if batch and batch['kind'] in ('death_poll', 'death_lookup') and data:
             values = batch.setdefault('players', {}).setdefault(data[1], {})
@@ -937,7 +970,7 @@ class MarkerQueue:
                     batch['rotation'] = [float(v) for v in rotation.groups()]
                 if dimension:
                     batch['dimension'] = dimension[1]
-            elif batch["request"]["action"] in ("directions", "player_lookup"):
+            elif batch["request"]["action"] in ("directions", "player_lookup", "biome_lookup"):
                 if pos:
                     batch['request']["pos"] = [float(v) for v in pos.groups()]
                 if rotation:
@@ -973,6 +1006,21 @@ class MarkerQueue:
         player, action, note = match.groups()
         if action == "map" and note and note.strip():
             target, from_landmark = parse_map_query(note)
+            if re.search(r'(?<!\S)--biome(?!\S)', target):
+                name = re.sub(r'(?<!\S)--biome(?!\S)', '', target).strip().lower()
+                name = re.sub(r'\s+', '_', name)
+                biome = name if ':' in name else 'minecraft:' + name
+                if len(biome) > 128 or not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', biome):
+                    self.send_private(player, '[Map] Use @map --biome <biome name>.')
+                elif not server:
+                    self.send_private(player, '[Map] Biome lookup is unavailable.')
+                elif len(self.queue) >= MAX_MARKER_QUEUE:
+                    self.send(player, '[Map] The location queue is full; please try again.')
+                else:
+                    self.queue.append({'server': server, 'player': player, 'action': 'biome_lookup',
+                                       'biome': biome, 'from_landmark': from_landmark})
+                    self.send(player, '[Map] Looking for that biome...')
+                return True
             if from_landmark and not target:
                 self.send_private(player, '[Map] Use @map --from-landmark <search>.')
                 return True
@@ -991,7 +1039,7 @@ class MarkerQueue:
         if not server:
             return
         if action == "help":
-            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --from-landmark <search> | @death | @help')
+            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --biome <name> | @map --from-landmark <search> | @death | @help')
         elif action == 'rename' and parse_rename(note) is None:
             self.send(player, '[Map] Use @rename "old note" "new note" (new notes: up to 160 characters).')
         elif action == 'unpin' and (not note or not note.strip() or len(note.strip()) > 256):
@@ -1128,6 +1176,23 @@ class MarkerQueue:
 
     def finish(self, pending):
         player = pending["player"]
+        if pending['action'] == 'biome_lookup':
+            dimensions = pending.get('dimensions', [])
+            results = pending.get('biome_results', [])
+            if len(dimensions) != 2 or dimensions[0] != dimensions[1]:
+                self.send_private(player, '[Map] Could not determine your dimension for the biome search; please try again.')
+                return
+            if len(results) != 1 or any(abs(v) > 30000000 for v in results[0]):
+                suggestions = biome_suggestions(pending['biome']) if not results else []
+                message = '[Map] Could not find that biome in your current dimension, or the biome name is unknown.'
+                if suggestions:
+                    message += ' Did you mean ' + ', '.join(suggestions) + '?'
+                self.send_private(player, message)
+                return
+            marker = {'note': pending['biome'].split(':', 1)[1].replace('_', ' ') + ' biome',
+                      'pos': results[0], 'dimension': dimensions[0]}
+            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark']))
+            return
         if pending['action'] == 'player_lookup':
             dimensions = pending.get('dimensions', [])
             position = pending.get('pos', [])
@@ -1323,6 +1388,8 @@ class MarkerQueue:
                     console_direction_query(self.args.console, player, token)
                 elif request["action"] == "player_lookup":
                     console_player_location_query(self.args.console, request['target'], token)
+                elif request["action"] == "biome_lookup":
+                    console_biome_query(self.args.console, player, request['biome'], token)
                 else:
                     console_query(self.args.console, player, token)
             except BlockingIOError:
