@@ -38,6 +38,9 @@ class MarkerTests(unittest.TestCase):
         self.direction_query = patch.object(m, 'console_direction_query')
         self.direction_queries = self.direction_query.start()
         self.addCleanup(self.direction_query.stop)
+        self.player_query = patch.object(m, 'console_player_location_query')
+        self.player_queries = self.player_query.start()
+        self.addCleanup(self.player_query.stop)
         self.capture_query = patch.object(m, 'console_view_capture')
         self.captures = self.capture_query.start()
         self.addCleanup(self.capture_query.stop)
@@ -286,15 +289,59 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             self.assertFalse(requests)
             self.assertTrue(any('village:' in text for _, text, _ in self.replies))
-            for query in ('village', 'village?'):
+            for query in ('village spot', 'village?'):
                 line = PREFIX + '<Alex> @map ' + query
                 self.service.handle(line)
                 m.accept_chat(line, self.args, requests, None, 0, False)
             self.assertFalse(self.service.queue)
-            first = m.take_fast_find(self.args, requests)
-            self.assertEqual(first[1], '@map village')
             self.assertIsNone(m.take_fast_find(self.args, requests))
-            self.assertEqual(requests[0][2], '@map village?')
+            self.assertEqual(requests[0][2], '@map village spot')
+            self.assertEqual(requests[1][2], '@map village?')
+
+    def test_map_online_player_uses_fresh_location_and_private_directions(self):
+        marker = {'note': 'old village', 'pos': [50, 65, 50], 'dimension': 'minecraft:overworld'}
+        with patch.object(m, 'load_markers', return_value=[marker]):
+            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve'))
+            self.service.advance()
+            self.player_queries.assert_called_once()
+            token = self.service.inflight[0]['token']
+            for value in ('"minecraft:overworld"', '[10.0d, 70.0d, 10.0d]', '"minecraft:overworld"'):
+                self.service.handle(PREFIX + f'Steve has the following entity data: {value}')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.advance()
+            self.assertTrue(any('Steve: 10, 70, 10' in text and kw.get('broadcast') for _, text, kw in self.replies))
+            self.capture_direction('Alex')
+        self.assertTrue(any('Steve:' in text and 'compass:' in text and not kw.get('broadcast')
+                            for _, text, kw in self.replies))
+        self.assertEqual(self.service.player_misses, deque())
+
+    def test_map_offline_player_falls_back_to_normal_search(self):
+        self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve'))
+        self.service.advance()
+        token = self.service.inflight[0]['token']
+        self.service.handle(PREFIX + f'Found no elements matching {token}')
+        self.service.advance()
+        self.assertEqual(list(self.service.player_misses), [((42, '1'), 'Alex', '@map Steve')])
+        self.assertFalse(any('Steve:' in text for _, text, _ in self.replies))
+
+    def test_map_player_dimension_change_does_not_report_mixed_location(self):
+        self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve'))
+        self.service.advance()
+        token = self.service.inflight[0]['token']
+        for value in ('"minecraft:overworld"', '[10.0d, 70.0d, 10.0d]', '"minecraft:the_nether"'):
+            self.service.handle(PREFIX + f'Steve has the following entity data: {value}')
+        self.service.handle(PREFIX + f'Found no elements matching {token}')
+        self.assertEqual(len(self.service.player_misses), 1)
+
+    def test_map_player_lookup_waits_for_pending_pin(self):
+        self.service.handle(PREFIX + '<Alex> @pin new place')
+        self.service.advance()
+        self.assertTrue(self.service.handle(PREFIX + '<Steve> @map Alex'))
+        self.assertFalse(self.player_queries.called)
+        self.capture('Alex', '[1.0d, 64.0d, 2.0d]', 'minecraft:overworld')
+        self.player_queries.assert_called_once()
+        self.assertEqual(self.service.pending['player'], 'Steve')
+        self.assertEqual(self.service.pending['target'], 'Alex')
 
     def test_removed_find_command_is_not_queued(self):
         requests = deque()
@@ -610,6 +657,7 @@ class MarkerTests(unittest.TestCase):
         self.reply.stop()
         self.query.stop()
         self.direction_query.stop()
+        self.player_query.stop()
         self.capture_query.stop()
         log = Path(self.tmp.name) / 'server.log'
         log.write_text('')
@@ -647,6 +695,22 @@ class MarkerTests(unittest.TestCase):
             buffer = b''
             deadline = time.monotonic() + 5
             token = None
+            while time.monotonic() < deadline and token is None:
+                if select.select([fd], [], [], .1)[0]:
+                    buffer += os.read(fd, 65536)
+                    lines = buffer.split(b'\n')
+                    buffer = lines.pop()
+                    commands.extend(lines)
+                    for line in lines:
+                        found = re.search(rb'data get storage n20:(n20_pin_[0-9a-f]{32}) ', line)
+                        if found:
+                            token = found[1].decode()
+            self.assertIsNotNone(token)
+            self.assertTrue(any(line == b'data get entity village Pos' for line in commands))
+            with log.open('a') as stream:
+                stream.write(PREFIX + f'System chat: Found no elements matching {token}\n')
+            token = None
+            deadline = time.monotonic() + 5
             while time.monotonic() < deadline and token is None:
                 if select.select([fd], [], [], .1)[0]:
                     buffer += os.read(fd, 65536)

@@ -64,6 +64,10 @@ The same bridge also recognizes these commands at the start of a chat message:
   it returns all notes containing the whole query as a substring. If neither
   lookup finds anything, the local model interprets the request. Punctuation,
   including `?`, is treated as part of the query.
+  A query that is exactly an online player's name instead reports that player's
+  current position and provides private directions. If no such player is online,
+  the query falls back to saved-location search. An online player name takes
+  precedence over a saved location with the same name.
 - `@help` lists these commands and `@wiki`.
 
 For each matched location in a search, the bridge also privately tells the

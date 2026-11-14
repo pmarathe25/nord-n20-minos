@@ -515,6 +515,13 @@ def console_direction_query(path, player, token):
                   f"data get entity {player} Pos\ndata get entity {player} Dimension\n" + barrier_command(token))
 
 
+def console_player_location_query(path, player, token):
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', player):
+        raise ValueError('invalid player name')
+    console_write(path, f'data get entity {player} Dimension\ndata get entity {player} Pos\n'
+                  f'data get entity {player} Dimension\n' + barrier_command(token))
+
+
 def view_capture_commands(player, token):
     selector = f"@e[type=minecraft:area_effect_cloud,tag={token},limit=1]"
     return (f"execute as {player} at @s anchored eyes positioned ^ ^ ^ run summon minecraft:area_effect_cloud ~ ~ ~ "
@@ -837,6 +844,7 @@ class MarkerQueue:
         self.death_server = None
         self.next_death_poll = 0.0
         self.death_notices = []
+        self.player_misses = deque()
 
     def send(self, player, message):
         try:
@@ -908,7 +916,7 @@ class MarkerQueue:
                 if index in batch['results']:
                     batch['invalid'] = True
                 batch['results'][index] = bool(hit)
-        if batch and batch['kind'] in ('capture', 'request') and data and data[1] == batch['player']:
+        if batch and batch['kind'] in ('capture', 'request') and data and data[1].casefold() == batch['player'].casefold():
             value = data[2]
             number = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)d"
             pos = re.fullmatch(r"\[" + number + r", " + number + r", " + number + r"\]", value)
@@ -920,13 +928,15 @@ class MarkerQueue:
                     batch['rotation'] = [float(v) for v in rotation.groups()]
                 if dimension:
                     batch['dimension'] = dimension[1]
-            elif batch["request"]["action"] == "directions":
+            elif batch["request"]["action"] in ("directions", "player_lookup"):
                 if pos:
                     batch['request']["pos"] = [float(v) for v in pos.groups()]
                 if rotation:
                     batch['request']["rotation"] = [float(v) for v in rotation.groups()]
                 if dimension:
                     batch['request'].setdefault("dimensions", []).append(dimension[1])
+                if batch['request']['action'] == 'player_lookup':
+                    batch['request']['target_name'] = data[1]
             else:
                 if pos:
                     batch['request']["pos"] = [float(v) for v in pos.groups()]
@@ -953,7 +963,17 @@ class MarkerQueue:
             return
         player, action, note = match.groups()
         if action == "map" and note and note.strip():
-            return  # Search is handled by the model/lookup queue.
+            target = note.strip()
+            if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', target):
+                return  # Other searches use the normal model/lookup queue.
+            if not server:
+                return True
+            if len(self.queue) >= MAX_MARKER_QUEUE:
+                self.send(player, '[Map] The location queue is full; please try again.')
+            else:
+                self.queue.append({'server': server, 'player': player, 'action': 'player_lookup', 'target': target})
+                self.send(player, '[Map] Looking that up...')
+            return True
         server = server_identity(self.args.pid_file)
         if not server:
             return
@@ -1095,6 +1115,21 @@ class MarkerQueue:
 
     def finish(self, pending):
         player = pending["player"]
+        if pending['action'] == 'player_lookup':
+            dimensions = pending.get('dimensions', [])
+            position = pending.get('pos', [])
+            if (len(dimensions) != 2 or dimensions[0] != dimensions[1] or len(position) != 3 or
+                    not all(math.isfinite(v) and abs(v) <= 30000000 for v in position)):
+                self.player_misses.append((pending['server'], player, '@map ' + pending['target']))
+                return
+            marker = {'note': pending.get('target_name', pending['target']),
+                      'pos': position, 'dimension': dimensions[0]}
+            try:
+                landmarks = load_markers(self.args.pins_file)
+            except (OSError, ValueError, TypeError):
+                landmarks = []
+            self.enqueue_listing(player, [marker], landmarks)
+            return
         if pending["action"] == "directions":
             dimensions = pending.get("dimensions", [])
             position = pending.get("pos", [])
@@ -1254,7 +1289,8 @@ class MarkerQueue:
                 self.send(player, "[Map] Could not capture your view. Please try again.")
                 continue
             token = "n20_pin_" + secrets.token_hex(16)
-            batch = {'kind': 'request', 'server': server, 'player': player, 'token': token,
+            queried_player = request['target'] if request['action'] == 'player_lookup' else player
+            batch = {'kind': 'request', 'server': server, 'player': queried_player, 'token': token,
                      'request': request, 'deadline': time.monotonic() + (60 if request['action'] == 'pin_that' else 30)}
             try:
                 if request["action"] == "pin_that":
@@ -1276,6 +1312,8 @@ class MarkerQueue:
                     self.next_ray_batch = time.monotonic() + RAY_BATCH_INTERVAL
                 elif request["action"] == "directions":
                     console_direction_query(self.args.console, player, token)
+                elif request["action"] == "player_lookup":
+                    console_player_location_query(self.args.console, request['target'], token)
                 else:
                     console_query(self.args.console, player, token)
             except BlockingIOError:
@@ -1606,9 +1644,12 @@ def run(args):
                     progress = None
                 try:
                     for line in tail.read():
-                        marker_queue.handle(line)
-                        accept_chat(line, args, requests, pending, next_request, can_run)
+                        handled = marker_queue.handle(line)
+                        if not handled:
+                            accept_chat(line, args, requests, pending, next_request, can_run)
                     marker_queue.advance()
+                    while marker_queue.player_misses:
+                        requests.append(marker_queue.player_misses.popleft())
                     marker_queue.poll_deaths(server_identity(args.pid_file))
                 except (OSError, ValueError):
                     pass
