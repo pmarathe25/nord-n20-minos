@@ -51,12 +51,19 @@ The same bridge also recognizes these commands at the start of a chat message:
   and repeated whitespace. If several locations have that note, use
   `@unpin <note> | <x> <y> <z> | <dimension>` with values from `@map`.
   Indistinguishable duplicate entries are removed one at a time.
+- `@rename "old note" "new note"` changes the full note of one uniquely
+  matching location, without changing its coordinates. Use double quotes around
+  both notes; `\"` represents a quote within a note. Matching the old note
+  ignores case and repeated whitespace. For duplicate names, include the
+  coordinates and dimension inside the first quoted argument, for example
+  `@rename "home | 1 64 2 | minecraft:overworld" "cave home"`.
 - `@death` privately lists up to five recorded deaths and gives directions.
 - `@map` lists all shared saved locations in public chat, sorted alphabetically
-  without regard to letter case. `@map <search>` finds every note containing
-  the complete search phrase, ignoring case. If no note matches, the local model
-  interprets the request. Add `?` at the end to use the model even when the
-  phrase matches.
+  without regard to letter case. `@map <search>` first returns notes that match
+  the entire query, ignoring case and repeated whitespace. If none match exactly,
+  it returns all notes containing the whole query as a substring. If neither
+  lookup finds anything, the local model interprets the request. Punctuation,
+  including `?`, is treated as part of the query.
 - `@help` lists these commands and `@wiki`.
 
 For each matched location in a search, the bridge also privately tells the
@@ -83,9 +90,10 @@ the bridge can record it, the intervening locations cannot be recovered.
 Death detection and real-player respawn timing have not yet been verified in
 an in-game trial.
 
-For example, `@map village` lists every pin whose note contains the word
-"village"; `@map village?` asks the model to interpret the request instead.
-The whole search phrase must occur in a note for the direct match, so
+For example, if a note is exactly "village", `@map village` returns it before
+considering longer notes containing that word. `@map village?` looks for the
+literal question mark, and asks the model if no note contains that text. The
+whole search phrase must occur in a note for a substring match, so the query
 `@map village well` does not directly match "village with a well".
 
 Locations are shared by all players and stored in `world/n20-pins.json`, so

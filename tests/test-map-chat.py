@@ -109,6 +109,33 @@ class MarkerTests(unittest.TestCase):
         self.service.advance()
         self.assertTrue(any('No saved location matches' in text for _, text, _ in self.replies))
 
+    def test_rename_preserves_coordinates_and_serializes_with_pins(self):
+        self.service.handle(PREFIX + '<Alex> @pin small village')
+        self.service.handle(PREFIX + '<Steve> @rename "SMALL village" "Village with well"')
+        self.assertTrue(self.service.pin_pending())
+        self.service.advance()
+        self.capture('Alex', '[1.5d, 64.0d, 2.0d]', 'minecraft:overworld')
+        self.assertEqual(m.load_markers(self.args.pins_file),
+                         [{'note': 'Village with well', 'pos': [1.5, 64, 2], 'dimension': 'minecraft:overworld'}])
+        self.assertTrue(any('Renamed location:' in text and kw.get('broadcast') for _, text, kw in self.replies))
+
+    def test_rename_requires_quotes_and_does_not_change_ambiguous_notes(self):
+        markers = [{'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'},
+                   {'note': 'Home', 'pos': [3, 64, 2], 'dimension': 'minecraft:overworld'}]
+        m.save_markers(self.args.pins_file, markers)
+        for args in ('home new', '"home" "new"', '"missing" "new"', '"home" ""', '"home" "new" extra'):
+            self.service.handle(PREFIX + '<Alex> @rename ' + args)
+            self.service.advance()
+            self.assertEqual(m.load_markers(self.args.pins_file), markers)
+        self.assertTrue(any('multiple locations' in text for _, text, _ in self.replies))
+        self.service.handle(PREFIX + '<Alex> @rename "home | 1 64 2 | minecraft:overworld" "village home"')
+        self.service.advance()
+        self.assertEqual([item['note'] for item in m.load_markers(self.args.pins_file)], ['village home', 'Home'])
+
+    def test_rename_parses_escaped_quotes(self):
+        self.assertEqual(m.parse_rename(r'"old \"name\"" "new name"'), ('old "name"', 'new name'))
+        self.assertIsNone(m.parse_rename(r'"old" "bad\nname"'))
+
     def test_concurrent_pins_and_map_are_ordered_and_broadcast(self):
         self.service.handle(PREFIX + '<Alex> @pin small village with a well')
         self.service.handle(PREFIX + '<Steve> @pin mountain house')
@@ -218,12 +245,27 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         model.assert_not_called()
 
-    def test_search_requires_whole_query_and_question_mark_uses_model(self):
-        markers = [{'note': 'Village by a well'}, {'note': 'village with a well by a mountain'}]
-        self.assertEqual(m.direct_marker_indices(markers, 'village'), [0, 1])
-        self.assertEqual(m.direct_marker_indices(markers, 'VILLAGE WITH A WELL'), [1])
-        for query in ('village?', 'village well', 'village without a well', 'vill'):
+    def test_search_prioritizes_exact_names_then_substrings(self):
+        markers = [{'note': 'Village'}, {'note': 'village'},
+                   {'note': 'Village by a well'}, {'note': 'village with a well by a mountain'}]
+        self.assertEqual(m.direct_marker_indices(markers, ' VILLAGE '), [0, 1])
+        self.assertEqual(m.direct_marker_indices(markers, 'VILLAGE WITH A WELL'), [3])
+        self.assertEqual(m.direct_marker_indices(markers, 'vill'), [0, 1, 2, 3])
+        for query in ('village?', 'village well', 'village without a well?'):
             self.assertIsNone(m.direct_marker_indices(markers, query))
+
+    def test_question_uses_model_only_when_literal_lookup_misses(self):
+        markers = [{'note': 'Village by a well', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'}]
+        with patch.object(m, 'load_markers', return_value=markers), patch.object(m, 'resources_available', return_value=True), patch.object(m, 'generate', return_value='[1]') as model:
+            self.assertIn('Village by a well', m.find_marker(self.args, 'village')[0]['text'])
+            model.assert_not_called()
+            self.assertIn('Village by a well', m.find_marker(self.args, 'village?')[0]['text'])
+            model.assert_called_once()
+
+    def test_question_mark_is_literal_for_exact_and_substring_matches(self):
+        markers = [{'note': 'Village?'}, {'note': 'Village? Maybe'}, {'note': 'Village'}]
+        self.assertEqual(m.direct_marker_indices(markers, 'village?'), [0])
+        self.assertEqual(m.direct_marker_indices(markers[1:], 'village?'), [0])
 
     def test_find_returns_all_literal_and_keyword_matches(self):
         markers = [{'note': note, 'pos': [n, 64, n], 'dimension': 'minecraft:overworld'}
@@ -235,7 +277,7 @@ class MarkerTests(unittest.TestCase):
                 self.assertIn('village with a well by a mountain', result)
                 self.assertNotIn('iron farm', result)
 
-    def test_map_routes_listing_and_search_and_question_mark_waits_for_model(self):
+    def test_map_routes_listing_and_search_and_only_literal_match_uses_fast_lookup(self):
         requests = deque()
         with patch.object(m, 'load_markers', return_value=[{'note': 'village', 'pos': [1, 2, 3], 'dimension': 'minecraft:overworld'}]):
             listing = PREFIX + '<Alex> @map'

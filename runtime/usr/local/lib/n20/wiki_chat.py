@@ -373,7 +373,7 @@ def reply(path, player, components, broadcast=False):
         os.close(fd)
 
 
-MARKER_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(pin_that|pin|unpin|map|death|help)(?:\s+(.*))?$")
+MARKER_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(pin_that|pin|unpin|rename|map|death|help)(?:\s+(.*))?$")
 MARKER_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) has the following entity data: (.+)$")
 RAY_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?(n20_pin_[0-9a-f]{32}) has the following entity data: (.+)$")
 RAY_SAMPLE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Number provider returned value ([0-9]+)$")
@@ -607,12 +607,62 @@ def marker_note_prompt(markers):
 
 def literal_marker_hits(markers, question):
     query = " ".join(question.casefold().split())
-    if not query or query.endswith("?"):
+    if not query:
         return None, []
-    pattern = re.compile(r"(?<!\w)" + re.escape(query) + r"(?!\w)")
-    hits = [i for i, marker in enumerate(markers)
-            if pattern.search(" ".join(marker['note'].casefold().split()))]
-    return query, hits
+    notes = [" ".join(marker['note'].casefold().split()) for marker in markers]
+    exact = [i for i, note in enumerate(notes) if note == query]
+    return query, exact or [i for i, note in enumerate(notes) if query in note]
+
+
+def parse_rename(text):
+    """Parse two double-quoted JSON strings, with no trailing arguments."""
+    if not text or len(text) > 2048:
+        return None
+    decoder = json.JSONDecoder()
+    text = text.strip()
+    try:
+        if not text.startswith('"'):
+            return None
+        old, end = decoder.raw_decode(text)
+        rest = text[end:]
+        if not rest or not rest[0].isspace():
+            return None
+        rest = rest.lstrip()
+        if not rest.startswith('"'):
+            return None
+        new, end = decoder.raw_decode(rest)
+        if rest[end:].strip():
+            return None
+    except (ValueError, RecursionError):
+        return None
+    old, new = old.strip(), new.strip()
+    if (not old or len(old) > 256 or not old.isprintable() or
+            not new or len(new) > 160 or not new.isprintable()):
+        return None
+    return old, new
+
+
+def marker_note_selection(markers, note):
+    normalize = lambda text: ' '.join(text.casefold().split())
+    hits = [i for i, marker in enumerate(markers) if normalize(marker['note']) == normalize(note)]
+    if hits:
+        return hits, False
+    selector = re.fullmatch(r'(.+?)\s+\|\s*(-?\d+)(?:\s*,\s*|\s+)(-?\d+)(?:\s*,\s*|\s+)(-?\d+)(?:\s+\|\s+([a-z0-9_.-]+:[a-z0-9_./-]+))?\s*', note)
+    if not selector:
+        return [], False
+    name, x, y, z, dimension = selector.groups()
+    coords = [int(x), int(y), int(z)]
+    return ([i for i, marker in enumerate(markers)
+             if normalize(marker['note']) == normalize(name)
+             and [math.floor(value) for value in marker['pos']] == coords
+             and (dimension is None or marker['dimension'] == dimension)], True)
+
+
+def same_displayed_location(markers, hits):
+    first = markers[hits[0]]
+    return all(markers[i]['dimension'] == first['dimension'] and
+               [math.floor(v) for v in markers[i]['pos']] == [math.floor(v) for v in first['pos']]
+               for i in hits[1:])
 
 
 class MarkerResults(list):
@@ -706,8 +756,6 @@ def direct_marker_indices(markers, question):
 
 
 def direct_marker_reply(markers, question):
-    if question.rstrip().endswith("?"):
-        return None
     if not markers:
         return [{"text": "[Map] There are no saved locations."}]
     indices = direct_marker_indices(markers, question)
@@ -825,8 +873,8 @@ class MarkerQueue:
                                'markers': markers, 'offset': 0, 'landmarks': landmarks})
 
     def pin_pending(self):
-        return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that', 'unpin')) or
-                any(item.get('action') in ('pin', 'pin_that', 'unpin') for item in self.queue))
+        return ((self.pending is not None and self.pending.get('action') in ('pin', 'pin_that', 'unpin', 'rename')) or
+                any(item.get('action') in ('pin', 'pin_that', 'unpin', 'rename') for item in self.queue))
 
     def handle(self, line):
         server = server_identity(self.args.pid_file)
@@ -910,7 +958,9 @@ class MarkerQueue:
         if not server:
             return
         if action == "help":
-            self.send(player, "[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @map [search] | @death | @help")
+            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @death | @help')
+        elif action == 'rename' and parse_rename(note) is None:
+            self.send(player, '[Map] Use @rename "old note" "new note" (new notes: up to 160 characters).')
         elif action == 'unpin' and (not note or not note.strip() or len(note.strip()) > 256):
             self.send(player, '[Map] Use @unpin followed by the exact location note.')
         elif action in ("pin", "pin_that") and (not note or not note.strip() or len(note.strip()) > 160):
@@ -1131,24 +1181,11 @@ class MarkerQueue:
                 try:
                     markers = load_markers(self.args.pins_file)
                     note = request['note']
-                    normalize = lambda text: ' '.join(text.casefold().split())
-                    hits = [i for i, marker in enumerate(markers) if normalize(marker['note']) == normalize(note)]
-                    selected_coordinates = False
-                    if not hits:
-                        selector = re.fullmatch(r'(.+?)\s+\|\s*(-?\d+)(?:\s*,\s*|\s+)(-?\d+)(?:\s*,\s*|\s+)(-?\d+)(?:\s+\|\s+([a-z0-9_.-]+:[a-z0-9_./-]+))?\s*', note)
-                        if selector:
-                            selected_coordinates = True
-                            name, x, y, z, dimension = selector.groups()
-                            coords = [int(x), int(y), int(z)]
-                            hits = [i for i, marker in enumerate(markers)
-                                    if normalize(marker['note']) == normalize(name)
-                                    and [math.floor(value) for value in marker['pos']] == coords
-                                    and (dimension is None or marker['dimension'] == dimension)]
+                    hits, selected_coordinates = marker_note_selection(markers, note)
                     if not hits:
                         self.send(player, '[Map] No saved location matches that exact note and any specified coordinates.')
                     elif (len(hits) > 1 and any(markers[i] != markers[hits[0]] for i in hits[1:]) and
-                          not (selected_coordinates and all(markers[i]['dimension'] == markers[hits[0]]['dimension']
-                              for i in hits[1:]))):
+                          not (selected_coordinates and same_displayed_location(markers, hits))):
                         self.send(player, '[Map] That note matches multiple locations. Use @unpin <exact note> | <x> <y> <z> | <dimension>; see @map for coordinates and dimensions.')
                     else:
                         removed = markers.pop(hits[0])
@@ -1156,6 +1193,23 @@ class MarkerQueue:
                         self.send(player, '[Map] Removed ' + marker_text(removed))
                 except (OSError, ValueError, TypeError):
                     self.send(player, '[Map] Could not remove location; the map may be unreadable.')
+                continue
+            if request['action'] == 'rename':
+                try:
+                    old, new = parse_rename(request['note'])
+                    markers = load_markers(self.args.pins_file)
+                    hits, selected_coordinates = marker_note_selection(markers, old)
+                    if not hits:
+                        self.send(player, '[Map] No saved location matches that exact note.')
+                    elif len(hits) > 1 and not (selected_coordinates and same_displayed_location(markers, hits)):
+                        self.send(player, '[Map] That note matches multiple locations. Use @rename "<old note> | <x> <y> <z> | <dimension>" "<new note>"; see @map for coordinates.')
+                    else:
+                        marker = markers[hits[0]]
+                        marker['note'] = new
+                        save_markers(self.args.pins_file, markers)
+                        self.send(player, '[Map] Renamed location: ' + marker_text(marker))
+                except (OSError, ValueError, TypeError):
+                    self.send(player, '[Map] Could not rename location; the map may be unreadable.')
                 continue
             if request['action'] == 'death':
                 token = 'n20_pin_' + secrets.token_hex(16)
@@ -1320,8 +1374,6 @@ def take_fast_find(args, requests):
         query = marker_search_query(question)
         if query is None:
             continue
-        if query.rstrip().endswith("?"):
-            continue  # The player explicitly requested the model.
         try:
             components = direct_marker_reply(load_markers(args.pins_file), query)
         except (OSError, ValueError, TypeError, RecursionError):
