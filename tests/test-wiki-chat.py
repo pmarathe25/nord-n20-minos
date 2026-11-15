@@ -293,7 +293,7 @@ class WikiChatTests(unittest.TestCase):
                 with patch("wiki_chat.LogTail", SignallingTail), \
                      patch("wiki_chat.server_identity", return_value=(42, "start")), \
                      patch("wiki_chat.answer_question", fake_answer), \
-                     patch("wiki_chat.model_health", return_value="ready"), \
+                     patch("wiki_chat.model_health", return_value="unavailable"), \
                      patch("wiki_chat.resources_available", return_value=True), \
                      patch("wiki_chat.REQUEST_INTERVAL_SECONDS", 0.05):
                     wiki_chat.run(args)

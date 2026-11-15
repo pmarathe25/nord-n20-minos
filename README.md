@@ -62,6 +62,8 @@ cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
 /tmp/n20-capture-test
 python3 tests/test-mtp-sandbox.py build/n20-mtp-sandbox  # root; isolated mount namespace
 python3 tests/test-save-events.py
+sudo python3 tests/test-wiki-demand.py  # model-demand lifetime and ownership checks
+sudo sh tests/test-wiki-demand-launcher.sh  # isolated fake workers and model lifecycle
 sudo python3 tests/test-minecraft-pid.py  # isolated PID publication and bridge access
 python3 tests/test-death-message-compat.py --jar /opt/n20-minecraft/current/repo/versions/26.3/server-26.3.jar  # before server upgrades, use the new JAR
 python3 tests/test-ssh-policy.py  # requires OpenSSH server

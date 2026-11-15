@@ -48,6 +48,7 @@ HISTORY_LIMIT = 50
 MODEL_FIRST_REPLY_SECONDS = 75
 MODEL_STREAM_IDLE_SECONDS = 15
 MODEL_TOTAL_SECONDS = 105
+MODEL_STARTUP_SECONDS = 300
 MAX_MODEL_LINE = 8192
 MAX_MODEL_STREAM = 262144
 
@@ -318,6 +319,57 @@ def expand_wiki_passages(args, question, passages):
     return expanded
 
 
+def generate_for_request(args, question, passages, report=None, body=None):
+    """Request the model only after retrieval proves inference is needed."""
+    path = getattr(args, 'model_demand_file', None)
+    temporary = None
+    marker_identity = None
+    if path is not None:
+        path = Path(path)
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='ascii', dir=path.parent,
+                                             prefix='.model-demand-', delete=False) as out:
+                temporary = out.name
+                os.fchmod(out.fileno(), 0o600)
+                started = Path('/proc/self/stat').read_text().rpartition(')')[2].split()[19]
+                out.write(f'{os.getpid()} {started}\n')
+            os.replace(temporary, path)
+            temporary = None
+            info = path.lstat()
+            marker_identity = (info.st_dev, info.st_ino)
+            origin = server_identity(args.pid_file) if getattr(args, 'pid_file', None) else None
+            deadline = time.monotonic() + MODEL_STARTUP_SECONDS
+            while model_health(args.socket) != 'ready':
+                if time.monotonic() >= deadline or (origin and server_identity(args.pid_file) != origin):
+                    raise TimeoutError('model did not become available')
+                time.sleep(.5)
+        except BaseException:
+            if temporary is not None:
+                os.unlink(temporary)
+            if marker_identity is not None:
+                try:
+                    current = path.lstat()
+                    if (current.st_dev, current.st_ino) == marker_identity:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+    try:
+        if body is not None:
+            return generate(args.socket, question, passages, report, body)
+        if report is not None:
+            return generate(args.socket, question, passages, report)
+        return generate(args.socket, question, passages)
+    finally:
+        if marker_identity is not None:
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) == marker_identity:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def answer_question(args, question, cache, report=None):
     try:
         if marker_search_query(question) is not None:
@@ -345,9 +397,9 @@ def answer_question(args, question, cache, report=None):
                     return cache[key]
                 if report:
                     report("prefill", 0)
-                    answer = generate(args.socket, question, passages, report)
+                    answer = generate_for_request(args, question, passages, report)
                 else:
-                    answer = generate(args.socket, question, passages)
+                    answer = generate_for_request(args, question, passages)
             components = render(answer, passages)
             if len(components) > 1:
                 cache[key] = components
@@ -587,6 +639,7 @@ def console_biome_query(path, player, biome, token):
     if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', player) or not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', biome):
         raise ValueError('invalid biome query')
     console_write(path, f'data get entity {player} Dimension\n'
+                  f'data get entity {player} Pos\n'
                   f'execute at {player} run locate biome {biome}\n'
                   f'data get entity {player} Dimension\n' + barrier_command(token))
 
@@ -967,7 +1020,7 @@ def find_marker(args, question, report=None):
             return [{"text": "[Map] The location search was interrupted; please try again."}]
         if report:
             report("prefill", 0)
-        selected = generate(args.socket, question, None, report, marker_request_body(batch, question))
+        selected = generate_for_request(args, question, None, report, marker_request_body(batch, question))
         indices = parse_marker_selection(selected, len(batch))
         if indices is None:
             return [{"text": "[Map] The model could not complete the location search; please try again."}]
@@ -1359,7 +1412,7 @@ class MarkerQueue:
             results = pending.get('biome_results', [])
             if len(results) == 1 and all(abs(v) <= 30000000 for v in results[0]):
                 position = results[0]
-                distance = math.hypot(position[0] - landmark['pos'][0], position[2] - landmark['pos'][2])
+                distance = math.dist(position, landmark['pos'])
                 if job['best'] is None or distance < job['best'][0]:
                     job['best'] = (distance, landmark, position)
             elif pending.get('biome_error') != 'not_found':
@@ -1392,11 +1445,21 @@ class MarkerQueue:
                 self.send_private(player, '[Map] Could not read saved landmarks for the biome search.')
                 return
             if landmarks:
+                player_distance = None
+                if marker is not None:
+                    origin = pending.get('pos', [])
+                    if len(origin) != 3 or not all(math.isfinite(v) and abs(v) <= 30000000 for v in origin):
+                        self.send_private(player, '[Map] Could not compare biome distances because your search position was unavailable.')
+                        return
+                    player_distance = math.dist(marker['pos'], origin)
+                    if player_distance == 0:
+                        return  # No landmark can be strictly closer than zero.
                 if len(self.biome_jobs) >= MAX_BIOME_JOBS:
                     self.send_private(player, '[Map] Landmark biome searches are busy; please try again.')
                     return
                 self.biome_jobs.append({'server': pending['server'], 'player': player, 'biome': pending['biome'],
                                         'from_landmark': pending['from_landmark'], 'player_marker': marker,
+                                        'player_distance': player_distance,
                                         'landmarks': landmarks, 'index': 0, 'best': None, 'failed': 0})
                 self.send_private(player, f'[Map] Checking {len(landmarks)} saved landmarks for that biome...')
             return
@@ -1678,6 +1741,8 @@ class MarkerQueue:
                     self.send_private(job['player'], '[Map] No biome location was found near the saved landmarks.')
                     continue
                 distance, landmark, position = best
+                if player_marker and distance >= job['player_distance']:
+                    continue
                 if (player_marker and player_marker['dimension'] == landmark['dimension'] and
                         player_marker['pos'] == position):
                     continue
@@ -2112,7 +2177,7 @@ def run(args):
                     except (OSError, ValueError):
                         resources_ok = False
                     next_health = now + 1
-                can_run = health == "ready" and resources_ok
+                can_run = resources_ok
                 if pending and pending.done():
                     if server == server_identity(args.pid_file):
                         try:
@@ -2193,6 +2258,7 @@ def main():
     parser.add_argument("--wiki", default="/opt/n20-wiki/n20-wiki")
     parser.add_argument("--cache", default="/var/lib/n20-wiki/cache")
     parser.add_argument("--socket", default="/run/n20-wiki/model/llama.sock")
+    parser.add_argument("--model-demand-file", type=Path, default=Path('/run/n20-wiki/status/model-demand'))
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--log", type=Path, default=Path("/var/log/minecraft.log"))
     parser.add_argument("--pid-file", type=Path, default=Path("/run/minecraft.pid"))

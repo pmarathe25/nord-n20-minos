@@ -345,6 +345,7 @@ class MarkerTests(unittest.TestCase):
             self.assertEqual(query.call_args.args[2], 'minecraft:mangrove_swamp')
             token = self.service.inflight[0]['token']
             self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'Alex has the following entity data: [0.0d, 64.0d, 0.0d]')
             self.service.handle(PREFIX + 'System chat: The nearest minecraft:mangrove_swamp is at [20, 64, -30] (36 blocks away)')
             self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
             self.service.handle(PREFIX + f'Found no elements matching {token}')
@@ -375,6 +376,7 @@ class MarkerTests(unittest.TestCase):
             self.assertEqual(query.call_args.args[1:3], ('Alex', 'minecraft:swamp'))
             token = self.service.inflight[0]['token']
             self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'Alex has the following entity data: [0.0d, 64.0d, 0.0d]')
             self.service.handle(PREFIX + 'The nearest minecraft:swamp is at [1, 64, 2] (3 blocks away)')
             self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
             self.service.handle(PREFIX + f'Found no elements matching {token}')
@@ -391,6 +393,7 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             token = self.service.inflight[0]['token']
             self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'Alex has the following entity data: [0.0d, 64.0d, 0.0d]')
             self.service.handle(PREFIX + 'The nearest minecraft:swamp is at [20, 64, 20] (28 blocks away)')
             self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
             self.service.handle(PREFIX + f'Found no elements matching {token}')
@@ -421,6 +424,7 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             token = self.service.inflight[0]['token']
             for line in ('Alex has the following entity data: "minecraft:overworld"',
+                         'Alex has the following entity data: [0.0d, 64.0d, 0.0d]',
                          'The nearest minecraft:swamp is at [1, 64, 2] (0 blocks away)',
                          'Alex has the following entity data: "minecraft:overworld"',
                          f'Found no elements matching {token}'):
@@ -438,6 +442,48 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             self.assertEqual(sum('swamp biome:' in text and bool(kw.get('broadcast')) for _, text, kw in self.replies), 1)
             self.assertFalse(any('blocks from home' in text for _, text, _ in self.replies))
+
+    def test_landmark_biome_is_shown_only_when_strictly_closer_in_3d(self):
+        player_marker = {'note': 'swamp biome', 'pos': [3, 68, 0], 'dimension': 'minecraft:overworld'}
+        landmark = {'note': 'home', 'pos': [10, 64, 0], 'dimension': 'minecraft:overworld'}
+        for candidate, expected in [([13, 67, 0], True), ([13, 68, 0], False), ([13, 69, 0], False)]:
+            self.replies.clear()
+            job = {'server': (42, '1'), 'player': 'Alex', 'biome': 'minecraft:swamp',
+                   'from_landmark': False, 'player_marker': player_marker, 'player_distance': 5.0,
+                   'landmarks': [landmark], 'index': 1, 'best': None, 'failed': 0}
+            self.service.finish({'action': 'biome_landmark', 'player': 'Alex', 'job': job,
+                                 'landmark': landmark, 'biome_results': [candidate]})
+            self.service.next_biome_job = 0
+            self.service.poll_biome_jobs((42, '1'))
+            self.service.advance()
+            self.assertEqual(any('blocks from home' in text and kw.get('broadcast')
+                                 for _, text, kw in self.replies), expected)
+            self.service.queue.clear()
+            self.service.pending = None
+            self.service.inflight.clear()
+
+    def test_player_biome_distance_uses_captured_3d_position(self):
+        m.save_markers(self.args.pins_file, [{'note': 'home', 'pos': [10, 64, 0], 'dimension': 'minecraft:overworld'}])
+        pending = {'server': (42, '1'), 'player': 'Alex', 'action': 'biome_lookup',
+                   'biome': 'minecraft:swamp', 'from_landmark': False,
+                   'dimensions': ['minecraft:overworld', 'minecraft:overworld'],
+                   'pos': [0, 64, 0], 'biome_results': [[3, 68, 0]]}
+        self.service.finish(pending)
+        self.assertEqual(self.service.biome_jobs[0]['player_distance'], 5.0)
+        self.service.biome_jobs.clear()
+        self.service.queue.clear()
+        pending['biome_results'] = [[0, 64, 0]]
+        self.service.finish(pending)
+        self.assertFalse(self.service.biome_jobs)  # Nothing can beat distance zero.
+
+    def test_missing_player_search_position_does_not_invent_comparison(self):
+        m.save_markers(self.args.pins_file, [{'note': 'home', 'pos': [10, 64, 0], 'dimension': 'minecraft:overworld'}])
+        self.service.finish({'server': (42, '1'), 'player': 'Alex', 'action': 'biome_lookup',
+                             'biome': 'minecraft:swamp', 'from_landmark': False,
+                             'dimensions': ['minecraft:overworld', 'minecraft:overworld'],
+                             'biome_results': [[3, 64, 0]]})
+        self.assertFalse(self.service.biome_jobs)
+        self.assertTrue(any('Could not compare biome distances' in text for _, text, _ in self.replies))
 
     def test_biome_query_checks_landmarks_if_player_dimension_has_no_result(self):
         m.save_markers(self.args.pins_file, [{'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:the_nether'}])
@@ -500,6 +546,8 @@ class MarkerTests(unittest.TestCase):
         with patch.object(m, 'console_write') as write:
             m.console_biome_query('pipe', 'Alex', 'minecraft:swamp', 'token')
             self.assertIn('execute at Alex run locate biome minecraft:swamp\n', write.call_args.args[1])
+            self.assertLess(write.call_args.args[1].index('data get entity Alex Pos'),
+                            write.call_args.args[1].index('execute at Alex run locate biome'))
             with self.assertRaises(ValueError):
                 m.console_biome_query('pipe', 'Alex', 'minecraft:swamp\nstop', 'token')
 

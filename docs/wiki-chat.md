@@ -80,8 +80,12 @@ The same bridge also recognizes these commands at the start of a chat message:
   for example `@map --biome mangrove swamp`. It accepts Minecraft biome IDs,
   including namespaced custom IDs, and suggests similar built-in names when a
   search fails. It also searches from each saved landmark, in that landmark's
-  dimension, and reports the returned biome location closest horizontally to a
-  landmark if its coordinates and dimension differ from the player's result.
+  dimension. It reports the closest landmark result only if its three-dimensional
+  Euclidean distance from that landmark is strictly less than the player result's
+  distance from the player's position at the search, and its coordinates or
+  dimension differ from the player's result. If Minecraft finds no player-side
+  result, it can still report a landmark result. The command checks coordinates,
+  not whether two different points belong to the same connected biome region.
   Either landmark option can be included for landmark directions.
 - Unknown options receive an error and, when possible, a spelling suggestion.
   Options cannot be repeated, and the two landmark options cannot be combined.
@@ -201,8 +205,11 @@ The bridge immediately acknowledges a valid question in public chat. It queues
 additional questions in arrival order, tells their senders they are queued,
 and processes one at a time, with at least 30 seconds between request starts.
 The queue is held in memory and is discarded if the bridge or server restarts.
-If the model is unavailable or resources are low, questions remain queued
-until it is ready and the resource guard permits processing. The Wiki tab on
+Direct map matches and supported exact Wiki answers can run while the model is
+stopped. A request that actually needs inference asks the launcher to start the
+worker; the request waits for startup and the resource guard, up to five minutes.
+The existing dashboard may show the intentionally stopped model as unavailable
+or waiting until it is requested. The Wiki tab on
 the phone shows model health, resource limits, the active question, its current
 stage and elapsed time, and the first 128 queued questions; additional questions
 stay in the queue. During streaming it also shows received character count;
@@ -292,7 +299,7 @@ Install the files into root-controlled paths.
 | `/opt/n20-wiki/opencl/cl-compat.so` | Packed dot-product compatibility shim |
 | `/usr/local/lib/n20-radio/android/linker64` | Existing C.24 Bionic linker, beside its libraries |
 | `/opt/n20-wiki/model.gguf` | Verified GGUF checkpoint |
-| `/usr/local/lib/n20/` | `wiki_chat.py`, `wiki_answer.py`, `wiki_fast.py`, and `wiki_prefix.py` from the runtime tree |
+| `/usr/local/lib/n20/` | `wiki_chat.py`, `wiki_answer.py`, `wiki_fast.py`, `wiki_prefix.py`, and `wiki_demand.py` from the runtime tree |
 | `/usr/local/sbin/n20-wiki-start` | Launcher from the runtime tree, mode 0755 |
 | `/var/lib/n20-wiki/cache` | Parsed articles and SQLite index, mode 0700 owned by `minecraft` |
 | `/var/lib/n20-wiki/shaders/opencl` | OpenCL kernel cache, mode 0700 owned by UID and GID 61124 |
@@ -305,8 +312,13 @@ require roughly 80 MiB more, excluding other runtime allocations. The higher
 memory guards provide additional reserve, but the actual phone cost and gameplay
 impact still need measurement. Its CPU threads
 are restricted to efficiency cores and run at reduced priority. It requests
-the OpenCL GPU explicitly and releases the model from memory after 90
-seconds of inactivity. A request that wakes the model pays the reload cost.
+the OpenCL GPU explicitly. The launcher starts the worker only when a query
+needs inference. The worker releases model and context buffers after 90 seconds
+of inactivity, and the launcher stops the idle worker process after ten minutes.
+A later inference request pays the startup and reload cost. The root launcher
+validates the bridge-owned demand marker without following links and rejects a
+marker from an earlier bridge process. Resource and temperature guards still
+take precedence over demand.
 While awake, the single slot can reuse the unchanged portion of the prompt.
 The launcher passes `--cache-ram 0` to skip saving older model states in a
 separate RAM cache. The chat bridge still reuses sourced replies after
