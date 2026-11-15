@@ -618,6 +618,7 @@ class WikiChatTests(unittest.TestCase):
             path.write_bytes(b"old\n")
             tail = LogTail(path)
             self.assertEqual(list(tail.read()), [])
+            self.assertFalse(tail.discontinuity)
             with path.open("ab") as log:
                 log.write(b"part")
                 log.flush()
@@ -625,11 +626,14 @@ class WikiChatTests(unittest.TestCase):
                 log.write(b"ial\n" + b"x" * 12000)
                 log.flush()
                 self.assertEqual(list(tail.read()), ["partial"])
+                self.assertTrue(tail.discontinuity)
+                tail.discontinuity = False
                 log.write(b"ignored\nnew\n")
             self.assertEqual(list(tail.read()), ["new"])
             path.rename(path.with_suffix(".previous"))
             path.write_bytes(b"rotated\n")
             self.assertEqual(list(tail.read()), ["rotated"])
+            self.assertTrue(tail.discontinuity)
 
     def test_reply_is_one_literal_command_with_a_wiki_link(self):
         passages = [{"title": "Test Article", "anchor": "Usage & details"}]

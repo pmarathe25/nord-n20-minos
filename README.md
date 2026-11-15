@@ -50,6 +50,7 @@ cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
 /tmp/n20-capture-test
 python3 tests/test-mtp-sandbox.py build/n20-mtp-sandbox  # root; isolated mount namespace
 python3 tests/test-save-events.py
+python3 tests/test-death-message-compat.py --jar /opt/n20-minecraft/current/repo/versions/26.3/server-26.3.jar  # before server upgrades, use the new JAR
 python3 tests/test-ssh-policy.py  # requires OpenSSH server
 python3 tests/test-wifi-security.py
 python3 tests/test-wifi-events.py

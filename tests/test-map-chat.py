@@ -362,6 +362,112 @@ class MarkerTests(unittest.TestCase):
             self.capture_direction('Alex')
             self.assertEqual(query.call_args.args[1:3], ('Steve', 'minecraft:desert'))
 
+    def test_biome_search_reports_closest_landmark_result_if_different(self):
+        landmarks = [{'note': 'village', 'pos': [100, 64, 100], 'dimension': 'minecraft:overworld'},
+                     {'note': 'nether home', 'pos': [0, 64, 0], 'dimension': 'minecraft:the_nether'}]
+        m.save_markers(self.args.pins_file, landmarks)
+        with patch.object(m, 'console_biome_query'), patch.object(m, 'console_landmark_biome_query') as landmark_query:
+            self.service.handle(PREFIX + '<Alex> @map --biome swamp')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + 'The nearest minecraft:swamp is at [20, 64, 20] (28 blocks away)')
+            self.service.handle(PREFIX + 'Alex has the following entity data: "minecraft:overworld"')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.advance()
+            self.capture_direction('Alex')
+            for expected, result in [(landmarks[0], '[110, 64, 100]'), (landmarks[1], '[2, 64, 0]')]:
+                self.service.next_biome_job = 0
+                self.service.poll_biome_jobs((42, '1'))
+                self.service.advance()
+                self.assertEqual(landmark_query.call_args.args[1], expected)
+                token = self.service.inflight[0]['token']
+                self.service.handle(PREFIX + f'The nearest minecraft:swamp is at {result} (2 blocks away)')
+                self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.next_biome_job = 0
+            self.service.poll_biome_jobs((42, '1'))
+            self.service.advance()
+            self.assertTrue(any('swamp biome (2 blocks from nether home): 2, 64, 0 (minecraft:the_nether)' in text
+                                and kw.get('broadcast') for _, text, kw in self.replies))
+            self.capture_direction('Alex')
+            self.assertTrue(any('direction unavailable from here' in text and not kw.get('broadcast')
+                                for _, text, kw in self.replies))
+
+    def test_biome_search_does_not_repeat_same_location(self):
+        landmark = {'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [landmark])
+        with patch.object(m, 'console_biome_query'), patch.object(m, 'console_landmark_biome_query'):
+            self.service.handle(PREFIX + '<Alex> @map --biome swamp')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            for line in ('Alex has the following entity data: "minecraft:overworld"',
+                         'The nearest minecraft:swamp is at [1, 64, 2] (0 blocks away)',
+                         'Alex has the following entity data: "minecraft:overworld"',
+                         f'Found no elements matching {token}'):
+                self.service.handle(PREFIX + line)
+            self.service.advance()
+            self.capture_direction('Alex')
+            self.service.next_biome_job = 0
+            self.service.poll_biome_jobs((42, '1'))
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'The nearest minecraft:swamp is at [1, 64, 2] (0 blocks away)')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.next_biome_job = 0
+            self.service.poll_biome_jobs((42, '1'))
+            self.service.advance()
+            self.assertEqual(sum('swamp biome:' in text and bool(kw.get('broadcast')) for _, text, kw in self.replies), 1)
+            self.assertFalse(any('blocks from home' in text for _, text, _ in self.replies))
+
+    def test_biome_query_checks_landmarks_if_player_dimension_has_no_result(self):
+        m.save_markers(self.args.pins_file, [{'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:the_nether'}])
+        with patch.object(m, 'console_biome_query'):
+            self.service.handle(PREFIX + '<Alex> @map --biome warped_forest')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            for line in ('Alex has the following entity data: "minecraft:overworld"',
+                         'Could not find a biome of type "minecraft:warped_forest" within a reasonable distance',
+                         'Alex has the following entity data: "minecraft:overworld"',
+                         f'Found no elements matching {token}'):
+                self.service.handle(PREFIX + line)
+            self.assertEqual(len(self.service.biome_jobs), 1)
+
+    def test_biome_landmark_command_validates_inputs(self):
+        landmark = {'note': 'home', 'pos': [1.5, 64, -2], 'dimension': 'minecraft:overworld'}
+        with patch.object(m, 'console_write') as write:
+            m.console_landmark_biome_query('pipe', landmark, 'minecraft:swamp', 'token')
+            self.assertIn('execute in minecraft:overworld positioned 1.500000 64.000000 -2.000000 run locate biome minecraft:swamp', write.call_args.args[1])
+            with self.assertRaises(ValueError):
+                m.console_landmark_biome_query('pipe', {**landmark, 'dimension': 'minecraft:overworld\nstop'}, 'minecraft:swamp', 'token')
+
+    def test_biome_landmark_timeout_marks_result_incomplete_and_resyncs(self):
+        job = {'server': (42, '1'), 'player': 'Alex', 'biome': 'minecraft:swamp',
+               'from_landmark': False, 'player_marker': None,
+               'landmarks': [{'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'}],
+               'index': 0, 'best': None, 'failed': 0}
+        self.service.biome_jobs.append(job)
+        with patch.object(m, 'console_landmark_biome_query'), patch.object(m, 'console_write'):
+            self.service.poll_biome_jobs((42, '1'))
+            self.service.advance()
+            self.service.inflight[0]['deadline'] = 0
+            self.service.advance()
+            self.assertEqual(job['failed'], 1)
+            self.assertTrue(self.service.pending['resync'])
+            self.assertEqual(list(self.service.biome_jobs), [job])
+
+    def test_unknown_biome_does_not_scan_landmarks(self):
+        m.save_markers(self.args.pins_file, [{'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'}])
+        with patch.object(m, 'console_biome_query'):
+            self.service.handle(PREFIX + '<Alex> @map --biome badname')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            for line in ('Alex has the following entity data: "minecraft:overworld"',
+                         "Can't find element 'minecraft:badname' of type 'minecraft:worldgen/biome'",
+                         'Alex has the following entity data: "minecraft:overworld"',
+                         f'Found no elements matching {token}'):
+                self.service.handle(PREFIX + line)
+            self.assertFalse(self.service.biome_jobs)
+
     def test_biome_suggestions_and_command_validation(self):
         repo = Path(self.tmp.name) / 'versions'
         (repo / 'test').mkdir(parents=True)
@@ -488,6 +594,7 @@ class MarkerTests(unittest.TestCase):
             for name, number in [('Alex', 1), ('Steve', 2)]:
                 self.service.handle(PREFIX + f'{name} has the following entity data: [I; 0, 0, 0, {number}]')
                 self.service.handle(PREFIX + f'{name} has the following entity data: {{pos: [I; {number}, 64, -4], dimension: "minecraft:overworld"}}')
+                self.service.handle(PREFIX + f'{name} has the following entity data: 20.0f')
                 self.service.handle(PREFIX + f'{name} has {number} [n20_death]')
                 self.service.handle(PREFIX + f'{name} has {number} [n20_death]')
             self.service.handle(PREFIX + f'Found no elements matching {token}')
@@ -498,6 +605,68 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(write.call_count, 2)
         self.assertGreaterEqual(self.service.death_notices[0][0], time.monotonic() + .9)
 
+    def test_death_message_patterns_use_installed_translations(self):
+        repo = Path(self.tmp.name) / 'versions'
+        (repo / 'test').mkdir(parents=True)
+        with zipfile.ZipFile(repo / 'test/server-test.jar', 'w') as jar:
+            jar.writestr('assets/minecraft/lang/en_us.json', json.dumps({
+                'death.attack.generic': '%1$s died',
+                'death.attack.player': '%1$s was slain by %2$s',
+                'death.attack.sulfurCubeHot.player': '%2$s showed %1$s that not just the floor is lava',
+                'unrelated': '%1$s joined the game'}))
+        patterns = m.death_message_patterns(repo)
+        for text in ('Alex died', 'Alex was slain by Zombie', 'Zombie showed Alex that not just the floor is lava'):
+            match = next((p.fullmatch(text) for p in patterns if p.fullmatch(text)), None)
+            self.assertIsNotNone(match)
+            self.assertEqual(match['player'], 'Alex')
+        self.assertFalse(any(p.fullmatch('Alex joined the game') for p in patterns))
+        self.assertTrue(any((match := p.fullmatch('[Team] Alex died')) and match['player'] == '[Team] Alex'
+                            for p in patterns))
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        self.service.death_patterns = patterns
+        self.service.death_dirty = False
+        self.service.handle(PREFIX + 'System chat: [Team] Alex died')
+        self.assertTrue(self.service.death_dirty)
+        self.assertFalse(self.service.death_watch)
+
+    def test_death_tracking_is_woken_by_events_and_slowly_reconciles(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        self.service.death_patterns = [re.compile(r'(?P<player>[A-Za-z0-9_]{1,16}) died')]
+        with patch.object(m, 'console_write') as write, patch.object(m.time, 'monotonic', return_value=100):
+            self.service.poll_deaths((42, '1'))
+            setup = self.service.inflight.popleft()
+            self.service.pending = None
+            self.service.poll_deaths((42, '1'))
+            self.assertEqual(self.service.inflight[0]['kind'], 'death_poll')
+            self.assertEqual(self.service.next_death_poll, 400)
+            self.service.inflight.clear()
+            self.service.pending = None
+            count = write.call_count
+            self.service.poll_deaths((42, '1'))
+            self.assertEqual(write.call_count, count)
+            self.service.handle(PREFIX + 'System chat: Alex died')
+            self.assertIn('alex', self.service.death_watch)
+            self.service.poll_deaths((42, '1'))
+            self.assertEqual(self.service.next_death_poll, 101)
+            self.assertEqual(write.call_count, count + 1)
+            self.service.inflight.clear()
+            self.service.pending = None
+            self.service.handle(PREFIX + 'System chat: Alex left the game')
+            self.assertFalse(self.service.death_watch)
+            self.service.handle(PREFIX + 'System chat: Alex joined the game')
+            self.assertTrue(self.service.death_dirty)
+
+    def test_new_death_event_during_capture_is_not_acknowledged_as_old(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        identity = '0' * 31 + '1'
+        self.service.death_watch['alex'] = 2.0
+        batch = {'kind': 'death_poll', 'server': (42, '1'), 'watch': {'alex': 1.0},
+                 'players': {'Alex': {'uuid': identity, 'location': {'pos': [1, 64, 2],
+                             'dimension': 'minecraft:overworld'}, 'scores': [1, 1], 'health': 20.0}}}
+        with patch.object(m, 'console_write'):
+            self.service.finish_death_query(batch)
+        self.assertEqual(self.service.death_watch['alex'], 2.0)
+
     def test_death_history_caps_at_five_and_deduplicates_retry(self):
         self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
         identity = '0' * 31 + '1'
@@ -505,10 +674,51 @@ class MarkerTests(unittest.TestCase):
             for score in [1, 2, 3, 4, 5, 6, 6]:
                 self.service.finish_death_query({'kind': 'death_poll', 'server': (42, '1'),
                     'players': {'Alex': {'uuid': identity, 'location': {'pos': [score, 64, 0],
-                    'dimension': 'minecraft:overworld'}, 'scores': [score, score]}}})
+                    'dimension': 'minecraft:overworld'}, 'scores': [score, score], 'health': 20.0}}})
         saved = m.load_deaths(self.args.deaths_file)[identity]
         self.assertEqual([death['pos'][0] for death in saved['deaths']], [6, 5, 4, 3, 2])
         self.assertEqual(len(self.service.death_notices), 6)
+
+    def test_deaths_are_saved_before_respawn_and_notified_afterward(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        identity = '0' * 31 + '1'
+        with patch.object(m, 'console_write') as write:
+            for score in (1, 2):
+                batch = {'kind': 'death_poll', 'server': (42, '1'), 'watch': {},
+                         'players': {'Alex': {'uuid': identity, 'location': {'pos': [score, 64, 0],
+                                     'dimension': 'minecraft:overworld'}, 'scores': [score, score], 'health': 0.0}}}
+                self.service.finish_death_query(batch)
+            self.assertEqual([p['pos'][0] for p in m.load_deaths(self.args.deaths_file)[identity]['deaths']], [2, 1])
+            self.assertFalse(self.service.death_notices)
+            self.assertFalse(write.called)
+            batch['players']['Alex']['health'] = 20.0
+            batch['watch'] = dict(self.service.death_watch)
+            self.service.finish_death_query(batch)
+            self.assertEqual(len(self.service.death_notices), 1)
+            self.assertEqual(self.service.death_notices[0][3]['pos'], [2, 64, 0])
+            self.assertTrue(write.called)
+            self.assertFalse(self.service.death_watch)
+
+    def test_death_command_saves_latest_location_before_listing(self):
+        self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
+        with patch.object(m, 'console_write') as write:
+            self.service.handle(PREFIX + '<Alex> @death')
+            self.service.advance()
+            self.assertIn('LastDeathLocation', write.call_args.args[1])
+            token = self.service.inflight[0]['token']
+            for value in ('Alex has 2 [n20_death]',
+                          'Alex has the following entity data: [I; 0, 0, 0, 1]',
+                          'Alex has the following entity data: {pos: [I; 10, 64, -4], dimension: "minecraft:overworld"}',
+                          'Alex has the following entity data: 20.0f',
+                          'Alex has 2 [n20_death]', f'Found no elements matching {token}'):
+                self.service.handle(PREFIX + value)
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + 'Alex has the following entity data: [I; 0, 0, 0, 1]')
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
+            self.service.advance()
+            self.capture_direction('Alex')
+        self.assertTrue(any('Death 1: 10, 64, -4' in text for _, text, _ in self.replies))
 
     def test_death_command_uses_uuid_and_private_directions(self):
         self.args.deaths_file = Path(self.tmp.name) / 'deaths.json'
@@ -517,6 +727,9 @@ class MarkerTests(unittest.TestCase):
             {'pos': [5, 65, 10], 'dimension': 'minecraft:overworld'}]}})
         with patch.object(m, 'console_write'):
             self.service.handle(PREFIX + '<Alex> @death')
+            self.service.advance()
+            token = self.service.inflight[0]['token']
+            self.service.handle(PREFIX + f'Found no elements matching {token}')
             self.service.advance()
             token = self.service.inflight[0]['token']
             self.service.handle(PREFIX + 'Alex has the following entity data: [I; 0, 0, 0, 1]')

@@ -53,6 +53,7 @@ class LogTail:
         self.offset = 0
         self.pending = b""
         self.discard = False
+        self.discontinuity = False
 
     def read(self):
         with os.fdopen(os.open(self.path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb") as log:
@@ -63,6 +64,7 @@ class LogTail:
             if self.identity is None:
                 self.offset = info.st_size
             elif identity != self.identity or info.st_size < self.offset:
+                self.discontinuity = True
                 self.offset = 0
                 self.pending = b""
                 self.discard = False
@@ -76,8 +78,11 @@ class LogTail:
             lines.pop(0)
             self.discard = False
         if len(self.pending) > MAX_LINE or self.discard:
+            self.discontinuity = True
             self.pending = b""
             self.discard = True
+        if any(len(line) > MAX_LINE for line in lines):
+            self.discontinuity = True
         return (line.decode("utf-8", errors="replace") for line in lines if len(line) <= MAX_LINE)
 
 
@@ -381,11 +386,20 @@ RAY_DATA = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System 
 RAY_SAMPLE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Number provider returned value ([0-9]+)$")
 MARKER_BARRIER = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Found no elements matching (n20_pin_[0-9a-f]{32})$")
 BIOME_RESULT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?The nearest ([a-z0-9_.-]+:[a-z0-9_./-]+) is at \[(-?\d+), (-?\d+), (-?\d+)\] \(\d+ blocks away\)$")
+BIOME_NOT_FOUND = re.compile(r'\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Could not find a biome of type "([a-z0-9_.-]+:[a-z0-9_./-]+)" within a reasonable distance$')
+BIOME_UNKNOWN = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?Can't find element '([a-z0-9_.-]+:[a-z0-9_./-]+)' of type 'minecraft:worldgen/biome'$")
 DEATH_SCORE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) has (-?\d+) \[n20_death\]$")
+DEATH_CHAT = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: System chat: (.+)$")
+PLAYER_JOIN = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) joined the game$")
+PLAYER_LEAVE = re.compile(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:System chat: )?([A-Za-z0-9_]{1,16}) left the game$")
+DEATH_RECONCILE_INTERVAL = 300.0
+DEATH_RESPAWN_INTERVAL = 1.0
 MAX_PINS = 10000
 MAX_MARKER_FILE_BYTES = 24 * 1024 * 1024
 MAX_MARKER_PROMPT_BYTES = 2600  # Per-batch text budget, not a storage limit.
 MAX_MARKER_QUEUE = 128
+MAX_BIOME_JOBS = 8
+BIOME_JOB_INTERVAL = 0.25
 RAYCAST_RANGE = 512
 RAY_BATCH_SIZE = 12
 RAY_BATCH_INTERVAL = 0.02
@@ -489,6 +503,16 @@ def death_location(value):
     return {'pos': coords, 'dimension': dimension[1]}
 
 
+def death_scan_commands():
+    select = 'execute as @a if score @s n20_death > @s n20_seen run '
+    return ('execute as @a unless score @s n20_seen matches -2147483648..2147483647 run scoreboard players set @s n20_seen 0\n'
+            + select + 'scoreboard players get @s n20_death\n'
+            + select + 'data get entity @s UUID\n'
+            + select + 'data get entity @s LastDeathLocation\n'
+            + select + 'data get entity @s Health\n'
+            + select + 'scoreboard players get @s n20_death\n')
+
+
 def console_write(path, command):
     command = command.encode("ascii")
     fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -533,6 +557,16 @@ def console_biome_query(path, player, biome, token):
                   f'data get entity {player} Dimension\n' + barrier_command(token))
 
 
+def console_landmark_biome_query(path, landmark, biome, token):
+    dimension, position = landmark['dimension'], landmark['pos']
+    if (not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', dimension) or
+            not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', biome) or
+            len(position) != 3 or any(not math.isfinite(v) or abs(v) > 30000000 for v in position)):
+        raise ValueError('invalid landmark biome query')
+    coords = ' '.join(f'{v:.6f}' for v in position)
+    console_write(path, f'execute in {dimension} positioned {coords} run locate biome {biome}\n' + barrier_command(token))
+
+
 def biome_suggestions(biome, repo=Path('/opt/n20-minecraft/current/repo/versions')):
     """Suggest built-in IDs from the installed server, without ruling out datapacks."""
     if not biome.startswith('minecraft:'):
@@ -548,6 +582,45 @@ def biome_suggestions(biome, repo=Path('/opt/n20-minecraft/current/repo/versions
         name = biome.split(':', 1)[1]
         return [] if name in names else difflib.get_close_matches(name, names, n=3, cutoff=.6)
     except (OSError, ValueError, zipfile.BadZipFile):
+        return []
+
+
+def compile_death_message_patterns(language):
+    """Compile death templates; displayed player names may include team text."""
+    patterns = []
+    for key, template in language.items():
+        if not key.startswith(('death.attack.', 'death.fell.')) or not isinstance(template, str):
+            continue
+        result, pos, automatic, found = '', 0, 0, False
+        for match in re.finditer(r'%(?:(\d+)\$)?s', template):
+            result += re.escape(template[pos:match.start()])
+            if match[1]:
+                number = int(match[1])
+            else:
+                automatic += 1
+                number = automatic
+            if number == 1:
+                result += r'(?P=player)' if found else r'(?P<player>.{1,256}?)'
+                found = True
+            else:
+                result += r'.+?'
+            pos = match.end()
+        if found:
+            patterns.append(re.compile(result + re.escape(template[pos:])))
+    return patterns
+
+
+def death_message_patterns(repo=Path('/opt/n20-minecraft/current/repo/versions')):
+    """Compile vanilla English death messages from the installed server JAR."""
+    try:
+        jars = list(repo.glob('*/server-*.jar'))
+        if len(jars) != 1:
+            return []
+        with zipfile.ZipFile(jars[0]) as jar:
+            language = json.loads(jar.read('assets/minecraft/lang/en_us.json'))
+        patterns = compile_death_message_patterns(language)
+        return patterns
+    except (OSError, ValueError, TypeError, zipfile.BadZipFile, KeyError, json.JSONDecodeError, re.error):
         return []
 
 
@@ -879,7 +952,13 @@ class MarkerQueue:
         self.death_server = None
         self.next_death_poll = 0.0
         self.death_notices = []
+        self.death_announced = {}
+        self.death_patterns = death_message_patterns()
+        self.death_watch = {}
+        self.death_dirty = True
         self.player_misses = deque()
+        self.biome_jobs = deque()
+        self.next_biome_job = 0.0
 
     def send(self, player, message):
         try:
@@ -939,14 +1018,36 @@ class MarkerQueue:
 
     def handle(self, line):
         server = server_identity(self.args.pid_file)
+        death_chat = DEATH_CHAT.fullmatch(line)
+        if death_chat and getattr(self.args, 'deaths_file', None) is not None:
+            for pattern in self.death_patterns:
+                match = pattern.fullmatch(death_chat[1])
+                if match:
+                    player = match['player']
+                    if re.fullmatch(r'[A-Za-z0-9_]{1,16}', player):
+                        self.death_watch[player.casefold()] = time.monotonic()
+                    self.death_dirty = True
+                    self.next_death_poll = 0.0
+                    break
+        joined, left = PLAYER_JOIN.fullmatch(line), PLAYER_LEAVE.fullmatch(line)
+        if joined:
+            self.death_dirty = True
+            self.next_death_poll = 0.0
+        if left:
+            self.death_watch.pop(left[1].casefold(), None)
         if self.inflight and self.inflight[0]["server"] != server:
             self.pending = None
             self.inflight.clear()
         batch = self.inflight[0] if self.inflight else None
         biome_result = BIOME_RESULT.fullmatch(line)
-        if (batch and batch['kind'] == 'request' and batch['request']['action'] == 'biome_lookup'
+        if (batch and batch['kind'] == 'request' and batch['request']['action'] in ('biome_lookup', 'biome_landmark')
                 and biome_result and biome_result[1] == batch['request']['biome']):
             batch['request'].setdefault('biome_results', []).append([int(v) for v in biome_result.groups()[1:]])
+        for pattern, result in ((BIOME_NOT_FOUND, 'not_found'), (BIOME_UNKNOWN, 'unknown')):
+            match = pattern.fullmatch(line)
+            if (batch and batch['kind'] == 'request' and batch['request']['action'] in ('biome_lookup', 'biome_landmark')
+                    and match and match[1] == batch['request']['biome']):
+                batch['request']['biome_error'] = result
         data = MARKER_DATA.fullmatch(line)
         if batch and batch['kind'] in ('death_poll', 'death_lookup') and data:
             values = batch.setdefault('players', {}).setdefault(data[1], {})
@@ -956,6 +1057,9 @@ class MarkerQueue:
                 values['uuid'] = uuid
             if location:
                 values['location'] = location
+            health = re.fullmatch(r'(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)f', data[2])
+            if health and math.isfinite(float(health[1])):
+                values['health'] = float(health[1])
         score = DEATH_SCORE.fullmatch(line)
         if batch and batch['kind'] == 'death_poll' and score:
             batch.setdefault('players', {}).setdefault(score[1], {}).setdefault('scores', []).append(int(score[2]))
@@ -1012,7 +1116,12 @@ class MarkerQueue:
                 self.finish(batch['request'])
             elif batch['kind'] in ('death_poll', 'death_lookup'):
                 self.pending = None
-                self.finish_death_query(batch)
+                completed = self.finish_death_query(batch)
+                if batch.get('after'):
+                    if completed:
+                        self.queue.appendleft(batch['after'])
+                    else:
+                        self.send_private(batch['after']['player'], '[Death] Could not update your death history; please try again.')
             else:
                 self.pending = None
         match = MARKER_CHAT.fullmatch(line)
@@ -1033,7 +1142,7 @@ class MarkerQueue:
                     self.send_private(player, '[Map] Use @map --biome <biome name>.')
                 elif not server:
                     self.send_private(player, '[Map] Biome lookup is unavailable.')
-                elif len(self.queue) >= MAX_MARKER_QUEUE:
+                elif len(self.queue) >= MAX_MARKER_QUEUE or len(self.biome_jobs) >= MAX_BIOME_JOBS:
                     self.send(player, '[Map] The location queue is full; please try again.')
                 else:
                     self.queue.append({'server': server, 'player': player, 'action': 'biome_lookup',
@@ -1132,7 +1241,7 @@ class MarkerQueue:
     def finish_death_query(self, batch):
         path = getattr(self.args, 'deaths_file', None)
         if path is None:
-            return
+            return False
         try:
             history = load_deaths(path)
             if batch['kind'] == 'death_lookup':
@@ -1142,10 +1251,14 @@ class MarkerQueue:
                     self.send_private(player, '[Death] Could not identify your player; please try again.')
                 else:
                     self.show_deaths(player, history.get(identity, {}).get('deaths', []))
-                return
+                return True
             for player, data in batch.get('players', {}).items():
                 identity, location, scores = data.get('uuid'), data.get('location'), data.get('scores', [])
-                if not identity or not location or len(scores) != 2 or scores[0] != scores[1] or scores[0] < 1:
+                health = data.get('health')
+                if (not identity or not location or health is None or len(scores) != 2 or
+                        scores[0] != scores[1] or scores[0] < 1):
+                    if batch.get('after', {}).get('player', '').casefold() == player.casefold():
+                        return False
                     continue
                 score = scores[0]
                 previous = history.get(identity)
@@ -1153,19 +1266,31 @@ class MarkerQueue:
                     deaths = [location] + (previous['deaths'] if previous else [])
                     history[identity] = {'score': score, 'deaths': deaths[:5]}
                     save_markers(path, history)
-                    self.death_notices.append((time.monotonic() + 1, batch['server'], player, location))
+                if health <= 0:
+                    self.death_watch.setdefault(player.casefold(), time.monotonic())
+                    self.next_death_poll = min(self.next_death_poll, time.monotonic() + DEATH_RESPAWN_INTERVAL)
+                    continue
                 # Acknowledge only the observed score, after durable storage. A
                 # later death therefore stays visible to the next poll.
                 console_write(self.args.console, f'scoreboard players set {player} n20_seen {score}\n')
+                if self.death_announced.get(identity) != score:
+                    self.death_notices.append((time.monotonic() + 1, batch['server'], player, location))
+                    self.death_announced[identity] = score
+                key = player.casefold()
+                watched = batch.get('watch', {}).get(key)
+                if watched is not None and self.death_watch.get(key) == watched:
+                    self.death_watch.pop(key, None)
+            return True
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             print('Death history could not be read or saved; will retry', flush=True)
+            return False
 
     def poll_deaths(self, server):
         path = getattr(self.args, 'deaths_file', None)
         if path is None or not server or self.pending or self.inflight or self.queue:
             return
         now = time.monotonic()
-        if now < self.next_death_poll:
+        if self.death_server == server and not self.death_dirty and now < self.next_death_poll:
             return
         token = 'n20_pin_' + secrets.token_hex(16)
         if self.death_server != server:
@@ -1173,13 +1298,7 @@ class MarkerQueue:
                         'scoreboard objectives add n20_seen dummy\n')
             kind = 'death_setup'
         else:
-            ready = '@a[nbt=!{Health:0.0f}]'
-            select = f'execute as {ready} if score @s n20_death > @s n20_seen run '
-            commands = (f'execute as @a unless score @s n20_seen matches -2147483648..2147483647 run scoreboard players set @s n20_seen 0\n'
-                        + select + 'scoreboard players get @s n20_death\n'
-                        + select + 'data get entity @s UUID\n'
-                        + select + 'data get entity @s LastDeathLocation\n'
-                        + select + 'scoreboard players get @s n20_death\n')
+            commands = death_scan_commands()
             kind = 'death_poll'
         try:
             console_write(self.args.console, commands + barrier_command(token))
@@ -1188,29 +1307,61 @@ class MarkerQueue:
             return
         self.pending = {'server': server, 'action': kind}
         self.inflight.append({'kind': kind, 'server': server, 'token': token,
-                              'deadline': now + 30, 'players': {}})
+                              'deadline': now + 30, 'players': {}, 'watch': dict(self.death_watch)})
         if kind == 'death_setup':
             self.death_server = server
-        self.next_death_poll = now + 0.25
+            self.next_death_poll = 0.0
+        else:
+            self.death_dirty = False
+            self.next_death_poll = now + (DEATH_RESPAWN_INTERVAL if self.death_watch else DEATH_RECONCILE_INTERVAL)
 
     def finish(self, pending):
         player = pending["player"]
+        if pending['action'] == 'biome_landmark':
+            job, landmark = pending['job'], pending['landmark']
+            results = pending.get('biome_results', [])
+            if len(results) == 1 and all(abs(v) <= 30000000 for v in results[0]):
+                position = results[0]
+                distance = math.hypot(position[0] - landmark['pos'][0], position[2] - landmark['pos'][2])
+                if job['best'] is None or distance < job['best'][0]:
+                    job['best'] = (distance, landmark, position)
+            elif pending.get('biome_error') != 'not_found':
+                job['failed'] += 1
+            self.biome_jobs.append(job)
+            return
         if pending['action'] == 'biome_lookup':
             dimensions = pending.get('dimensions', [])
             results = pending.get('biome_results', [])
             if len(dimensions) != 2 or dimensions[0] != dimensions[1]:
                 self.send_private(player, '[Map] Could not determine your dimension for the biome search; please try again.')
                 return
-            if len(results) != 1 or any(abs(v) > 30000000 for v in results[0]):
+            found = len(results) == 1 and all(abs(v) <= 30000000 for v in results[0])
+            if not found:
                 suggestions = biome_suggestions(pending['biome']) if not results else []
                 message = '[Map] Could not find that biome in your current dimension, or the biome name is unknown.'
                 if suggestions:
                     message += ' Did you mean ' + ', '.join(suggestions) + '?'
                 self.send_private(player, message)
+                if pending.get('biome_error') != 'not_found':
+                    return
+            marker = None
+            if found:
+                marker = {'note': pending['biome'].split(':', 1)[1].replace('_', ' ') + ' biome',
+                          'pos': results[0], 'dimension': dimensions[0]}
+                self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark'], player))
+            try:
+                landmarks = load_markers(self.args.pins_file)
+            except (OSError, ValueError, TypeError):
+                self.send_private(player, '[Map] Could not read saved landmarks for the biome search.')
                 return
-            marker = {'note': pending['biome'].split(':', 1)[1].replace('_', ' ') + ' biome',
-                      'pos': results[0], 'dimension': dimensions[0]}
-            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark'], player))
+            if landmarks:
+                if len(self.biome_jobs) >= MAX_BIOME_JOBS:
+                    self.send_private(player, '[Map] Landmark biome searches are busy; please try again.')
+                    return
+                self.biome_jobs.append({'server': pending['server'], 'player': player, 'biome': pending['biome'],
+                                        'from_landmark': pending['from_landmark'], 'player_marker': marker,
+                                        'landmarks': landmarks, 'index': 0, 'best': None, 'failed': 0})
+                self.send_private(player, f'[Map] Checking {len(landmarks)} saved landmarks for that biome...')
             return
         if pending['action'] == 'player_lookup':
             dimensions = pending.get('dimensions', [])
@@ -1280,6 +1431,13 @@ class MarkerQueue:
                     batch['request']['capture_state'] = 'failed'
             if self.pending and self.pending.get('action') in ('death_poll', 'death_setup'):
                 self.death_server = None
+            elif self.pending and self.pending.get('action') == 'death_sync':
+                self.death_server = None
+                self.send_private(self.pending['player'], '[Death] Updating your death history timed out; please try again.')
+            elif self.pending and self.pending.get('action') == 'biome_landmark':
+                job = self.pending['job']
+                job['failed'] += 1
+                self.biome_jobs.append(job)
             elif self.pending and self.pending.get('action') == 'directions':
                 self.send_private(self.pending['player'], "[Map] Couldn't read your current position for directions.")
             elif self.pending and self.pending.get('action'):
@@ -1341,6 +1499,23 @@ class MarkerQueue:
                 continue
             if request['action'] == 'death':
                 token = 'n20_pin_' + secrets.token_hex(16)
+                if not request.get('synced'):
+                    setup = self.death_server != server
+                    commands = (('scoreboard objectives add n20_death deathCount\n'
+                                 'scoreboard objectives add n20_seen dummy\n') if setup else '')
+                    try:
+                        console_write(self.args.console, commands + death_scan_commands() + barrier_command(token))
+                    except (OSError, ValueError):
+                        self.send_private(player, '[Death] Could not update your death history; please try again.')
+                        continue
+                    if setup:
+                        self.death_server = server
+                    request['synced'] = True
+                    self.pending = {'server': server, 'player': player, 'action': 'death_sync'}
+                    self.inflight.append({'kind': 'death_poll', 'server': server, 'token': token,
+                                          'deadline': time.monotonic() + 30, 'players': {},
+                                          'watch': dict(self.death_watch), 'after': request})
+                    continue
                 try:
                     console_write(self.args.console, f'data get entity {player} UUID\n' + barrier_command(token))
                 except (OSError, ValueError):
@@ -1409,6 +1584,8 @@ class MarkerQueue:
                     console_player_location_query(self.args.console, request['target'], token)
                 elif request["action"] == "biome_lookup":
                     console_biome_query(self.args.console, player, request['biome'], token)
+                elif request["action"] == "biome_landmark":
+                    console_landmark_biome_query(self.args.console, request['landmark'], request['biome'], token)
                 else:
                     console_query(self.args.console, player, token)
             except BlockingIOError:
@@ -1416,9 +1593,18 @@ class MarkerQueue:
                     self.queue.append(request)
                     self.next_ray_batch = time.monotonic() + RAY_BATCH_INTERVAL
                     return
+                if request['action'] == 'biome_landmark':
+                    request['job']['failed'] += 1
+                    self.biome_jobs.append(request['job'])
+                    continue
                 self.send_private(player, "[Map] Directions are temporarily unavailable.") if request['action'] == 'directions' else self.send(player, "[Map] Location service is unavailable.")
                 continue
             except (OSError, ValueError):
+                if request['action'] == 'biome_landmark':
+                    request['job']['failed'] += 1
+                    self.biome_jobs.append(request['job'])
+                    self.resynchronize(server)
+                    return
                 if request['action'] == 'directions':
                     self.send_private(player, "[Map] Directions are temporarily unavailable.")
                 else:
@@ -1438,6 +1624,37 @@ class MarkerQueue:
             console_write(self.args.console, barrier_command(token))
         except (OSError, ValueError):
             pass
+
+    def poll_biome_jobs(self, server):
+        # Run one landmark at a time, after ordinary requests and death polling.
+        if self.pending or self.inflight or self.queue or time.monotonic() < self.next_biome_job:
+            return
+        while self.biome_jobs:
+            job = self.biome_jobs.popleft()
+            if job['server'] != server:
+                continue
+            if job['index'] >= len(job['landmarks']):
+                best, player_marker = job['best'], job['player_marker']
+                if job['failed']:
+                    self.send_private(job['player'], f"[Map] {job['failed']} landmark biome searches could not be completed; the result may be incomplete.")
+                if best is None:
+                    self.send_private(job['player'], '[Map] No biome location was found near the saved landmarks.')
+                    continue
+                distance, landmark, position = best
+                if (player_marker and player_marker['dimension'] == landmark['dimension'] and
+                        player_marker['pos'] == position):
+                    continue
+                name = job['biome'].split(':', 1)[1].replace('_', ' ')
+                marker = {'note': f"{name} biome ({round(distance)} blocks from {landmark['note']})",
+                          'pos': position, 'dimension': landmark['dimension']}
+                self.enqueue_listing(job['player'], [marker], self.map_landmarks(job['from_landmark'], job['player']))
+                continue
+            landmark = job['landmarks'][job['index']]
+            job['index'] += 1
+            self.queue.append({'server': server, 'player': job['player'], 'action': 'biome_landmark',
+                               'biome': job['biome'], 'job': job, 'landmark': landmark})
+            self.next_biome_job = time.monotonic() + BIOME_JOB_INTERVAL
+            return
 
 
 def parse_map_query(text):
@@ -1807,10 +2024,20 @@ def run(args):
                     active = None
                     progress = None
                 try:
-                    for line in tail.read():
+                    try:
+                        lines = tail.read()
+                    except (OSError, ValueError):
+                        marker_queue.death_dirty = True
+                        marker_queue.next_death_poll = 0.0
+                        raise
+                    for line in lines:
                         handled = marker_queue.handle(line)
                         if not handled:
                             accept_chat(line, args, requests, pending, next_request, can_run)
+                    if tail.discontinuity:
+                        marker_queue.death_dirty = True
+                        marker_queue.next_death_poll = 0.0
+                        tail.discontinuity = False
                     marker_queue.advance()
                     while marker_queue.player_misses:
                         requests.append(marker_queue.player_misses.popleft())
@@ -1833,6 +2060,8 @@ def run(args):
                     pending, player, server, next_request, question = started
                     active = (player, question)
                     progress = candidate_progress
+                if not pending and not requests:
+                    marker_queue.poll_biome_jobs(server_identity(args.pid_file))
                 now = time.monotonic()
                 if status_file and now >= next_status:
                     try:

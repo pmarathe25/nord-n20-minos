@@ -57,7 +57,8 @@ The same bridge also recognizes these commands at the start of a chat message:
   ignores case and repeated whitespace. For duplicate names, include the
   coordinates and dimension inside the first quoted argument, for example
   `@rename "home | 1 64 2 | minecraft:overworld" "cave home"`.
-- `@death` privately lists up to five recorded deaths and gives directions.
+- `@death` first checks Minecraft for newly recorded deaths, then privately lists
+  up to five recorded deaths and gives directions.
 - `@map` lists all shared saved locations in public chat, sorted alphabetically
   without regard to letter case. `@map <search>` first returns notes that match
   the entire query, ignoring case and repeated whitespace. If none match exactly,
@@ -78,7 +79,10 @@ The same bridge also recognizes these commands at the start of a chat message:
 - `@map --biome <name>` searches for a biome in the player's current dimension,
   for example `@map --biome mangrove swamp`. It accepts Minecraft biome IDs,
   including namespaced custom IDs, and suggests similar built-in names when a
-  search fails. Either landmark option can be included for landmark directions.
+  search fails. It also searches from each saved landmark, in that landmark's
+  dimension, and reports the returned biome location closest horizontally to a
+  landmark if its coordinates and dimension differ from the player's result.
+  Either landmark option can be included for landmark directions.
 - Unknown options receive an error and, when possible, a spelling suggestion.
   Options cannot be repeated, and the two landmark options cannot be combined.
   Use `--` before a search beginning with a dash to treat it as text.
@@ -100,8 +104,13 @@ The explicitly named landmark is used even if the target is closest to the
 player; comparisons across dimensions are unavailable.
 
 Biome searches use Minecraft's `/locate biome` command at the player's position
-when the queued request runs. Minecraft executes that search on the server
-thread, so a difficult search can briefly slow gameplay. The returned point is
+when the queued request runs, then separately from a snapshot of every saved
+landmark. The player's result is shown first; the landmark result follows after
+all landmark searches finish. Each landmark command is queued separately, so
+other bridge operations can run in between. Minecraft executes each search on
+the server thread, so large maps or difficult searches can slow gameplay and the
+landmark result can take a long time. A server or bridge restart interrupts the
+in-memory search. The returned point is
 the server's sampled biome location, including the searched elevation; it is
 not necessarily a safe surface destination. Searches can fail if the biome is
 unknown or cannot be found nearby in the current dimension. Suggestions use
@@ -110,14 +119,35 @@ datapack biomes.
 
 Death tracking uses Minecraft scoreboard objectives `n20_death` (death count)
 and `n20_seen` (last recorded count), and stores per-UUID history in
-`world/n20-deaths.json`. After detecting a respawn, the bridge waits at least
-one second before privately sending the latest location and fresh directions.
+`world/n20-deaths.json`. The bridge watches server death messages using the
+installed server's English death-message templates and checks the scoreboard
+when a death or player join is observed. Display names with team decorations
+also trigger a scoreboard check. After a death, it checks roughly once
+per second until that player respawns or leaves. It saves the server's latest
+death location as soon as the death is detected, before the player respawns;
+the death counter remains unacknowledged until respawn. A five-minute reconciliation
+check recovers from missed or disabled death messages and unavailable templates;
+log rotation, truncation and discarded oversized lines also trigger an immediate
+reconciliation. In those cases detection may be delayed. After detecting a respawn, the bridge
+waits at least one second before privately sending the latest location and fresh
+directions.
 Landmark comparisons for deaths include any saved location in the same
 dimension. Polling and the console queue can add to that delay. The server only
 retains the latest death location itself: if a player dies multiple times before
 the bridge can record it, the intervening locations cannot be recovered.
 Death detection and real-player respawn timing have not yet been verified in
 an in-game trial.
+
+When updating the Minecraft server, check all death-message templates in its
+extracted versioned JAR before deployment:
+
+```sh
+python3 tests/test-death-message-compat.py --jar /path/to/server-version.jar
+```
+
+The check exercises plain and team-decorated names. Long or multiline messages,
+disabled messages, server interruptions, and multiple deaths before a location
+is captured can still require the fallback or lose an earlier location.
 
 For example, if a note is exactly "village", `@map village` returns it before
 considering longer notes containing that word. `@map village?` looks for the
