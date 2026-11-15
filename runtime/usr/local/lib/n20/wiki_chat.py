@@ -83,7 +83,11 @@ class LogTail:
             self.discard = True
         if any(len(line) > MAX_LINE for line in lines):
             self.discontinuity = True
-        return (line.decode("utf-8", errors="replace") for line in lines if len(line) <= MAX_LINE)
+        # The dashboard log adds a date before Minecraft's usual time prefix.
+        # Keep existing command parsers compatible with both old and new logs.
+        return (re.sub(r"^\[\d{4}-\d{2}-\d{2}\] (?=\[\d{2}:\d{2}:\d{2}\] )", "",
+                       line.decode("utf-8", errors="replace"))
+                for line in lines if len(line) <= MAX_LINE)
 
 
 class UnixHTTP(http.client.HTTPConnection):

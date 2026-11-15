@@ -168,6 +168,14 @@ connection state, and battery temperature on every page and form. Its reads
 reuse the existing awake cadence and stop while the screen is off. Only changed
 indicator rows repaint on otherwise static pages. Existing display power and
 Wi-Fi power policy behavior is unchanged.
+Minecraft console messages include the date in the server's local timezone
+through `/usr/local/lib/n20/minecraft-log4j2.xml`; older time-only messages
+remain undated. Install that configuration and the compatible `wiki_chat.py`
+before updating the supervisor, and restart the Wiki bridge before starting
+Minecraft with the updated supervisor. The new format takes effect when the
+updated supervisor launches the server; replacing its script does not update
+an already running supervisor, so a normal phone reboot applies all three.
+The Minecraft rolling file log retains its original format.
 Confirmation buttons recheck current data and, for stop/restart, the server
 process identity. Failed server actions show the helper's reason, such as
 another operation already being in progress. On Wi-Fi send failure the password form stays open.

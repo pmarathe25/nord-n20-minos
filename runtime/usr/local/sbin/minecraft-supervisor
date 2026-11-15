@@ -142,7 +142,7 @@ while :; do
     fi
     # Mods and server code should not gain privileges through setuid binaries
     # or file capabilities if the game process is compromised.
-    setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G "-DbundlerRepoDir=$bundle/repo" -jar "$bundle/server.jar" nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
+    setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G "-DbundlerRepoDir=$bundle/repo" -Dlog4j.configurationFile=/usr/local/lib/n20/minecraft-log4j2.xml -jar "$bundle/server.jar" nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
     pid=$!
     echo "$pid" > /run/minecraft.pid
     flock -u 4

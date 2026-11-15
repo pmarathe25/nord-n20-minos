@@ -630,6 +630,13 @@ class WikiChatTests(unittest.TestCase):
                 tail.discontinuity = False
                 log.write(b"ignored\nnew\n")
             self.assertEqual(list(tail.read()), ["new"])
+            with path.open("ab") as log:
+                log.write(b"[2026-11-15] [01:37:23] [Server thread/INFO]: <Alex> @wiki hello\n")
+                log.write(b"[2026-11-15] ordinary line\n")
+            self.assertEqual(list(tail.read()), [
+                "[01:37:23] [Server thread/INFO]: <Alex> @wiki hello",
+                "[2026-11-15] ordinary line",
+            ])
             path.rename(path.with_suffix(".previous"))
             path.write_bytes(b"rotated\n")
             self.assertEqual(list(tail.read()), ["rotated"])
