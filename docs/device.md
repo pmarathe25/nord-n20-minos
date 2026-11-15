@@ -203,8 +203,17 @@ point-in-time check, not a firewall guarantee or a test from every network.
 The supervisor launches Java with an empty capability bounding set and
 `no_new_privs`, so the game cannot gain privilege via setuid executables or
 file capabilities. An already-running supervisor continues using its old
-launch command until that supervisor is restarted. To exercise the boundary
-without touching the live world, run as root:
+launch command until that supervisor is restarted.
+
+The supervisor atomically publishes `/run/minecraft.pid` as root-owned and
+group-readable by `minecraft` (mode 0640). The Wiki bridge uses it to verify
+the server identity and cannot modify or replace it. The root Wiki supervisor
+also repairs a root-owned, single-link legacy PID file if an older, still-running
+Minecraft supervisor recreates it with restrictive permissions. The repair
+rejects links and malformed files. `tests/test-minecraft-pid.py` checks these
+properties in a temporary directory.
+
+To exercise the boundary without touching the live world, run as root:
 
 ```sh
 python3 tests/test-live-private-paths.py --check-live

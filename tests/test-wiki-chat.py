@@ -158,6 +158,15 @@ class WikiChatTests(unittest.TestCase):
             finally:
                 os.close(fd)
 
+    def test_wiki_reports_missing_server_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(console='unused', pid_file=Path(tmp) / 'missing')
+            line = '[01:37:23] [Server thread/INFO]: <Alex> @wiki How does a hopper work?'
+            with patch('wiki_chat.server_identity', return_value=None), patch('wiki_chat.reply') as send:
+                accept_chat(line, args, deque(), None, 0)
+            self.assertIn('Cannot find the Minecraft server identity', send.call_args.args[2][0]['text'])
+            self.assertFalse(send.call_args.kwargs.get('broadcast', False))
+
     def test_dashboard_status_is_atomic_bounded_and_sanitized(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "status"

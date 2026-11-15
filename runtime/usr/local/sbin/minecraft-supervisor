@@ -2,6 +2,21 @@
 set -u
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+publish_server_pid() {
+    # The bridge runs as minecraft. It may read the root-owned PID, but must
+    # not be able to alter it or replace it under the root-owned /run directory.
+    [ ! -d "$1" ] || return 1
+    pid_record=$(mktemp "$1.XXXXXXXX") || return 1
+    if printf '%s\n' "$2" > "$pid_record" &&
+       chown root:minecraft "$pid_record" && chmod 0640 "$pid_record" &&
+       mv -f "$pid_record" "$1"; then
+        return 0
+    fi
+    rm -f "$pid_record"
+    return 1
+}
+
 services=1
 if [ "$#" -eq 1 ] && [ "$1" = --server-only ]; then services=0
 elif [ "$#" -ne 0 ]; then echo 'Invalid supervisor argument' >&2; exit 2
@@ -152,7 +167,14 @@ while :; do
     launched=$(cut -d. -f1 /proc/uptime)
     /usr/local/sbin/n20-service-sandbox minecraft -- setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G "-DbundlerRepoDir=$bundle/repo" -Dlog4j.configurationFile=/usr/local/lib/n20/minecraft-log4j2.xml -jar "$bundle/server.jar" nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
     pid=$!
-    echo "$pid" > /run/minecraft.pid
+    if ! publish_server_pid /run/minecraft.pid "$pid"; then
+        echo 'Could not publish Minecraft PID; stopping untracked server' >&2
+        kill "$pid" 2>/dev/null || :
+        wait "$pid" 2>/dev/null || :
+        flock -u 4
+        sleep 10
+        continue
+    fi
     flock -u 4
     wait "$pid"
     status=$?

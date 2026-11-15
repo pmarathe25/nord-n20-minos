@@ -31,6 +31,7 @@ with tempfile.TemporaryDirectory(prefix='n20-wiki-supervise-') as tmp:
         enabled.unlink();return False
     with patch.object(m,'ENABLED',enabled),patch.object(m,'LOCK',area/'lock'), \
          patch.object(m,'allowed',side_effect=allowed),patch.object(m.subprocess,'Popen',side_effect=launch), \
+         patch.object(m,'ensure_server_pid_access'), \
          patch.object(m.time,'monotonic',side_effect=lambda:clock[0]), \
          patch.object(m.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)), \
          patch.object(m.signal,'signal'),patch.object(m.HEALTH,'record',side_effect=lambda *a:events.append(a)):

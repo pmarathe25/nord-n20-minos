@@ -160,6 +160,24 @@ class MarkerTests(unittest.TestCase):
             self.assertIn('small village', m.find_marker(self.args, 'the settlement')[0]['text'])
             self.assertIn('small village', json.dumps(generate.call_args.args[4]))
 
+    def test_map_reports_actionable_identity_failure_privately(self):
+        with patch.object(m, 'server_identity', return_value=None):
+            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --biome swamp'))
+            message = self.replies[-1]
+            self.assertIn('Cannot find the Minecraft server identity', message[1])
+            self.assertIn('supervisor', message[1])
+            self.assertFalse(message[2].get('broadcast'))
+            self.assertFalse(self.service.queue)
+            self.service.handle(PREFIX + '<Alex> @help')
+            self.assertTrue(any('[Help]' in text for _, text, _ in self.replies))
+
+    def test_unreadable_server_identity_explains_permissions(self):
+        path = Path(self.tmp.name) / 'pid'
+        with patch.object(Path, 'read_text', side_effect=PermissionError):
+            text = m.server_identity_error(path, 'Map')
+        self.assertIn('Cannot read', text)
+        self.assertIn('/run/minecraft.pid permissions', text)
+
     def test_timeout_drains_stale_responses_before_next_pin(self):
         self.service.handle(PREFIX + '<Alex> @pin first')
         self.service.handle(PREFIX + '<Alex> @pin second')

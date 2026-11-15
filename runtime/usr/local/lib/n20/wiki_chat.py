@@ -373,6 +373,30 @@ def server_identity(path):
     return None
 
 
+def server_identity_error(path, label):
+    """Explain a failed identity check without exposing the PID or other data."""
+    path = Path(path)
+    try:
+        pid = int(path.read_text().strip())
+        if pid <= 1:
+            raise ValueError('invalid PID')
+    except PermissionError:
+        return f'[{label}] Cannot read the Minecraft server identity. Ask an administrator to check /run/minecraft.pid permissions.'
+    except FileNotFoundError:
+        return f'[{label}] Cannot find the Minecraft server identity. Ask an administrator to check the server and its supervisor.'
+    except (OSError, ValueError, IndexError):
+        return f'[{label}] Cannot verify the Minecraft server identity. Ask an administrator to check the server and its supervisor.'
+    try:
+        proc = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+        if not proc or proc[0] == 'Z':
+            raise ValueError('server is not running')
+    except PermissionError:
+        return f'[{label}] Cannot inspect the Minecraft server process. Ask an administrator to check /proc permissions.'
+    except (OSError, ValueError, IndexError):
+        return f'[{label}] The Minecraft server identity is stale. Ask an administrator to check the server and its supervisor.'
+    return f'[{label}] Minecraft server identity changed. Please try again.'
+
+
 def reply(path, player, components, broadcast=False):
     if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
         raise ValueError("invalid player name")
@@ -1138,6 +1162,9 @@ class MarkerQueue:
         if not match:
             return
         player, action, note = match.groups()
+        if not server and action != 'help':
+            self.send_private(player, server_identity_error(self.args.pid_file, 'Death' if action == 'death' else 'Map'))
+            return True
         if action == "map" and note and note.strip():
             try:
                 target, from_landmark, is_biome = parse_map_query(note)
@@ -1174,7 +1201,7 @@ class MarkerQueue:
                 self.send(player, '[Map] Looking that up...')
             return True
         server = server_identity(self.args.pid_file)
-        if not server:
+        if not server and action != 'help':
             return
         if action == "help":
             self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --biome <name> | @map <search> --from-landmark "<name>" | @map <search> --from-nearest-landmark | @death | @help')
@@ -1813,6 +1840,10 @@ def accept_chat(line, args, requests, pending, next_request, can_run=True):
         return None
     server = server_identity(args.pid_file)
     if not server:
+        try:
+            reply(args.console, player, [{'text': server_identity_error(args.pid_file, 'Map' if question.startswith('@map ') else 'Wiki')}])
+        except (OSError, ValueError):
+            pass
         return None
     busy = not can_run or pending is not None or bool(requests) or time.monotonic() < next_request
     if not queue_request(args, requests, pending, server, player, question):
