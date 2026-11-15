@@ -251,6 +251,22 @@ static void check_log_paging(void){
     f=tmpfile();assert(f);for(int i=0;i<262145;i++)assert(fputs("abc\n",f)>=0);assert(fflush(f)==0);
     cache=(LogCount){0};assert(!count_log_lines(f,&cache,&total));assert(count_log_lines(f,&cache,&total)&&total==262145);fclose(f);
 }
+static void check_log_detail(void){
+    char path[]="/tmp/n20-log-test-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
+    FILE *f=fdopen(fd,"w");assert(f);fputs("older\n",f);
+    for(int i=0;i<4000;i++)fputc('a'+i%26,f);
+    fputs(" end\n",f);for(int i=0;i<8;i++)fprintf(f,"newer %d\n",i);
+    assert(!fclose(f));fixture_log_path=path;
+    page=LOGS;list_offset=0;draw();check_layout();Hit older=find_action(A_SCROLL,LOG_PAGE_SIZE);activate(&older);
+    draw();check_layout();Hit entry=find_action(A_LOG_DETAIL,0);
+    activate(&entry);assert(page==LOG_DETAIL&&strlen(log_detail)==4004&&strstr(log_detail," end"));
+    draw();check_layout();assert(log_detail_count>WIKI_DETAIL_PAGE_SIZE);
+    Hit next=find_action(A_SCROLL,WIKI_DETAIL_PAGE_SIZE);activate(&next);assert(log_detail_offset==WIKI_DETAIL_PAGE_SIZE);
+    draw();Hit back=find_action(A_PAGE,LOGS);activate(&back);assert(page==LOGS&&list_offset==LOG_PAGE_SIZE);
+    draw();entry=find_action(A_LOG_DETAIL,0);f=fopen(path,"a");assert(f);fputs("new\n",f);assert(!fclose(f));
+    activate(&entry);assert(page==LOGS);
+    fixture_log_path=NULL;unlink(path);free(log_detail);log_detail=NULL;message[0]=0;message_until=0;
+}
 static void check_helper_errors(void){
     int fds[2];assert(pipe(fds)==0);
     const char *reason="Another operation is in progress\n";
@@ -359,7 +375,7 @@ int main(int argc,char **argv){
     /* The target's dumb buffer has 32 bytes of padding per scanline. */
     pitch=W*4+32;map_size=(size_t)pitch*H;canvas=calloc(1,map_size);assert(canvas);
     state.valid=1;state.updated=(long)time(NULL);state.max_players=10;strcpy(state.server,"online");
-    check_page(HOME);check_page(PLAYERS);check_page(DEVICE_SETTINGS);check_page(BACKUPS);check_page(LOGS);check_page(WIKI);check_page(WIKI_HISTORY);check_page(WIKI_DETAIL);check_wiki_status();check_helper_errors();check_log_paging();
+    check_page(HOME);check_page(PLAYERS);check_page(DEVICE_SETTINGS);check_page(BACKUPS);check_page(LOGS);check_page(WIKI);check_page(WIKI_HISTORY);check_page(WIKI_DETAIL);check_wiki_status();check_helper_errors();check_log_paging();check_log_detail();
     page=HOME;draw();assert(hit_at(70,450)<0);
     find_action(A_PAGE,PLAYERS);find_action(A_PAGE,BACKUPS);find_action(A_PAGE,DEVICE_SETTINGS);find_action(A_PAGE,LOGS);
     for(int i=0;i<4;i++)find_action(A_DIFFICULTY,i);

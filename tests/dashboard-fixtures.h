@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 static int fixture_running=1,fixture_wifi_available=1;
+static const char *fixture_log_path;
 static long fixture_battery=54,fixture_temp=286;
 static int fixture_charging;
 static FILE *fixture_file(const char *contents){
@@ -28,6 +29,7 @@ static FILE *fixture_fopen(const char *path,const char *mode){
         if(!strcmp(path,"/sys/class/power_supply/ac/online"))return fixture_file("0\n");
         if(!strcmp(path,"/sys/class/oplus_chg/battery/mmi_charging_enable"))return fixture_file("0\n");
         if(!strcmp(path,"/proc/uptime"))return fixture_file("30600.00 0.00\n");
+        if(!strcmp(path,"/var/log/minecraft.log")&&fixture_log_path)return fopen(fixture_log_path,mode);
         if(!strcmp(path,"/var/log/minecraft.log"))return fixture_file(
             "[10:20:00] Starting Minecraft server\n"
             "[10:20:12] Preparing world\n"

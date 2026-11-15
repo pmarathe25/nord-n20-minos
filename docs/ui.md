@@ -44,8 +44,9 @@ Four persistent bottom tabs divide tasks by subject:
   so the chosen backup date remains the focus of the confirmation.
 - **Phone** combines network selection and display preferences on one page.
 
-Only logs, text-entry forms and confirmations open another screen. Logs have a
-back button and keep Server selected. Lists use Previous/Next controls with a
+Logs have a back button and keep Server selected. Tap an activity entry to read
+its full message; long messages have Previous/Next controls, and returning to
+the list preserves its page. Lists use Previous/Next controls with a
 page count. Players show six entries, networks three, and backups five.
 Pagination disappears for a single
 page and clamps when a list shrinks. There are no hidden swipe-only actions.

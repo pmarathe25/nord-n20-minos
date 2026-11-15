@@ -80,18 +80,22 @@ static char message[128];
 static volatile sig_atomic_t exiting=0, sleep_requested=0;
 static int signal_pipe[2]={-1,-1};
 static int state_watch_fd=-1;
-enum { HOME, PLAYERS, LOGS, BACKUPS, DEVICE_SETTINGS, WIKI, WIKI_HISTORY, WIKI_DETAIL };
+enum { HOME, PLAYERS, LOGS, BACKUPS, DEVICE_SETTINGS, WIKI, WIKI_HISTORY, WIKI_DETAIL, LOG_DETAIL };
 enum { A_PAGE=1, A_START, A_RESTART, A_STOP, A_CONFIRM, A_CANCEL,
     A_LIST, A_ADD, A_REMOVE, A_ALLOW, A_DIFFICULTY, A_MAX, A_VIEW, A_SIM,
     A_BRIGHT, A_TIMEOUT, A_BACKUP, A_RESTORE, A_KEY, A_ERASE, A_SUBMIT,
-    A_SHIFT, A_SCROLL, A_WIFI_SELECT, A_WIFI_SCAN, A_WIFI_DISCONNECT, A_WIFI_SPACE, A_WIFI_SHOW, A_WIFI_LEFT, A_WIFI_RIGHT, A_NOTICE, A_WIKI_DETAIL };
+    A_SHIFT, A_SCROLL, A_WIFI_SELECT, A_WIFI_SCAN, A_WIFI_DISCONNECT, A_WIFI_SPACE, A_WIFI_SHOW, A_WIFI_LEFT, A_WIFI_RIGHT, A_NOTICE, A_WIKI_DETAIL, A_LOG_DETAIL };
 typedef struct { int x,y,w,h,action,value; char arg[96]; } Hit;
 static Hit hits[100], pressed_hit;
 static int hit_count, pressed_valid, down_x, down_y, drag_cancel;
 static int list_mode=1, list_offset, wifi_count, keyboard_open, keyboard_shift, difficulty_open, notice_open, idle_seconds=120;
 static char wifi_password[65], wifi_selected[65], wifi_label[80];
 static int wifi_keyboard_mode, wifi_show_password;
-static int log_has_older;
+static int log_has_older,log_display_count;
+static long log_starts[LOG_PAGE_SIZE],log_ends[LOG_PAGE_SIZE];
+static struct stat log_snapshot;
+static char *log_detail;
+static int log_list_offset,log_detail_offset,log_detail_count;
 static int wiki_history_offset;
 static int wiki_detail_offset,wiki_detail_count;
 static char wiki_detail_player[32],wiki_detail_question[1025],wiki_detail_answer[2049];
@@ -208,7 +212,7 @@ static int running(void){long pid=read_long("/run/minecraft.pid",0);return pid>1
 static int log_page(FILE *f,int offset,char lines[][160],int *older){
     char block[4096],reverse[159];size_t used=0;int skipped=0,count=0;*older=0;
     if(fseek(f,0,SEEK_END)!=0)return 0;
-    long position=ftell(f);if(position<0)return 0;
+    long position=ftell(f),end=position;if(position<0)return 0;
     while(position>0){
         size_t length=position>(long)sizeof(block)?sizeof(block):(size_t)position;position-=(long)length;
         if(fseek(f,position,SEEK_SET)!=0||fread(block,1,length,f)!=length)break;
@@ -219,9 +223,9 @@ static int log_page(FILE *f,int offset,char lines[][160],int *older){
                 if(skipped++>=offset){
                     if(count==LOG_PAGE_SIZE){*older=1;return count;}
                     for(size_t i=0;i<used;i++)lines[count][i]=reverse[used-1-i];
-                    lines[count][used]=0;count++;
+                    lines[count][used]=0;log_starts[count]=position+(long)length+1;log_ends[count]=end;count++;
                 }
-                used=0;
+                used=0;end=position+(long)length;
             }else if(ch!='\r'){
                 if(used<sizeof(reverse))reverse[used++]=(char)ch;
                 else{memmove(reverse,reverse+1,sizeof(reverse)-1);reverse[sizeof(reverse)-1]=(char)ch;}
@@ -230,7 +234,7 @@ static int log_page(FILE *f,int offset,char lines[][160],int *older){
     }
     if(used&&skipped>=offset){
         if(count==LOG_PAGE_SIZE)*older=1;
-        else{for(size_t i=0;i<used;i++)lines[count][i]=reverse[used-1-i];lines[count][used]=0;count++;}
+        else{for(size_t i=0;i<used;i++)lines[count][i]=reverse[used-1-i];lines[count][used]=0;log_starts[count]=0;log_ends[count]=end;count++;}
     }
     return count;
 }
@@ -426,7 +430,7 @@ static int confirmation_ready(int c){
     if(c==4||c==5){if(!strcmp(state.server,"recovery")||strstr(state.error,"Battery low"))return 0;if(c==5){for(int i=0;i<state.backup_count&&i<64;i++)if(!strcmp(state.backup_id[i],selected_backup))return 1;return 0;}return 1;}
     return 0;
 }
-static void heading(const char *title){int subpage=page==LOGS||page==WIKI_HISTORY||page==WIKI_DETAIL;int x=subpage&&!notice_open&&!confirm&&!keyboard_open&&!difficulty_open?230:60;text(bold,76,x,300,WHITE,title,W-x-60);}
+static void heading(const char *title){int subpage=page==LOGS||page==LOG_DETAIL||page==WIKI_HISTORY||page==WIKI_DETAIL;int x=subpage&&!notice_open&&!confirm&&!keyboard_open&&!difficulty_open?230:60;text(bold,76,x,300,WHITE,title,W-x-60);}
 static void divider(int y){rect(60,y,960,2,BORDER);}
 static void section_label(int y,const char *label){text(bold,28,60,y,DIM,label,960);}
 static void draw_indicators(void){
@@ -699,15 +703,19 @@ static void draw_backups(void){
 }
 static void draw_logs(void){
     heading("Activity");
+    text(regular,28,60,390,MUTED,"Tap an entry to read it",960);
     char logs[LOG_PAGE_SIZE][160]={{0}};FILE *f=fopen("/var/log/minecraft.log","r");log_has_older=0;
     long long total=0;int counted=f?count_log_lines(f,&log_count,&total):0;
-    int count=f?log_page(f,list_offset,logs,&log_has_older):0;if(f)fclose(f);
-    if(!count&&list_offset){list_offset=0;f=fopen("/var/log/minecraft.log","r");count=f?log_page(f,0,logs,&log_has_older):0;if(f)fclose(f);}
+    int count=f?log_page(f,list_offset,logs,&log_has_older):0;if(f){if(fstat(fileno(f),&log_snapshot))count=0;fclose(f);}
+    if(!count&&list_offset){list_offset=0;f=fopen("/var/log/minecraft.log","r");count=f?log_page(f,0,logs,&log_has_older):0;if(f){if(fstat(fileno(f),&log_snapshot))count=0;fclose(f);}}
+    log_display_count=count;
     for(int i=0;i<count;i++){
         int y=480+i*185;char first[160];size_t len=0;const char *cursor=logs[i];
         /* Wrap at a glyph boundary rather than slicing UTF-8 bytes. */
         while(*cursor){const char *next=cursor;next_codepoint(&next);size_t n=(size_t)(next-cursor);if(len+n>=sizeof(first))break;memcpy(first+len,cursor,n);first[len+n]=0;if(text_width(mono,30,first)>960)break;len+=n;cursor=next;}
         first[len]=0;text(mono,30,60,y,WHITE,first,960);if(*cursor)text(mono,28,60,y+53,MUTED,cursor,960);divider(y+112);
+        char identity[96];snprintf(identity,sizeof(identity),"%ld:%ld:%lld:%lld",log_starts[i],log_ends[i],(long long)log_snapshot.st_ino,(long long)log_snapshot.st_size);
+        add_hit(60,y-45,960,160,A_LOG_DETAIL,i,identity);
     }
     if(!count)text(regular,36,60,570,MUTED,"No activity",960);
     if(list_offset||log_has_older){
@@ -856,7 +864,31 @@ static void draw_wiki_detail(void){
     }
     int saved=list_offset;list_offset=wiki_detail_offset;pagination(1900,count,WIKI_DETAIL_PAGE_SIZE);list_offset=saved;
 }
-static int page_section(int target){return target==LOGS?HOME:(target==WIKI_HISTORY||target==WIKI_DETAIL)?WIKI:target;}
+/* Walk at glyph boundaries, including through long words. */
+static const char *log_detail_line(const char *s,char *line,size_t capacity){
+    size_t len=0;const char *cursor=s;
+    while(*cursor){
+        const char *next=cursor;next_codepoint(&next);size_t part=(size_t)(next-cursor);
+        if(len+part>=capacity)break;
+        memcpy(line+len,cursor,part);line[len+part]=0;
+        if(len&&text_width(mono,30,line)>960)break;
+        len+=part;cursor=next;
+    }
+    line[len]=0;return cursor;
+}
+static void draw_log_detail(void){
+    heading("Log message");control(60,205,130,120,PANEL,MUTED,"<",A_PAGE,LOGS,NULL);
+    const char *cursor=log_detail?log_detail:"";char line[512];int count=0;
+    while(*cursor){
+        const char *next=log_detail_line(cursor,line,sizeof(line));if(next==cursor)break;
+        if(count>=log_detail_offset&&count<log_detail_offset+WIKI_DETAIL_PAGE_SIZE)
+            text(mono,30,60,480+(count-log_detail_offset)*55,WHITE,line,960);
+        count++;cursor=next;
+    }
+    log_detail_count=count;
+    int saved=list_offset;list_offset=log_detail_offset;pagination(1900,count,WIKI_DETAIL_PAGE_SIZE);list_offset=saved;
+}
+static int page_section(int target){return (target==LOGS||target==LOG_DETAIL)?HOME:(target==WIKI_HISTORY||target==WIKI_DETAIL)?WIKI:target;}
 static void draw_navigation(void){
     static const char *labels[]={"Server","Players","World","Wiki","Phone"};static const int targets[]={HOME,PLAYERS,BACKUPS,WIKI,DEVICE_SETTINGS};
     rect(0,2210,W,190,BG);rect(60,2210,960,2,BORDER);
@@ -880,6 +912,7 @@ static void draw(void){
         case WIKI:draw_wiki();break;
         case WIKI_HISTORY:draw_wiki_history();break;
         case WIKI_DETAIL:draw_wiki_detail();break;
+        case LOG_DETAIL:draw_log_detail();break;
         default:draw_logs();break;
     }
     const char *notice=message_until>now_ms()?message:state.error[0]?state.error:state.operation[0]?state.operation:!fresh()?"Waiting for current server data...":"";
@@ -919,7 +952,19 @@ static int poll_timeout(long long now){
 }
 static void activate(const Hit *hit){
     int a=hit->action,v=hit->value;const char *arg=hit->arg;char n[32];
-    if(a==A_PAGE){int from=page;page=v;list_offset=(from==WIKI_DETAIL&&v==WIKI_HISTORY)?wiki_history_offset:0;return;}
+    if(a==A_PAGE){int from=page;page=v;list_offset=(from==WIKI_DETAIL&&v==WIKI_HISTORY)?wiki_history_offset:(from==LOG_DETAIL&&v==LOGS)?log_list_offset:0;return;}
+    if(a==A_LOG_DETAIL&&page==LOGS){
+        FILE *f=fopen("/var/log/minecraft.log","r");struct stat current;
+        if(!f||v<0||v>=log_display_count||fstat(fileno(f),&current)||current.st_dev!=log_snapshot.st_dev||current.st_ino!=log_snapshot.st_ino||current.st_size!=log_snapshot.st_size||current.st_mtim.tv_sec!=log_snapshot.st_mtim.tv_sec||current.st_mtim.tv_nsec!=log_snapshot.st_mtim.tv_nsec){if(f)fclose(f);msg("Log changed; please try again.");return;}
+        char identity[96];snprintf(identity,sizeof(identity),"%ld:%ld:%lld:%lld",log_starts[v],log_ends[v],(long long)log_snapshot.st_ino,(long long)log_snapshot.st_size);
+        if(strcmp(identity,arg)){fclose(f);msg("Log changed; please try again.");return;}
+        long length=log_ends[v]-log_starts[v];
+        if(length<0||fseek(f,log_starts[v],SEEK_SET)){fclose(f);msg("Could not read log message.");return;}
+        char *entry=malloc((size_t)length+1);
+        if(!entry||fread(entry,1,(size_t)length,f)!=(size_t)length||fstat(fileno(f),&current)||current.st_size!=log_snapshot.st_size||current.st_mtim.tv_sec!=log_snapshot.st_mtim.tv_sec||current.st_mtim.tv_nsec!=log_snapshot.st_mtim.tv_nsec){free(entry);fclose(f);msg("Could not read log message.");return;}
+        fclose(f);while(length>0&&(entry[length-1]=='\n'||entry[length-1]=='\r'))length--;entry[length]=0;
+        free(log_detail);log_detail=entry;log_list_offset=list_offset;log_detail_offset=0;page=LOG_DETAIL;return;
+    }
     if(a==A_WIKI_DETAIL&&page==WIKI_HISTORY){
         WikiStatus wiki;if(!read_wiki_status(wiki_status_path,&wiki)||v<0||v>=wiki.history_count){msg("Wiki history changed; please try again.");return;}
         char identity[24];history_identity(wiki.history_player[v],wiki.history_question[v],wiki.history_answer[v],identity,sizeof(identity));
@@ -936,6 +981,7 @@ static void activate(const Hit *hit){
     if(a==A_SCROLL&&page==WIKI){WikiStatus wiki;if(read_wiki_status(wiki_status_path,&wiki))list_offset=page_offset(list_offset+v,wiki.listed,WIKI_PAGE_SIZE);return;}
     if(a==A_SCROLL&&page==WIKI_HISTORY){WikiStatus wiki;if(read_wiki_status(wiki_status_path,&wiki))list_offset=page_offset(list_offset+v,wiki.history_count,WIKI_HISTORY_PAGE_SIZE);return;}
     if(a==A_SCROLL&&page==WIKI_DETAIL){wiki_detail_offset=page_offset(wiki_detail_offset+v,wiki_detail_count,WIKI_DETAIL_PAGE_SIZE);return;}
+    if(a==A_SCROLL&&page==LOG_DETAIL){log_detail_offset=page_offset(log_detail_offset+v,log_detail_count,WIKI_DETAIL_PAGE_SIZE);return;}
     if(a==A_SCROLL&&page==LOGS){if(v<0||log_has_older)list_offset=bounded(list_offset+v,0,100000000);return;}
     if(a==A_SCROLL){int count=page==BACKUPS?bounded(state.backup_count,0,64):list_mode?bounded(state.allow_count,0,128):bounded(state.players,0,64);int step=page==BACKUPS?BACKUP_PAGE_SIZE:PLAYER_PAGE_SIZE;list_offset=page_offset(list_offset+v,count,step);return;}
     if(a==A_KEY){char *target=keyboard_open==2?wifi_password:typed_name;size_t max=keyboard_open==2?64:16,len=strlen(target);if(len<max){size_t at=keyboard_open==2?wifi_cursor:len;if(at>len)at=len;memmove(target+at+1,target+at,len-at+1);target[at]=(char)v;if(keyboard_open==2)wifi_cursor=at+1;}return;}
