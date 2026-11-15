@@ -68,13 +68,20 @@ The same bridge also recognizes these commands at the start of a chat message:
   current position and provides private directions. If no such player is online,
   the query falls back to saved-location search. An online player name takes
   precedence over a saved location with the same name.
-- `@map --from-landmark <search>` includes landmark-relative directions for that
-  search. The option also works after the search, and does not change later
-  requests.
+- `@map <search> --from-nearest-landmark` adds directions from the closest
+  saved landmark to each result. `@map <search> --from-landmark "<name>"`
+  instead gives the distance and directions from the named saved landmark.
+  Names must match the full saved note, ignoring case and repeated whitespace;
+  quote names containing spaces. For duplicate names, supply the coordinates
+  and dimension in the quoted name, as with `@unpin`. These options can appear
+  before or after the search and apply only to the current request.
 - `@map --biome <name>` searches for a biome in the player's current dimension,
   for example `@map --biome mangrove swamp`. It accepts Minecraft biome IDs,
   including namespaced custom IDs, and suggests similar built-in names when a
-  search fails. `--from-landmark` can be included for landmark directions.
+  search fails. Either landmark option can be included for landmark directions.
+- Unknown options receive an error and, when possible, a spelling suggestion.
+  Options cannot be repeated, and the two landmark options cannot be combined.
+  Use `--` before a search beginning with a dash to treat it as text.
 - `@help` lists these commands and `@wiki`.
 
 For each matched location in a search, the bridge also privately tells the
@@ -84,11 +91,13 @@ Directions also give compass and vertical offsets from the player's position.
 No direction is given across dimensions. If the player cannot be queried, the
 bridge reports that privately. Large results are sent as multiple pages. Plain
 `@map` lists locations without directions.
-When `--from-landmark` is included, the search also describes
+When `--from-nearest-landmark` is included, the search also describes
 the closest other saved landmark in the same dimension, using east, west, north,
 south and vertical distances. When the target is already one of the player's
 closest landmarks, the bridge omits directions from another landmark.
 The unfiltered `@map` listing does not include these landmark comparisons.
+The explicitly named landmark is used even if the target is closest to the
+player; comparisons across dimensions are unavailable.
 
 Biome searches use Minecraft's `/locate biome` command at the player's position
 when the queued request runs. Minecraft executes that search on the server

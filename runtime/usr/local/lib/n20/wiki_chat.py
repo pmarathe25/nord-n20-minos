@@ -768,6 +768,12 @@ def closest_to_player(target, landmarks, position, dimension):
 
 def landmark_direction(target, landmarks, exclude_target=False):
     """Describe the nearest same-dimension landmark to a target location."""
+    if isinstance(landmarks, dict):
+        landmark = landmarks['named']
+        if landmark['dimension'] != target['dimension']:
+            return f"From {landmark['note']}: direction unavailable across dimensions"
+        distance = round(math.dist(target['pos'], landmark['pos']))
+        return f"From {landmark['note']}: {compass_direction(target, landmark['pos'])} (about {distance} blocks away)"
     nearest = None
     nearest_distance = math.inf
     skipped = False
@@ -909,11 +915,20 @@ class MarkerQueue:
         self.queue.appendleft({'server': server, 'player': player, 'action': 'listing',
                                'markers': markers, 'offset': 0, 'landmarks': landmarks})
 
-    def map_landmarks(self, enabled):
+    def map_landmarks(self, enabled, player=None):
         if not enabled:
             return []
         try:
-            return load_markers(self.args.pins_file)
+            markers = load_markers(self.args.pins_file)
+            if isinstance(enabled, str):
+                hits, _ = marker_note_selection(markers, enabled)
+                if len(hits) == 1:
+                    return {'named': markers[hits[0]]}
+                if player:
+                    self.send_private(player, '[Map] ' + ('No saved landmark matches that name.' if not hits else
+                                      'That landmark name is ambiguous; include its coordinates and dimension.'))
+                return []
+            return markers
         except (OSError, ValueError, TypeError):
             print('Map landmarks could not be read', flush=True)
         return []
@@ -1005,9 +1020,13 @@ class MarkerQueue:
             return
         player, action, note = match.groups()
         if action == "map" and note and note.strip():
-            target, from_landmark = parse_map_query(note)
-            if re.search(r'(?<!\S)--biome(?!\S)', target):
-                name = re.sub(r'(?<!\S)--biome(?!\S)', '', target).strip().lower()
+            try:
+                target, from_landmark, is_biome = parse_map_query(note)
+            except ValueError as exc:
+                self.send_private(player, '[Map] ' + str(exc))
+                return True
+            if is_biome:
+                name = target.lower()
                 name = re.sub(r'\s+', '_', name)
                 biome = name if ':' in name else 'minecraft:' + name
                 if len(biome) > 128 or not re.fullmatch(r'[a-z0-9_.-]+:[a-z0-9_./-]+', biome):
@@ -1021,8 +1040,8 @@ class MarkerQueue:
                                        'biome': biome, 'from_landmark': from_landmark})
                     self.send(player, '[Map] Looking for that biome...')
                 return True
-            if from_landmark and not target:
-                self.send_private(player, '[Map] Use @map --from-landmark <search>.')
+            if not target:
+                self.send_private(player, '[Map] Provide a search when using map options.')
                 return True
             if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', target):
                 return  # Other searches use the normal model/lookup queue.
@@ -1039,7 +1058,7 @@ class MarkerQueue:
         if not server:
             return
         if action == "help":
-            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --biome <name> | @map --from-landmark <search> | @death | @help')
+            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --biome <name> | @map <search> --from-landmark "<name>" | @map <search> --from-nearest-landmark | @death | @help')
         elif action == 'rename' and parse_rename(note) is None:
             self.send(player, '[Map] Use @rename "old note" "new note" (new notes: up to 160 characters).')
         elif action == 'unpin' and (not note or not note.strip() or len(note.strip()) > 256):
@@ -1191,7 +1210,7 @@ class MarkerQueue:
                 return
             marker = {'note': pending['biome'].split(':', 1)[1].replace('_', ' ') + ' biome',
                       'pos': results[0], 'dimension': dimensions[0]}
-            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark']))
+            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark'], player))
             return
         if pending['action'] == 'player_lookup':
             dimensions = pending.get('dimensions', [])
@@ -1202,7 +1221,7 @@ class MarkerQueue:
                 return
             marker = {'note': pending.get('target_name', pending['target']),
                       'pos': position, 'dimension': dimensions[0]}
-            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark']))
+            self.enqueue_listing(player, [marker], self.map_landmarks(pending['from_landmark'], player))
             return
         if pending["action"] == "directions":
             dimensions = pending.get("dimensions", [])
@@ -1219,7 +1238,7 @@ class MarkerQueue:
                      for marker in pending["markers"]]
             if pending.get('landmarks') is not None:
                 for index, marker in enumerate(pending['markers']):
-                    if (not pending.get('death') and
+                    if (not pending.get('death') and not isinstance(pending['landmarks'], dict) and
                             closest_to_player(marker, pending['landmarks'], position, dimensions[0])):
                         continue
                     nearby = landmark_direction(marker, pending['landmarks'], exclude_target=not pending.get('death'))
@@ -1422,15 +1441,81 @@ class MarkerQueue:
 
 
 def parse_map_query(text):
-    pattern = r'(?<!\S)--from-landmark(?!\S)'
-    from_landmark = re.search(pattern, text) is not None
-    return re.sub(pattern, '', text).strip(), from_landmark
+    # Quotes group an argument at its start (or after =), while apostrophes
+    # within ordinary search text remain literal.
+    tokens, token, quote = [], '', None
+    started = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == '\\' and i + 1 < len(text) and text[i + 1] in (quote, '\\'):
+                i += 1
+                token += text[i]
+            else:
+                token += ch
+        elif ch.isspace():
+            if started:
+                tokens.append(token)
+                token, started = '', False
+        elif ch in "\"'" and (not started or token.endswith('=')):
+            quote, started = ch, True
+        else:
+            token, started = token + ch, True
+        i += 1
+    if quote:
+        raise ValueError('Unclosed quote in map query.')
+    if started:
+        tokens.append(token)
+    options = ('--biome', '--from-landmark', '--from-nearest-landmark')
+    seen, words, from_landmark, biome, end = set(), [], False, False, False
+    i = 0
+    while i < len(tokens):
+        word = tokens[i]
+        if not end and word == '--':
+            end = True
+        elif not end and word.startswith('-'):
+            option, separator, value = word.partition('=')
+            if option not in options:
+                matches = difflib.get_close_matches(option, options, n=1, cutoff=.55)
+                hint = f' Did you mean {matches[0]}?' if matches else ''
+                raise ValueError(f'Unknown option {option}.{hint} Use @help for map options.')
+            if option in seen:
+                raise ValueError(f'Option {option} can only be used once.')
+            seen.add(option)
+            if option == '--from-landmark':
+                if not separator:
+                    i += 1
+                    if i >= len(tokens) or tokens[i].startswith('-'):
+                        raise ValueError('Option --from-landmark requires a landmark name; quote names with spaces.')
+                    value = tokens[i]
+                if not value.strip():
+                    raise ValueError('Option --from-landmark requires a landmark name.')
+                from_landmark = value.strip()
+            else:
+                if separator:
+                    raise ValueError(f'Option {option} does not take a value.')
+                if option == '--biome':
+                    biome = True
+                else:
+                    from_landmark = True
+        else:
+            words.append(word)
+        i += 1
+    if '--from-landmark' in seen and '--from-nearest-landmark' in seen:
+        raise ValueError('Choose either --from-landmark or --from-nearest-landmark, not both.')
+    return ' '.join(words).strip(), from_landmark, biome
 
 
 def marker_search_query(question):
     for prefix in ("@map ",):
         if question.startswith(prefix):
-            return parse_map_query(question[len(prefix):])[0]
+            try:
+                return parse_map_query(question[len(prefix):])[0]
+            except ValueError:
+                return None
     return None
 
 
@@ -1686,8 +1771,8 @@ def run(args):
 
     def record_reply(player, question, components):
         if marker_search_query(question) is not None and isinstance(components, MarkerResults):
-            _, from_landmark = parse_map_query(question[len('@map '):])
-            marker_queue.enqueue_listing(player, components.markers, marker_queue.map_landmarks(from_landmark))
+            _, from_landmark, _ = parse_map_query(question[len('@map '):])
+            marker_queue.enqueue_listing(player, components.markers, marker_queue.map_landmarks(from_landmark, player))
         else:
             reply(args.console, player, components, broadcast=True)
         answer = "".join(item.get("text", "") for item in components)[:512]

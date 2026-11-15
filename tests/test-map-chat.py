@@ -320,7 +320,7 @@ class MarkerTests(unittest.TestCase):
         landmark = {'note': 'village', 'pos': [10, 64, 10], 'dimension': 'minecraft:overworld'}
         m.save_markers(self.args.pins_file, [landmark])
         with patch.object(m, 'console_biome_query') as query:
-            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --biome --from-landmark mangrove swamp'))
+            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --biome --from-nearest-landmark mangrove swamp'))
             self.service.advance()
             self.assertEqual(query.call_args.args[2], 'minecraft:mangrove_swamp')
             token = self.service.inflight[0]['token']
@@ -402,7 +402,7 @@ class MarkerTests(unittest.TestCase):
     def test_map_online_player_respects_landmark_option(self):
         near = {'note': 'village', 'pos': [4, 65, 14], 'dimension': 'minecraft:overworld'}
         m.save_markers(self.args.pins_file, [near])
-        self.service.handle(PREFIX + '<Alex> @map --from-landmark Steve')
+        self.service.handle(PREFIX + '<Alex> @map --from-nearest-landmark Steve')
         self.service.advance()
         token = self.service.inflight[0]['token']
         for value in ('"minecraft:overworld"', '[10.0d, 70.0d, 10.0d]', '"minecraft:overworld"'):
@@ -550,17 +550,17 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(json.loads(legacy.read_text()), ['alex'])
         self.assertTrue(self.service.handle(PREFIX + '<Alex> @map --from-landmark'))
         self.assertFalse(self.service.queue)
-        self.assertTrue(any('Use @map --from-landmark <search>' in text for _, text, _ in self.replies))
+        self.assertTrue(any('requires a landmark name' in text for _, text, _ in self.replies))
 
     def test_map_option_is_removed_from_search_and_kept_for_offline_player_fallback(self):
-        self.assertEqual(m.marker_search_query('@map --from-landmark village well'), 'village well')
-        self.assertEqual(m.marker_search_query('@map village well --from-landmark'), 'village well')
+        self.assertEqual(m.marker_search_query('@map --from-nearest-landmark village well'), 'village well')
+        self.assertEqual(m.marker_search_query('@map village well --from-nearest-landmark'), 'village well')
         self.assertEqual(m.marker_search_query('@map village--from-landmark'), 'village--from-landmark')
-        self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve --from-landmark'))
+        self.assertTrue(self.service.handle(PREFIX + '<Alex> @map Steve --from-nearest-landmark'))
         self.service.advance()
         token = self.service.inflight[0]['token']
         self.service.handle(PREFIX + f'Found no elements matching {token}')
-        self.assertEqual(list(self.service.player_misses), [((42, '1'), 'Alex', '@map Steve --from-landmark')])
+        self.assertEqual(list(self.service.player_misses), [((42, '1'), 'Alex', '@map Steve --from-nearest-landmark')])
 
     def test_map_defaults_to_compass_without_landmark_guidance(self):
         target = {'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}
@@ -575,7 +575,66 @@ class MarkerTests(unittest.TestCase):
 
     def test_help_lists_landmark_option(self):
         self.service.handle(PREFIX + '<Alex> @help')
-        self.assertTrue(any('@map --from-landmark' in text for _, text, _ in self.replies))
+        self.assertTrue(any('--from-landmark' in text for _, text, _ in self.replies))
+        self.assertTrue(any('--from-nearest-landmark' in text and '--biome' in text for _, text, _ in self.replies))
+
+    def test_map_option_parser_and_feedback(self):
+        self.assertEqual(m.parse_map_query('village --from-landmark "Home Base"'), ('village', 'Home Base', False))
+        self.assertEqual(m.parse_map_query('--from-landmark="Home Base" --biome mangrove swamp'),
+                         ('mangrove swamp', 'Home Base', True))
+        self.assertEqual(m.parse_map_query("Steve's village --from-nearest-landmark"), ("Steve's village", True, False))
+        self.assertEqual(m.parse_map_query('-- --from-landmarks'), ('--from-landmarks', False, False))
+        for query, expected in [('--from-landmarks village', 'Did you mean --from-landmark?'),
+                                ('village --from-landmark', 'requires a landmark name'),
+                                ('village --from-landmark home --from-nearest-landmark', 'Choose either'),
+                                ('village --biome --biome', 'only be used once'),
+                                ('village --unknown', 'Unknown option --unknown'),
+                                ('village --from-landmark "home', 'Unclosed quote')]:
+            self.assertTrue(self.service.handle(PREFIX + '<Alex> @map ' + query))
+            self.assertIn(expected, self.replies[-1][1])
+            self.assertFalse(self.replies[-1][2].get('broadcast'))
+        self.assertFalse(self.service.queue)
+
+    def test_named_landmark_includes_distance_even_if_target_is_closest(self):
+        target = {'note': 'village', 'pos': [3, 64, 0], 'dimension': 'minecraft:overworld'}
+        home = {'note': 'Home Base', 'pos': [0, 64, 4], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [target, home])
+        landmarks = self.service.map_landmarks('home base', 'Alex')
+        self.service.enqueue_listing('Alex', [target], landmarks)
+        self.service.advance()
+        self.capture_direction('Alex')
+        private = '\n'.join(text for _, text, kw in self.replies if not kw.get('broadcast'))
+        self.assertIn('From Home Base: 3 blocks east, 4 blocks north (about 5 blocks away)', private)
+
+    def test_named_landmark_unknown_ambiguous_and_cross_dimension(self):
+        home = {'note': 'home', 'pos': [0, 64, 0], 'dimension': 'minecraft:overworld'}
+        duplicate = {'note': 'Home', 'pos': [1, 64, 1], 'dimension': 'minecraft:the_nether'}
+        m.save_markers(self.args.pins_file, [home, duplicate])
+        self.assertEqual(self.service.map_landmarks('missing', 'Alex'), [])
+        self.assertIn('No saved landmark', self.replies[-1][1])
+        self.assertEqual(self.service.map_landmarks('home', 'Alex'), [])
+        self.assertIn('ambiguous', self.replies[-1][1])
+        selected = self.service.map_landmarks('home | 0 64 0 | minecraft:overworld', 'Alex')
+        self.assertEqual(selected['named'], home)
+        self.assertIn('unavailable across dimensions', m.landmark_direction(duplicate, selected))
+
+    def test_player_and_biome_queries_keep_named_landmark(self):
+        home = {'note': 'home base', 'pos': [0, 64, 0], 'dimension': 'minecraft:overworld'}
+        m.save_markers(self.args.pins_file, [home])
+        self.service.handle(PREFIX + '<Alex> @map Steve --from-landmark "home base"')
+        self.service.advance()
+        token = self.service.inflight[0]['token']
+        for value in ('"minecraft:overworld"', '[10.0d, 64.0d, 0.0d]', '"minecraft:overworld"'):
+            self.service.handle(PREFIX + f'Steve has the following entity data: {value}')
+        self.service.handle(PREFIX + f'Found no elements matching {token}')
+        self.service.advance()
+        self.capture_direction('Alex')
+        self.assertTrue(any('From home base: 10 blocks east (about 10 blocks away)' in text for _, text, _ in self.replies))
+        with patch.object(m, 'console_biome_query') as query:
+            self.service.handle(PREFIX + '<Alex> @map --biome swamp --from-landmark "home base"')
+            self.service.advance()
+            self.assertEqual(query.call_args.args[2], 'minecraft:swamp')
+            self.assertEqual(self.service.pending['from_landmark'], 'home base')
 
     def test_search_omits_landmark_when_target_is_closest_to_player(self):
         target = {'note': 'target', 'pos': [3, 64, 0], 'dimension': 'minecraft:overworld'}
@@ -818,7 +877,7 @@ class MarkerTests(unittest.TestCase):
                 time.sleep(.01)
             self.assertTrue(ready.exists())
             with log.open('a') as stream:
-                stream.write(PREFIX + '<Alex> @map --from-landmark village\n')
+                stream.write(PREFIX + '<Alex> @map village --from-landmark "Village east"\n')
             commands = []
             buffer = b''
             deadline = time.monotonic() + 5
@@ -863,7 +922,7 @@ class MarkerTests(unittest.TestCase):
                     buffer = lines.pop()
                     commands.extend(lines)
             self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'Directions:' in line for line in commands))
-            self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'From Village east:' in line for line in commands))
+            self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'From Village east:' in line and b'blocks away' in line for line in commands))
         finally:
             process.terminate()
             process.join(5)
