@@ -2,6 +2,17 @@
 
 ## Current architecture
 
+The current [security controls](security.md) add raw-storage protection,
+compatible kernel restrictions, service seccomp/memory limits, a dual-stack
+legacy firewall, protected SSH logs with rotation, and bounded Wiki admission.
+That document also records deployment prerequisites and the physical-access,
+vendor-kernel and recovery risks that remain.
+
+Minecraft availability has priority over the optional Wiki. The Wiki uses a
+separate socket group, an optional-only memory hierarchy, swap-aware pressure
+guards and bounded restart supervision. The existing 6 GiB swapfile and 2 GiB
+Java maximum heap remain unchanged; see the [availability policy](security.md#swap-aware-minecraft-priority).
+
 The tested phone is CPH2459 with an unlocked bootloader. Slot B combines C.24 `vendor_boot`, `dtbo`, `vbmeta`, and a custom boot image containing kernel `5.4.254-qgki-g93bb89e5a062`. The kernel starts BusyBox `/init`, mounts the ext4 userdata volume and bind-mounts `/dev`, `/proc`, and `/sys` into the Debian root. The UUID in `boot/persistent-init` is the existing phone's UUID. Do not substitute another device or assume this image is portable. `fastboot boot` was not supported by this phone.
 
 While USB or AC power is reported present, `n20-admin powerguard` stops charging at 55% and

@@ -1,0 +1,106 @@
+#!/usr/bin/python3
+"""Record bounded nonprivate service-exit, OOM and resource diagnostics."""
+import fcntl
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import time
+
+META = Path('/var/lib/n20')
+CGROUP = Path('/run/n20-cgroups/memory')
+POLICY = Path(__file__).with_name('n20-resource-policy')
+ROLES = ('minecraft', 'wiki-model', 'wiki-launcher')
+
+
+def global_oom_count():
+    try: return int(dict(line.split() for line in Path('/proc/vmstat').read_text().splitlines()).get('oom_kill',0))
+    except (OSError,ValueError): return 0
+
+
+def oom_count(role, base=CGROUP):
+    optional=role in ('wiki-model','wiki-launcher')
+    parent = base / 'n20-optional' if optional else base
+    leaf='wiki-bridge' if role=='wiki-launcher' else role
+    path = parent / ('n20-' + leaf) / 'memory.oom_control'
+    try:
+        count=int(dict(line.split() for line in path.read_text().splitlines()).get('oom_kill', 0))
+        if optional:
+            parent=base/'n20-optional/memory.oom_control'
+            count+=int(dict(line.split() for line in parent.read_text().splitlines()).get('oom_kill',0))
+        return count
+    except (OSError, ValueError):
+        return 0
+
+
+def heap_failure(path, start=0):
+    try:
+        with path.open('rb') as log:
+            size = os.fstat(log.fileno()).st_size
+            log.seek(max(min(start, size), size - 262144))
+            text = log.read(262144).decode('utf-8', 'replace')
+        if re.search(r'(?m)^java\.lang\.OutOfMemoryError: (Java heap space|GC overhead limit exceeded)', text):
+            return 'Java heap exhausted'
+        if re.search(r'(?m)^java\.lang\.OutOfMemoryError:', text):
+            return 'Java native/off-heap allocation failed'
+    except OSError:
+        pass
+    return ''
+
+
+def record(role, event, status=0, meta=META):
+    meta.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (meta / 'service-health.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        target = meta / 'service-health.json'
+        try: data = json.loads(target.read_text())
+        except (OSError, ValueError): data = {'roles': {}, 'events': []}
+        previous = data['roles'].get(role, {})
+        current = dict(previous)
+        now = time.time()
+        current.update(event=event, time=now, status=status)
+        if event == 'started':
+            current['oom_baseline'] = oom_count(role)
+            current['global_oom_baseline'] = global_oom_count()
+            current['reason'] = ''
+            try: current['log_start'] = Path('/var/log/minecraft.log').stat().st_size
+            except OSError: current['log_start'] = 0
+        else:
+            reason = ''
+            if event == 'paused':
+                policy = importlib.machinery.SourceFileLoader('n20_resource_health', str(POLICY)).load_module()
+                try: reason = policy.last_reason()
+                except (OSError, ValueError, KeyError): reason = 'resource measurements unavailable'
+                reason = reason or 'temperature reserve'
+            elif event == 'exited' and status:
+                if oom_count(role) > previous.get('oom_baseline', 0): reason = 'cgroup OOM kill'
+                elif role == 'minecraft': reason = heap_failure(Path('/var/log/minecraft.log'), previous.get('log_start', 0))
+                if not reason and status>=128 and global_oom_count()>previous.get('global_oom_baseline',0):
+                    reason='system OOM observed since launch'
+                reason = reason or ('signal ' + str(status - 128) if status >= 128 else 'exit ' + str(status))
+            elif event == 'backoff': reason = 'bounded restart cooldown'
+            current['reason'] = reason
+            if reason:
+                # Repeated pressure holds are a state, not a stream of new
+                # incidents that can evict the actual crash history.
+                if event==previous.get('event') and status==previous.get('status') and reason==previous.get('reason'):
+                    return
+                data['events'].append({'role': role, 'event': event, 'time': now, 'status': status, 'reason': reason})
+                data['events'] = data['events'][-32:]
+        data['roles'][role] = current
+        fd, temporary = tempfile.mkstemp(prefix='.health-', dir=meta)
+        try:
+            with os.fdopen(fd, 'w') as output:
+                json.dump(data, output); output.write('\n'); output.flush(); os.fsync(output.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary): os.unlink(temporary)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) not in (3, 4) or sys.argv[1] not in ROLES or sys.argv[2] not in ('started', 'exited', 'paused', 'backoff'):
+        raise SystemExit('Usage: n20-service-health ROLE started|exited|paused|backoff [STATUS]')
+    record(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) == 4 else 0)

@@ -38,6 +38,12 @@ MAX_LINE = 4096
 REPLY_CACHE_SIZE = 64
 REQUEST_INTERVAL_SECONDS = 30
 STATUS_QUEUE_LIMIT = 128
+REQUEST_QUEUE_LIMIT = 16
+REQUEST_QUEUE_BYTES = 8192
+REQUEST_PLAYER_LIMIT = 2
+REQUEST_LIFETIME = 300
+REQUEST_ADMISSION_INTERVAL = 10
+REQUEST_REJECTION_INTERVAL = 30
 HISTORY_LIMIT = 50
 MODEL_FIRST_REPLY_SECONDS = 75
 MODEL_STREAM_IDLE_SECONDS = 15
@@ -1740,6 +1746,56 @@ def marker_search_query(question):
     return None
 
 
+class QueuedRequest(tuple):
+    def __new__(cls, server, player, question):
+        value = super().__new__(cls, (server, player, question))
+        value.accepted = time.monotonic()
+        return value
+
+
+def expire_requests(requests, now=None):
+    now = time.monotonic() if now is None else now
+    for item in list(requests):
+        if now - getattr(item, 'accepted', now) >= REQUEST_LIFETIME:
+            requests.remove(item)
+
+
+def queue_request(args, requests, pending, server, player, question):
+    """Apply the same bounded admission to chat and asynchronous map misses."""
+    if not question or len(question) > 256 or not re.fullmatch(r'[A-Za-z0-9_]{1,16}', player):
+        return False
+    now = time.monotonic()
+    expire_requests(requests, now)
+    if getattr(args, '_admission_server', None) != server:
+        args._admission_server = server
+        args._admission = OrderedDict()
+    admission = args._admission
+    admitted, rejected = admission.pop(player, (float('-inf'), float('-inf')))
+    player_count = sum(entry[1] == player for entry in requests)
+    if pending is not None and getattr(args, '_active_player', None) == player:
+        player_count += 1
+    full = (len(requests) >= REQUEST_QUEUE_LIMIT or player_count >= REQUEST_PLAYER_LIMIT or
+            sum(len(entry[2].encode('utf-8')) for entry in requests) + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES or
+            now - admitted < REQUEST_ADMISSION_INTERVAL)
+    if full:
+        if now - rejected >= REQUEST_REJECTION_INTERVAL:
+            try:
+                reply(args.console, player, [{"text": "[Wiki] Request limit reached; please try again later."}])
+            except (OSError, ValueError):
+                pass
+            rejected = now
+        admission[player] = (admitted, rejected)
+    else:
+        admission[player] = (now, rejected)
+    # Bound bookkeeping even when many distinct names appear in the log.
+    while len(admission) > 128:
+        admission.popitem(last=False)
+    if full:
+        return False
+    requests.append(QueuedRequest(server, player, question))
+    return True
+
+
 def accept_chat(line, args, requests, pending, next_request, can_run=True):
     """Queue a valid request and immediately acknowledge it to its sender."""
     match = re.fullmatch(r"\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (?:\[Not Secure\] )?<([A-Za-z0-9_]{1,16})> @(map)\s+(\S.*)", line)
@@ -1758,10 +1814,9 @@ def accept_chat(line, args, requests, pending, next_request, can_run=True):
     server = server_identity(args.pid_file)
     if not server:
         return None
-
-    now = time.monotonic()
-    busy = not can_run or pending is not None or bool(requests) or now < next_request
-    requests.append((server, player, question))
+    busy = not can_run or pending is not None or bool(requests) or time.monotonic() < next_request
+    if not queue_request(args, requests, pending, server, player, question):
+        return None
     label = "Map" if marker_search_query(question) is not None else "Wiki"
     message = (f"[{label}] Your question is queued; I'll look it up soon." if busy
                else f"[{label}] Looking that up...")
@@ -1774,6 +1829,7 @@ def accept_chat(line, args, requests, pending, next_request, can_run=True):
 def start_queued(args, requests, worker, cache, pending, next_request, wake_on_reply, can_run=True, report=None):
     """Start the oldest request for the current server when the worker is free."""
     now = time.monotonic()
+    expire_requests(requests, now)
     if not can_run or pending is not None or now < next_request:
         return None
     while requests:
@@ -1785,12 +1841,14 @@ def start_queued(args, requests, worker, cache, pending, next_request, wake_on_r
         else:
             future = worker.submit(answer_question, args, question, cache)
         future.add_done_callback(wake_on_reply)
+        args._active_player = player
         return future, player, server, now + REQUEST_INTERVAL_SECONDS, question
     return None
 
 
 def take_fast_find(args, requests):
     """Resolve a queued direct lookup even when the model is busy or asleep."""
+    expire_requests(requests)
     server = server_identity(args.pid_file)
     for entry in list(islice(requests, STATUS_QUEUE_LIMIT)):
         origin, player, question = entry
@@ -1929,16 +1987,23 @@ def restore_handoff(path):
         with os.fdopen(fd, "r", encoding="utf-8") as source:
             fd = -1
             data = json.load(source)
-        if data.get("version") != 1 or len(data["queue"]) > STATUS_QUEUE_LIMIT:
+        if data.get("version") != 1 or len(data["queue"]) > REQUEST_QUEUE_LIMIT:
             raise ValueError("invalid Wiki handoff")
         requests = deque()
+        age = max(0, time.time() - info.st_mtime)
         for server, player, question in data["queue"]:
             if (not isinstance(server, list) or len(server) != 2 or
                     not isinstance(server[0], int) or not isinstance(server[1], str) or
                     not isinstance(player, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player) or
                     not isinstance(question, str) or not question.strip() or len(question) > 256):
                 raise ValueError("invalid Wiki handoff request")
-            requests.append((tuple(server), player, question))
+            if (sum(entry[1] == player for entry in requests) >= REQUEST_PLAYER_LIMIT or
+                    sum(len(entry[2].encode('utf-8')) for entry in requests) + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES):
+                raise ValueError("Wiki handoff exceeds admission limits")
+            entry = QueuedRequest(tuple(server), player, question)
+            entry.accepted -= age
+            requests.append(entry)
+        expire_requests(requests)
         log = data["log"]
         if any(not isinstance(log[key], int) or log[key] < 0 for key in ("dev", "ino", "offset")):
             raise ValueError("invalid Wiki handoff log position")
@@ -2044,7 +2109,8 @@ def run(args):
                         tail.discontinuity = False
                     marker_queue.advance()
                     while marker_queue.player_misses:
-                        requests.append(marker_queue.player_misses.popleft())
+                        origin, sender, query = marker_queue.player_misses.popleft()
+                        queue_request(args, requests, pending, origin, sender, query)
                     marker_queue.poll_deaths(server_identity(args.pid_file))
                 except (OSError, ValueError):
                     pass

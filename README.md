@@ -12,6 +12,7 @@ The phone uses boot slot B and a reformatted userdata partition. Its bootloader 
 - `boot/` contains the persistent initramfs init and a deterministic builder. Its filesystem UUID and USB configuration are specific to this device.
 - `tools/` has non-installing builds, screen capture, and a Minecraft status probe; `tests/` exercises administration and backup behavior in temporary directories.
 - [Device and development notes](docs/device.md) describe dependencies, firmware, deployment, boot-image inputs, and known limitations.
+- [Security controls and remaining boundaries](docs/security.md) cover raw storage, service confinement, firewall policy, authentication logs, and physical/platform risks.
 - [Minecraft Wiki chat](docs/wiki-chat.md) describes the on-device `@wiki` bridge, GPU worker, and cache maintenance.
 - `docs/` contains durable documentation; older investigation reports remain available in Git history.
 - [Power measurements](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-08-power-baseline.md) record battery, idle-policy and earlier performance comparisons and their limitations.
@@ -41,6 +42,17 @@ On the phone, or another ARM64 Debian environment with the dependencies in [the 
 sh tools/build-local.sh             # builds dashboard, capture, and MTP sandbox
 sh tools/build-radio.sh             # produces open-source radio helpers; see prerequisites
 sh tests/test-security-sysctls.sh   # isolated fake sysctl files
+sudo python3 tests/test-security-devices.py  # isolated fake block nodes/sysfs
+sudo python3 tests/test-service-sandbox.py   # small test child, no game server
+sudo python3 tests/test-firewall.py          # isolated network namespaces
+python3 tests/test-firewall-dhcp.py
+python3 tests/test-log-rotation.py
+python3 tests/test-backup-locking.py
+python3 tests/test-wiki-admission.py
+sudo python3 tests/test-wiki-device-boundary.py  # fake nodes/socket, no model load
+python3 tests/test-wiki-resource-policy.py     # synthetic swap/pressure samples
+python3 tests/test-service-health.py
+python3 tests/test-wiki-supervision.py         # disposable child/backoff checks
 sudo python3 tests/test-live-private-paths.py --check-live  # read-only on the configured phone
 cc -std=c11 -O2 -Wall -Wextra -Werror -I/usr/include/libdrm -I/usr/include/freetype2 \
   tests/test-dashboard.c -o /tmp/n20-dashboard-test -ldrm -lfreetype -lm

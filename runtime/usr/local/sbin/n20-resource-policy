@@ -1,0 +1,106 @@
+#!/usr/bin/python3
+"""Minecraft-first admission/yield policy for the optional Wiki model."""
+from pathlib import Path
+import fcntl
+import json
+import os
+import sys
+import time
+
+CGROUP = Path('/run/n20-cgroups/memory')
+STATE = Path('/run/n20/wiki-resource-policy.json')
+
+
+def snapshot(proc=Path('/proc'), cgroup=CGROUP):
+    memory = dict(line.split(':', 1) for line in (proc / 'meminfo').read_text().splitlines() if ':' in line)
+    values = {key: int(memory[key].split()[0]) for key in ('MemAvailable', 'SwapFree')}
+    for source, prefix in (('memory', 'memory'), ('io', 'io')):
+        for line in (proc / 'pressure' / source).read_text().splitlines():
+            parts = line.split()
+            values[prefix + '_' + parts[0]] = float(dict(part.split('=') for part in parts[1:])['avg10'])
+    java = cgroup / 'n20-minecraft/memory.memsw.usage_in_bytes'
+    values['java_memsw'] = int(java.read_text()) if java.exists() else 0
+    model = cgroup / 'n20-optional/n20-wiki-model/cgroup.procs'
+    values['old_model'] = bool(model.read_text().strip()) if model.exists() else False
+    bridge = cgroup / 'n20-optional/n20-wiki-bridge/cgroup.procs'
+    values['old_bridge'] = bool(bridge.read_text().strip()) if bridge.exists() else False
+    return values
+
+
+def reason(values, starting=False, launcher=False):
+    if starting and values.get('old_model'):
+        return 'previous Wiki worker cleanup pending'
+    if launcher and values.get('old_bridge'):
+        return 'previous Wiki bridge cleanup pending'
+    # Healthy paging is allowed. Physical reserve also covers uncharged GPU RAM.
+    if values['MemAvailable'] < (786432 if starting else 262144):
+        return 'RAM reserve for Minecraft'
+    if values['SwapFree'] < (2097152 if starting else 786432):
+        return 'swap reserve for Minecraft'
+    if values['MemAvailable'] + values['SwapFree'] < (3145728 if starting else 1048576):
+        return 'combined free-memory reserve'
+    if values['memory_some'] >= 20 or values['memory_full'] >= 5:
+        return 'memory pressure'
+    if values['io_full'] >= 25:
+        return 'storage pressure'
+    return ''
+
+
+def update(state, values, mode, now):
+    """One sample; counters reset independently when a condition clears."""
+    starting = mode != 'running'
+    blocked = ''
+    if starting:
+        blocked = reason(values, True, mode == 'launcher')
+        if now < state.get('cooldown_until', 0): blocked = blocked or 'post-yield cooldown'
+        if blocked:
+            state['healthy_since'] = None
+        else:
+            since = state.get('healthy_since')
+            if since is None: state['healthy_since'] = since = now
+            if now - since < 30: blocked = 'healthy admission window'
+        state['counts'] = {}
+    else:
+        state['healthy_since'] = None
+        counts = state.setdefault('counts', {})
+        checks = (
+            ('low_ram', values['MemAvailable'] < 393216, 5, 'sustained low RAM reserve'),
+            ('low_swap', values['SwapFree'] < 786432, 3, 'swap reserve for Minecraft'),
+            ('low_total', values['MemAvailable'] + values['SwapFree'] < 1048576, 3, 'combined free-memory reserve'),
+            ('memory', values['memory_some'] >= 20 or values['memory_full'] >= 5, 10, 'sustained memory pressure'),
+            ('io', values['io_full'] >= 25, 10, 'sustained storage pressure'))
+        if values['MemAvailable'] < 262144: blocked = 'emergency RAM reserve'
+        for key, active, limit, label in checks:
+            counts[key] = min(limit, counts.get(key, 0) + 1) if active else 0
+            if counts[key] >= limit: blocked = blocked or label
+        if blocked: state['cooldown_until'] = now + 120
+    state['reason'] = blocked
+    return blocked
+
+
+def admit(mode, state_path=STATE):
+    with state_path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try: state = json.loads(state_path.read_text())
+        except (OSError, ValueError): state = {}
+        blocked = update(state, snapshot(), mode, time.monotonic())
+        temporary = state_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(state)); temporary.chmod(0o600)
+        os.replace(temporary, state_path)
+        return not blocked
+
+
+def last_reason():
+    try: return str(json.loads(STATE.read_text()).get('reason', ''))
+    except (OSError, ValueError): return 'resource measurements unavailable'
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] not in (['start'], ['running']):
+        raise SystemExit('Usage: n20-resource-policy start|running')
+    try:
+        allowed = admit(sys.argv[1])
+    except (OSError, ValueError, KeyError):
+        allowed = False
+    if not allowed:
+        raise SystemExit(1)

@@ -12,6 +12,8 @@ if sh "$root/runtime/usr/local/sbin/n20-security-sysctls" --test-dir "$tmp" >/de
 fi
 fake=$tmp/root
 mkdir -p "$fake/proc/sys/fs" "$fake/usr/lib/python3/dist-packages" "$fake/usr/local/sbin" "$fake/usr/local/lib/n20-radio/android" "$fake/usr/local/share/ca-certificates" "$fake/opt/java/lib/server" "$fake/opt/java/bin" "$fake/opt/n20-minecraft/bundle/repo"
+mkdir -p "$fake/proc/sys/kernel"
+for key in unprivileged_bpf_disabled dmesg_restrict kptr_restrict; do printf '0\n' > "$fake/proc/sys/kernel/$key"; done
 ln -s bundle "$fake/opt/n20-minecraft/current"
 printf 'dummy\n' > "$fake/opt/n20-minecraft/bundle/server.jar"
 for key in protected_hardlinks protected_symlinks protected_fifos protected_regular; do printf '0\n' > "$fake/proc/sys/fs/$key"; done
@@ -23,6 +25,9 @@ chmod 777 "$fake/usr/local/sbin/helper"
 printf 'dummy\n' > "$fake/opt/java/lib/server/libjvm.so"
 chmod 666 "$fake/opt/java/lib/server/libjvm.so"
 sh "$root/runtime/usr/local/sbin/n20-security-sysctls" --test-root "$fake"
+[ "$(cat "$fake/proc/sys/kernel/unprivileged_bpf_disabled")" = 1 ]
+[ "$(cat "$fake/proc/sys/kernel/dmesg_restrict")" = 1 ]
+[ "$(cat "$fake/proc/sys/kernel/kptr_restrict")" = 2 ]
 for path in "$fake" "$fake/usr" "$fake/usr/lib" "$fake/usr/lib/python3/dist-packages" "$fake/usr/local" "$fake/usr/local/sbin" "$fake/usr/local/share/ca-certificates"; do [ "$(stat -c %a "$path")" = 755 ]; done
 [ "$(stat -c %a "$fake/usr/local/lib/n20-radio/android/library.so")" = 644 ]
 [ "$(stat -c %a "$fake/usr/local/sbin/helper")" = 755 ]

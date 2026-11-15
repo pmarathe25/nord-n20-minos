@@ -1,0 +1,84 @@
+#!/usr/bin/python3
+"""Apply compatible service memory limits and a dangerous-syscall deny policy."""
+import ctypes
+import errno
+import fcntl
+import os
+from pathlib import Path
+import resource
+import subprocess
+import sys
+
+LIMITS = {'minecraft': 4 * 1024**3, 'wiki-model': 3584 * 1024**2,
+          'wiki-bridge': 256 * 1024**2}
+MEMSW_LIMITS = {'minecraft': 6 * 1024**3, 'wiki-model': 4 * 1024**3,
+                'wiki-bridge': 384 * 1024**2}
+OOM_SCORES = {'minecraft': -250, 'wiki-model': 900, 'wiki-bridge': 600}
+# Keep normal Java, Python, networking and OpenCL calls. GPU ioctls remain
+# necessary and are not claimed confined by this filter.
+DENIED = ('bpf', 'perf_event_open', 'userfaultfd', 'ptrace', 'process_vm_writev',
+          'kexec_load', 'kexec_file_load', 'init_module', 'finit_module', 'delete_module',
+          'mount', 'umount2', 'pivot_root', 'open_by_handle_at', 'name_to_handle_at',
+          'reboot', 'swapon', 'swapoff', 'add_key', 'request_key', 'keyctl')
+
+
+def memory_group(name):
+    # The vendor exposes /sys/fs/cgroup as non-writable sysfs. Use a private
+    # root-controlled mountpoint rather than hiding that tree with a tmpfs.
+    parent = Path('/run/n20-cgroups')
+    parent.mkdir(mode=0o700, exist_ok=True)
+    base = parent / 'memory'
+    base.mkdir(mode=0o700, exist_ok=True)
+    with (parent / 'setup.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (base / 'memory.limit_in_bytes').exists():
+            subprocess.run(['/usr/bin/mount', '-t', 'cgroup', '-o', 'memory,nosuid,nodev,noexec',
+                            'n20-memory', str(base)], check=True)
+    # Never put Minecraft in an aggregate OOM boundary with optional services.
+    if name.startswith('wiki-'):
+        optional = base / 'n20-optional'
+        optional.mkdir(exist_ok=True)
+        (optional / 'memory.use_hierarchy').write_text('1')
+        (optional / 'memory.limit_in_bytes').write_text(str(3584 * 1024**2))
+        (optional / 'memory.memsw.limit_in_bytes').write_text(str(4608 * 1024**2))
+        base = optional
+    group = base / ('n20-' + name)
+    group.mkdir(exist_ok=True)
+    (group / 'memory.limit_in_bytes').write_text(str(LIMITS[name]))
+    (group / 'memory.memsw.limit_in_bytes').write_text(str(MEMSW_LIMITS[name]))
+    (group / 'cgroup.procs').write_text(str(os.getpid()))
+    Path('/proc/self/oom_score_adj').write_text(str(OOM_SCORES[name]))
+
+
+def syscall_filter():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0):
+        raise OSError(ctypes.get_errno(), 'cannot set no_new_privs')
+    sec = ctypes.CDLL('libseccomp.so.2', use_errno=True)
+    sec.seccomp_init.argtypes = [ctypes.c_uint32]
+    sec.seccomp_init.restype = ctypes.c_void_p
+    sec.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    sec.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
+    sec.seccomp_load.argtypes = [ctypes.c_void_p]
+    sec.seccomp_release.argtypes = [ctypes.c_void_p]
+    context = sec.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+    if not context:
+        raise RuntimeError('cannot allocate syscall filter')
+    try:
+        for name in DENIED:
+            number = sec.seccomp_syscall_resolve_name(name.encode())
+            if number >= 0 and sec.seccomp_rule_add(context, 0x00050000 | errno.EPERM, number, 0):
+                raise RuntimeError('cannot restrict syscall: ' + name)
+        if sec.seccomp_load(context):
+            raise RuntimeError('cannot activate syscall filter')
+    finally:
+        sec.seccomp_release(context)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 4 or sys.argv[1] not in LIMITS or sys.argv[2] != '--':
+        raise SystemExit('Usage: n20-service-sandbox minecraft|wiki-model|wiki-bridge -- COMMAND...')
+    memory_group(sys.argv[1])
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    syscall_filter()
+    os.execvp(sys.argv[3], sys.argv[3:])

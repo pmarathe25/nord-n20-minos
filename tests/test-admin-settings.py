@@ -55,6 +55,17 @@ config.write_text('difficulty=easy\nmax-players=5\nview-distance=6\nsimulation-d
 m.make_state(); state=(m.RUN/'state').read_text()
 assert 'whitelist=off\n' in state and 'allow_count=0\n' in state and 'backup_count=0\n' in state
 assert 'charge_stop=55\n' in state and 'charge_resume=50\n' in state
+health=m.META/'service-health.json'
+health.write_text(json.dumps({'roles':{'wiki-model':{'event':'paused','reason':'sustained memory pressure'}},'events':[]}))
+m.make_state();state=(m.RUN/'state').read_text()
+assert 'error=Wiki paused: sustained memory pressure\n' in state and 'operation=\n' in state
+health.write_text(json.dumps({'roles':{'wiki-model':{'event':'backoff'}},'events':[]}))
+m.make_state();assert 'error=Wiki recovering; Minecraft has priority\n' in (m.RUN/'state').read_text()
+health.write_text(json.dumps({'roles':{},'events':[{'role':'minecraft','event':'exited','status':137,'time':time.time(),'reason':'cgroup OOM kill'}]}))
+m.make_state();assert 'error=Minecraft restarted: cgroup OOM kill\n' in (m.RUN/'state').read_text()
+m.set_error('current backup warning');m.make_state()
+assert 'error=current backup warning\n' in (m.RUN/'state').read_text()
+m.ERR.unlink();health.unlink()
 # The dashboard should report the same time-gate failures as the supervisor.
 assert not m.credible_clock(100) and not m.credible_clock(4102444801)
 (m.META/'trusted-time').write_text('1800000000\n')

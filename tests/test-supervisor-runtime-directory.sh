@@ -21,6 +21,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$tmp/bin" "$tmp/sbin" "$tmp/server" "$tmp/log" "$tmp/ssh" "$tmp/security/proc/sys/fs" "$tmp/security/usr/local/sbin"
 chmod 777 "$tmp/security/usr/local/sbin"
+mkdir -p "$tmp/security/proc/sys/kernel"
+for key in unprivileged_bpf_disabled dmesg_restrict kptr_restrict; do printf '0\n' > "$tmp/security/proc/sys/kernel/$key"; done
 for key in protected_hardlinks protected_symlinks protected_fifos protected_regular; do printf '0\n' > "$tmp/security/proc/sys/fs/$key"; done
 cp /usr/local/bin/busybox "$tmp/bin/busybox"
 cat >"$tmp/sbin/n20-mtp-start" <<'EOF'
@@ -41,9 +43,10 @@ cat >"$tmp/sbin/n20-security-sysctls" <<'EOF'
 #!/bin/sh
 exec /bin/sh "$CHECK_SECURITY_HELPER" --test-root "$CHECK_SECURITY_ROOT"
 EOF
-for service in n20-radio-start n20-wifi-manager; do
+for service in n20-radio-start n20-wifi-manager n20-log-maintenance n20-ssh-start n20-service-sandbox n20-resource-policy n20-service-health n20-wiki-supervisor n20-stop-process; do
     printf '#!/bin/sh\nsleep 2\n' > "$tmp/sbin/$service"
 done
+printf '#!/bin/sh\nexit 0\n' > "$tmp/sbin/n20-firewall"
 chmod 755 "$tmp/sbin/"*
 export CHECK_FILE="$tmp/result"
 export CHECK_SECURITY_ROOT="$tmp/security"

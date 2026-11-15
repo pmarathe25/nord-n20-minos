@@ -1,0 +1,13 @@
+#!/bin/sh
+# logrotate timers are not run by this installation's BusyBox PID 1.
+set -eu
+umask 077
+mkdir -p /var/lib/n20
+while :; do
+    if /usr/sbin/logrotate --state /var/lib/n20/logrotate.state /etc/n20-logrotate.conf; then
+        rm -f /var/lib/n20/logrotate-error
+    else
+        date -u '+Log rotation failed at %Y-%m-%dT%H:%M:%SZ' > /var/lib/n20/logrotate-error
+    fi
+    sleep 60
+done

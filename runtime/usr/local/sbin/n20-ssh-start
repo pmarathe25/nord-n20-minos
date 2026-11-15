@@ -1,0 +1,12 @@
+#!/bin/sh
+# Keep authentication logging active under BusyBox init, including restarts.
+set -eu
+umask 077
+mkdir -p /run/sshd
+touch /var/log/n20-ssh.log
+chmod 600 /var/log/n20-ssh.log
+/usr/sbin/sshd -t -f /etc/ssh/sshd_config_n20
+while :; do
+    /usr/sbin/sshd -D -E /var/log/n20-ssh.log -f /etc/ssh/sshd_config_n20 || :
+    sleep 2
+done

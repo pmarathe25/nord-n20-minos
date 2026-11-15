@@ -295,7 +295,10 @@ def ensure_repo():
         run_restic(['init'], timeout=120)
 
 def run_restic(args, timeout=1800):
-    cmd = ['/usr/bin/ionice', '-c', '3', '/usr/bin/nice', '-n', '10', RESTIC, '-r', str(REPO), '--password-file', str(PASS), '--no-cache'] + args
+    # Drive restores hold shared repository locks; retention needs an exclusive
+    # lock. Wait for legitimate concurrent work, never remove its lock.
+    retry = '30s' if timeout <= 120 else '5m'
+    cmd = ['/usr/bin/ionice', '-c', '3', '/usr/bin/nice', '-n', '10', RESTIC, '-r', str(REPO), '--password-file', str(PASS), '--no-cache', '--retry-lock', retry] + args
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         detail = (result.stderr or result.stdout or 'unknown error').strip().splitlines()
@@ -393,8 +396,6 @@ def create_snapshot(tag, source=None, live=False):
     if live: args += ['--tag', 'live']
     args += ['--exclude', 'session.lock', str(source)]
     run_restic(args)
-    try: backup_wake.signal(RUN,'drive')
-    except OSError: pass  # A missed wake is recovered by the periodic scan.
     return refresh_cache()
 
 def run_backup_copy(cmd, timeout=300):
@@ -499,6 +500,11 @@ def backup(scheduled=False):
         except (OSError,ValueError,EOFError,IndexError): count=None
         retention(allow_prune=(count==0))
     except (AdminError,subprocess.TimeoutExpired) as exc: set_error('Snapshot saved; cleanup failed: '+str(exc))
+    finally:
+        # Publish after retention releases its exclusive lock. A missed wake is
+        # recovered by Drive's periodic scan.
+        try: backup_wake.signal(RUN,'drive')
+        except OSError: pass
 
 def secure_restore_area():
     """Keep restore artifacts outside the game-writable server directory."""
@@ -558,6 +564,8 @@ def restore(snapshot_id):
         try:
             copy_quiescent_world()
             create_snapshot('pre-restore', STAGE_WORLD)
+            try: backup_wake.signal(RUN,'drive')
+            except OSError: pass
         finally:
             clear_stage()
         set_operation('Preparing selected backup')
@@ -717,6 +725,24 @@ def make_state():
            'operation':operation, 'error':read(ERR), 'updated_unix':str(int(time.time()))}
     try: lines['server_port']=str(configured_server_port())
     except (OSError, ValueError, UnicodeError): pass
+    try:
+        health_path=META/'service-health.json'
+        if health_path.stat().st_size > 65536: raise ValueError('oversize service health')
+        health=json.loads(health_path.read_text())
+        for event in reversed(health.get('events', [])):
+            if event.get('role')=='minecraft' and event.get('event')=='exited' and event.get('status') and 0<=time.time()-event.get('time',0)<86400:
+                if not lines['error']: lines['error']='Minecraft restarted: '+str(event.get('reason','unexpected exit'))[:80]
+                break
+        roles=health.get('roles',{})
+        if any(roles.get(role,{}).get('event')=='backoff' for role in ('wiki-model','wiki-launcher')) and not lines['error']:
+            lines['error']='Wiki recovering; Minecraft has priority'
+        if not lines['error']:
+            for role in ('wiki-model','wiki-launcher'):
+                current=roles.get(role,{})
+                if current.get('event')=='paused':
+                    lines['error']='Wiki paused: '+str(current.get('reason','Minecraft reserve'))[:90]
+                    break
+    except (OSError, ValueError, TypeError, AttributeError): pass
     if restore_held(): lines['error']='Interrupted restore: server held for recovery'; lines['server']='recovery'
     elif low_battery_held(): lines['error']='Battery low: waiting for charge'; lines['server']='offline'
     elif not active and (not (BUNDLE/'server.jar').is_file() or not (BUNDLE/'repo').is_dir()):
@@ -767,8 +793,17 @@ def locked(action):
     with open(LOCK,'a+') as lock:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: raise AdminError('Another operation is in progress')
-        ERR.unlink(missing_ok=True)
-        try: action()
+        try: previous_error = ERR.stat()
+        except FileNotFoundError: previous_error = None
+        try:
+            action()
+            # Keep an old diagnostic visible until the operation succeeds, and
+            # retain a new cleanup warning even when snapshot creation passed.
+            try: current_error = ERR.stat()
+            except FileNotFoundError: current_error = None
+            if previous_error is not None and current_error is not None and (
+                    previous_error.st_dev, previous_error.st_ino) == (current_error.st_dev, current_error.st_ino):
+                ERR.unlink()
         finally: OP.unlink(missing_ok=True)
 
 def close_inherited_operation_lock():

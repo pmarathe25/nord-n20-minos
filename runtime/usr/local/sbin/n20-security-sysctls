@@ -44,3 +44,17 @@ for key in protected_hardlinks protected_symlinks protected_fifos protected_regu
     printf '1\n' > "$file" || { echo "Cannot enable kernel protection: $key" >&2; exit 1; }
     [ "$(cat "$file")" = 1 ] || { echo "Kernel protection not active: $key" >&2; exit 1; }
 done
+if [ "$check_paths" -eq 1 ] && [ -z "$root" ]; then
+    /usr/local/sbin/n20-security-devices || exit 1
+fi
+# These controls are supported by the installed vendor kernel. BPF value 1
+# may remain locked until reboot; no running service needs unprivileged BPF.
+if [ "$check_paths" -eq 1 ]; then
+    for setting in unprivileged_bpf_disabled:1 dmesg_restrict:1 kptr_restrict:2; do
+        key=${setting%:*}; value=${setting#*:}
+        file=$root/proc/sys/kernel/$key
+        [ -f "$file" ] || { echo "Missing kernel protection: $key" >&2; exit 1; }
+        printf '%s\n' "$value" > "$file" || exit 1
+        [ "$(cat "$file")" = "$value" ] || exit 1
+    done
+fi

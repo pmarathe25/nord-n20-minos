@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+"""Restart the optional Wiki launcher with bounded backoff and resource gates."""
+import fcntl
+import importlib.machinery
+import os
+from pathlib import Path
+import signal
+import subprocess
+import time
+
+POLICY = importlib.machinery.SourceFileLoader('n20_wiki_policy', str(Path(__file__).with_name('n20-resource-policy'))).load_module()
+HEALTH = importlib.machinery.SourceFileLoader('n20_wiki_health', str(Path(__file__).with_name('n20-service-health'))).load_module()
+STOP = importlib.machinery.SourceFileLoader('n20_wiki_stop', str(Path(__file__).with_name('n20-stop-process'))).load_module()
+ENABLED = Path('/etc/n20-wiki-enabled')
+LOCK = Path('/run/n20/wiki-supervisor.lock')
+LAUNCHER = '/usr/local/sbin/n20-wiki-start'
+
+
+def backoff(failures):
+    return min(900, 30 * 2 ** min(failures, 5))
+
+
+def allowed():
+    try: return POLICY.admit('launcher')
+    except (OSError, ValueError, KeyError): return False
+
+
+def main():
+    lock = LOCK.open('a')
+    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError: return
+    child = None
+    stopped = False
+    def stop(*_):
+        nonlocal stopped
+        stopped = True
+        if child and child.poll() is None: child.terminate()
+    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+    failures = 0
+    try:
+        while not stopped and ENABLED.exists():
+            if not allowed():
+                HEALTH.record('wiki-launcher', 'paused')
+                for _ in range(1):
+                    if stopped: break
+                    time.sleep(1)
+                continue
+            HEALTH.record('wiki-launcher', 'started')
+            started = time.monotonic()
+            child = subprocess.Popen([LAUNCHER])
+            while not stopped and child.poll() is None: time.sleep(1)
+            if stopped: break
+            status = child.wait()
+            HEALTH.record('wiki-launcher', 'exited', status if status >= 0 else 128 - status)
+            if time.monotonic() - started >= 300: failures = 0
+            HEALTH.record('wiki-launcher', 'backoff')
+            for _ in range(backoff(failures)):
+                if stopped or not ENABLED.exists(): break
+                time.sleep(1)
+            failures += 1
+    finally:
+        if child and child.poll() is None:
+            # The launcher's own cleanup is bounded for model and bridge.
+            STOP.stop(child.pid, 20, 2)
+            try: child.wait(timeout=1)
+            except subprocess.TimeoutExpired: pass
+        lock.close()
+
+
+if __name__ == '__main__': main()

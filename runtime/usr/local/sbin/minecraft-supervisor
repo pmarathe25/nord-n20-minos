@@ -1,5 +1,6 @@
 #!/bin/sh
 set -u
+umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 services=1
 if [ "$#" -eq 1 ] && [ "$1" = --server-only ]; then services=0
@@ -35,6 +36,11 @@ chmod go-w /srv/minecraft || exit 1
 if [ "$services" -eq 1 ]; then
 [ -x /usr/local/sbin/n20-security-sysctls ] || { echo 'Missing filesystem protection helper' >&2; exit 1; }
 /usr/local/sbin/n20-security-sysctls || exit 1
+for helper in n20-firewall n20-log-maintenance n20-ssh-start n20-service-sandbox n20-resource-policy n20-service-health n20-wiki-supervisor n20-stop-process; do
+    [ -x "/usr/local/sbin/$helper" ] || { echo "Missing required security helper: $helper" >&2; exit 1; }
+done
+/usr/local/sbin/n20-firewall || exit 1
+/usr/local/bin/busybox setsid /usr/local/sbin/n20-log-maintenance </dev/null >>/var/log/n20-log-maintenance.log 2>&1 &
 # n20-wifi-start
 /usr/local/bin/busybox setsid /usr/local/sbin/n20-radio-start >>/var/log/n20-radio.log 2>&1 </dev/null &
 /usr/local/bin/busybox setsid /usr/local/sbin/n20-wifi-manager >>/var/log/n20-wifi.log 2>&1 </dev/null &
@@ -55,7 +61,7 @@ if [ -x /usr/local/sbin/n20-save-events ]; then
     /usr/local/bin/busybox setsid /usr/local/sbin/n20-save-events >>/var/log/n20-save-events.log 2>&1 </dev/null &
 fi
 if [ -f /etc/n20-wiki-enabled ] && [ -x /usr/local/sbin/n20-wiki-start ]; then
-    /usr/local/bin/busybox setsid /usr/local/sbin/n20-wiki-start >>/var/log/n20-wiki.log 2>&1 </dev/null &
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-wiki-supervisor >>/var/log/n20-wiki.log 2>&1 </dev/null &
 fi
 if [ -x /usr/local/sbin/n20-admin ]; then
     /usr/local/bin/busybox setsid /usr/local/sbin/n20-admin scheduler >>/var/log/n20-scheduler.log 2>&1 </dev/null &
@@ -67,8 +73,7 @@ if [ -x /usr/local/sbin/n20-drive-backup ] && [ -f /etc/n20-drive/rclone.conf ];
     /usr/local/bin/busybox setsid /usr/bin/ionice -c 3 /usr/local/sbin/n20-drive-backup scheduler >>/var/log/n20-drive-backup.log 2>&1 </dev/null &
 fi
 if [ -x /usr/sbin/sshd ] && [ -f /etc/ssh/sshd_config_n20 ]; then
-    mkdir -p /run/sshd
-    /usr/sbin/sshd -t -f /etc/ssh/sshd_config_n20 && /usr/sbin/sshd -f /etc/ssh/sshd_config_n20
+    /usr/local/bin/busybox setsid /usr/local/sbin/n20-ssh-start </dev/null >/dev/null 2>&1 &
 fi
 fi
 cd /srv/minecraft || exit 1
@@ -86,6 +91,7 @@ else
 fi
 exec 3<>/run/minecraft-console
 exec 4>/run/n20/server-transition.lock
+restart_delay=10
 while :; do
     if [ -e /run/minecraft-stop ] || { [ -e /var/lib/n20/restore-hold ] || [ -L /var/lib/n20/restore-hold ] || [ -e /srv/minecraft/.n20-restore-hold ] || [ -L /srv/minecraft/.n20-restore-hold ]; } || { [ -e /var/lib/n20/low-battery-hold ] || [ -L /var/lib/n20/low-battery-hold ] || [ -e /srv/minecraft/.n20-low-battery-hold ] || [ -L /srv/minecraft/.n20-low-battery-hold ]; }; then
         sleep 5
@@ -142,7 +148,9 @@ while :; do
     fi
     # Mods and server code should not gain privileges through setuid binaries
     # or file capabilities if the game process is compromised.
-    setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G "-DbundlerRepoDir=$bundle/repo" -Dlog4j.configurationFile=/usr/local/lib/n20/minecraft-log4j2.xml -jar "$bundle/server.jar" nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
+    /usr/local/sbin/n20-service-health minecraft started || :
+    launched=$(cut -d. -f1 /proc/uptime)
+    /usr/local/sbin/n20-service-sandbox minecraft -- setpriv --no-new-privs --bounding-set=-all --reuid=minecraft --regid=minecraft --clear-groups /opt/java/bin/java -Xms512M -Xmx2G "-DbundlerRepoDir=$bundle/repo" -Dlog4j.configurationFile=/usr/local/lib/n20/minecraft-log4j2.xml -jar "$bundle/server.jar" nogui <&3 4>&- >> /var/log/minecraft.log 2>&1 &
     pid=$!
     echo "$pid" > /run/minecraft.pid
     flock -u 4
@@ -150,5 +158,9 @@ while :; do
     status=$?
     rm -f /run/minecraft.pid
     echo "$(date -u): Minecraft exited with status $status" >> /var/log/minecraft.log
-    sleep 10
+    /usr/local/sbin/n20-service-health minecraft exited "$status" || :
+    ended=$(cut -d. -f1 /proc/uptime)
+    if [ "$status" -eq 0 ] || [ "$((ended-launched))" -ge 300 ]; then restart_delay=10; fi
+    sleep "$restart_delay"
+    if [ "$status" -ne 0 ]; then restart_delay=$((restart_delay*2)); [ "$restart_delay" -le 120 ] || restart_delay=120; fi
 done

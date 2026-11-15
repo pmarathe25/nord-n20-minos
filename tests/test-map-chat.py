@@ -290,10 +290,12 @@ class MarkerTests(unittest.TestCase):
             self.service.advance()
             self.assertFalse(requests)
             self.assertTrue(any('village:' in text for _, text, _ in self.replies))
-            for query in ('village spot', 'village?'):
+            now = m.time.monotonic()
+            for index, query in enumerate(('village spot', 'village?')):
                 line = PREFIX + '<Alex> @map ' + query
                 self.service.handle(line)
-                m.accept_chat(line, self.args, requests, None, 0, False)
+                with patch.object(m.time, 'monotonic', return_value=now + index * 11):
+                    m.accept_chat(line, self.args, requests, None, 0, False)
             self.assertFalse(self.service.queue)
             self.assertIsNone(m.take_fast_find(self.args, requests))
             self.assertEqual(requests[0][2], '@map village spot')

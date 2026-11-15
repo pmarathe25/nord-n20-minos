@@ -274,7 +274,13 @@ Use the matching C.24 OTA's `vendor/firmware` files `a630_sqe.fw`,
 `a615_zap.mdt`, and `a615_zap.b00` through `a615_zap.b02` for the KGSL
 driver. The launcher creates restricted KGSL and ION character devices from
 their registered sysfs major and minor numbers. Reserve numeric UID and GID
-61124 for this worker. Use `n20-wiki-start --devices-only` as root to prepare
+61124 for this worker and dedicated socket GID 61125 for the bridge. The
+bridge receives socket group 61125 and cannot open the GPU nodes, whose group
+remains 61124. Model-directory setgid inheritance supplies the socket group
+without adding it to the worker's supplementary groups. The optional model
+can use swap but yields to sustained Minecraft pressure; see the current
+[resource limits and restart policy](security.md#swap-aware-minecraft-priority).
+Use `n20-wiki-start --devices-only` as root to prepare
 the two device nodes for an experiment without starting the chat bridge.
 Install the files into root-controlled paths.
 

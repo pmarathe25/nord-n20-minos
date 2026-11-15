@@ -1,6 +1,7 @@
 #!/bin/sh
 # Verify both restore holds gate server startup in an isolated mount namespace.
 set -eu
+umask 022
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if [ "${1:-}" != --inside ]; then exec unshare -m sh "$0" --inside "$root"; fi
 root=$2
@@ -10,14 +11,21 @@ case "$tmp" in /tmp/n20-hold-test.*) ;; *) exit 1 ;; esac
 cleanup() {
     [ -z "${pid:-}" ] || kill "$pid" 2>/dev/null || :
     umount -l /opt/java 2>/dev/null || :
+    umount -l /usr/local/sbin 2>/dev/null || :
     umount -l /opt 2>/dev/null || :
     umount -l /var/lib/n20 2>/dev/null || :
     umount -l /srv/minecraft 2>/dev/null || :
     umount -l /run 2>/dev/null || :
+    rm -rf -- "$tmp"
 }
 trap cleanup EXIT
 chmod 755 "$tmp"
-mkdir -p "$tmp/server" "$tmp/meta" "$tmp/java/bin"
+mkdir -p "$tmp/server" "$tmp/meta" "$tmp/java/bin" "$tmp/sbin"
+cp "$root/runtime/usr/local/sbin/n20-service-sandbox" "$tmp/sbin/"
+chmod 755 "$tmp/sbin/n20-service-sandbox"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/sbin/n20-service-health"
+chmod 755 "$tmp/sbin/n20-service-health"
+mount --bind "$tmp/sbin" /usr/local/sbin
 mount -t tmpfs -o mode=755 tmpfs /run
 mount --bind "$tmp/server" /srv/minecraft
 mount --bind "$tmp/meta" /var/lib/n20

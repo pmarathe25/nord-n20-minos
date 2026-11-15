@@ -13,6 +13,7 @@ for key, expected in {
     'passwordauthentication':'no', 'kbdinteractiveauthentication':'no',
     'permitemptypasswords':'no', 'maxauthtries':'3',
     'logingracetime':'30', 'maxstartups':'10:30:60',
+    'compression':'no', 'gssapiauthentication':'no', 'loglevel':'VERBOSE',
 }.items():
     assert values.get(key) == [expected], (key, values.get(key))
 assert values['pubkeyauthentication'] == ['yes']

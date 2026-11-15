@@ -22,3 +22,7 @@ case "$1" in
     $B ip route del default dev "$interface" 2>/dev/null || :
     ;;
 esac
+# Recompute administration subnets after a lease change, including deconfig.
+# A failure preserves the previous dual-stack policy and is reported to DHCP.
+[ -x /usr/local/sbin/n20-firewall ] || { echo 'Missing firewall helper' >&2; exit 1; }
+/usr/local/sbin/n20-firewall

@@ -50,7 +50,7 @@ for block in /sys/class/block/*; do
 done
 if [ -n "$found" ]; then
     number=$(cat "$found/dev")
-    mknod /dev/userdata b "${number%:*}" "${number#*:}"
+    mknod -m 600 /dev/userdata b "${number%:*}" "${number#*:}"
     if $B blkid /dev/userdata | $B grep -q 'UUID="d52d9354-5eac-46e0-9661-1b3b253f5d1b"'; then
         if mount -t ext4 /dev/userdata /newroot; then
             mount -o bind /dev /newroot/dev

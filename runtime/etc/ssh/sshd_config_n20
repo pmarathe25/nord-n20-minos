@@ -11,5 +11,8 @@ MaxStartups 10:30:60
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM yes
+Compression no
+GSSAPIAuthentication no
+LogLevel VERBOSE
 PidFile /run/sshd.pid
 Subsystem sftp /usr/lib/openssh/sftp-server

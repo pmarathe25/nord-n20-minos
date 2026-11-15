@@ -1,0 +1,34 @@
+#!/usr/bin/python3
+"""Bounded optional-service termination; never hang a pressure monitor."""
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+
+def identity(pid):
+    try:
+        fields=Path('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split()
+        return None if fields[0]=='Z' else fields[19]
+    except (FileNotFoundError, ProcessLookupError): return None
+
+
+def stop(pid, term_seconds=5, kill_seconds=2):
+    if pid<=1 or pid==os.getpid(): raise ValueError('invalid service PID')
+    cookie=identity(pid)
+    if cookie is None:return True
+    for sig,seconds in ((signal.SIGTERM,term_seconds),(signal.SIGKILL,kill_seconds)):
+        if identity(pid)!=cookie:return True
+        try:os.kill(pid,sig)
+        except ProcessLookupError:return True
+        deadline=time.monotonic()+seconds
+        while time.monotonic()<deadline:
+            if identity(pid)!=cookie:return True
+            time.sleep(.1)
+    return identity(pid)!=cookie
+
+
+if __name__=='__main__':
+    if len(sys.argv)!=2:raise SystemExit('Usage: n20-stop-process PID')
+    raise SystemExit(0 if stop(int(sys.argv[1])) else 1)

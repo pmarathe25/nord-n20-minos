@@ -40,7 +40,7 @@ def run(args, *, input_data=None, timeout=3600):
 
 
 def restic(*args):
-    return run([RESTIC, '-r', str(REPO), '--password-file', str(PASS), '--no-cache', *args])
+    return run([RESTIC, '-r', str(REPO), '--password-file', str(PASS), '--no-cache', '--retry-lock', '5m', *args])
 
 
 def rclone(*args, input_data=None):

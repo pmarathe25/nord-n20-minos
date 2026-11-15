@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+"""Apply legacy dual-stack netfilter policy supported by the vendor kernel."""
+import ipaddress
+import json
+import subprocess
+import sys
+
+
+def policy(family, addresses):
+    lines = ['*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+             '-A INPUT -i lo -j ACCEPT',
+             '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+             '-A INPUT -m conntrack --ctstate INVALID -j DROP']
+    if family == 4:
+        lines += ['-A INPUT -p icmp -j ACCEPT',
+                  '-A INPUT -i wlan0 -p udp --sport 67 --dport 68 -j ACCEPT']
+        # Only sources on the interface's actual current subnet may administer.
+        for interface in addresses:
+            if interface['ifname'] not in ('wlan0', 'usb0'):
+                continue
+            for address in interface.get('addr_info', []):
+                if address['family'] == 'inet':
+                    subnet = ipaddress.ip_network(f"{address['local']}/{address['prefixlen']}", strict=False)
+                    lines.append(f"-A INPUT -i {interface['ifname']} -s {subnet} -p tcp --dport 22 -j ACCEPT")
+    else:
+        # Neighbor/router discovery, PMTU and errors are necessary for IPv6.
+        lines += ['-A INPUT -p ipv6-icmp -j ACCEPT',
+                  '-A INPUT -i wlan0 -p udp --sport 547 --dport 546 -j ACCEPT']
+    # Deliberately preserve remote players; online auth and whitelist remain.
+    lines += ['-A INPUT -p tcp --dport 25565 -j ACCEPT', 'COMMIT', '']
+    return '\n'.join(lines)
+
+
+def main():
+    addresses = json.loads(subprocess.check_output(['/usr/sbin/ip', '-j', 'address', 'show']))
+    saved = [(tool, subprocess.check_output([save], text=True)) for save, tool in (
+        ('/usr/sbin/iptables-legacy-save', '/usr/sbin/iptables-legacy-restore'),
+        ('/usr/sbin/ip6tables-legacy-save', '/usr/sbin/ip6tables-legacy-restore'))]
+    try:
+        for family, (tool, _) in zip((4, 6), saved):
+            subprocess.run([tool, '--wait', '10'], input=policy(family, addresses), text=True, check=True)
+    except BaseException as exc:
+        # Applying two families is not atomic; restore both if either fails.
+        failures=[]
+        for tool, previous in saved:
+            try:
+                subprocess.run([tool, '--wait', '10'], input=previous, text=True, check=True)
+            except (OSError, subprocess.CalledProcessError) as rollback_error:
+                failures.append(str(rollback_error))
+        if failures:
+            raise RuntimeError('Firewall apply failed; rollback errors: '+'; '.join(failures)) from exc
+        raise
+
+
+if __name__ == '__main__':
+    main()

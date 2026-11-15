@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+"""Restrict raw storage nodes before any unprivileged services start."""
+import os
+from pathlib import Path
+import stat
+import sys
+
+
+def secure(root=Path('/')):
+    device = root / 'dev/userdata'
+    info = device.lstat()
+    if not stat.S_ISBLK(info.st_mode):
+        raise RuntimeError('userdata is not a block device')
+    identity = f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}'
+    matches = [entry for entry in (root / 'sys/class/block').iterdir()
+               if (entry / 'dev').read_text().strip() == identity
+               and 'PARTNAME=userdata' in (entry / 'uevent').read_text().splitlines()]
+    if len(matches) != 1:
+        raise RuntimeError('userdata node does not match device partition identity')
+    # Other aliases or raw disks must not bypass pathname confidentiality.
+    for directory, dirs, files in os.walk(root / 'dev', followlinks=False):
+        for name in files:
+            path = Path(directory) / name
+            info = path.lstat()
+            if stat.S_ISBLK(info.st_mode):
+                os.chown(path, 0, 0, follow_symlinks=False)
+                os.chmod(path, 0o600, follow_symlinks=False)
+    if stat.S_IMODE(device.stat().st_mode) != 0o600:
+        raise RuntimeError('userdata permissions could not be secured')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == '--test-root':
+        secure(Path(sys.argv[2]))
+    elif len(sys.argv) == 1:
+        secure()
+    else:
+        raise SystemExit('Usage: n20-security-devices [--test-root DIRECTORY]')
