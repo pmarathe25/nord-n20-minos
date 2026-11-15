@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/usr/local/lib/n20"))
 from wiki_answer import UNKNOWN, grounded_reply
-from wiki_chat import CHAT, LogTail, RequestProgress, accept_chat, answer_question, generate, load_history, read_completion, render, reply, restore_handoff, save_history, start_queued, write_dashboard_status
+from wiki_chat import CHAT, LogTail, RequestProgress, accept_chat, answer_question, generate, load_history, read_completion, render, reply, restore_handoff, save_history, start_queued, styled_components, write_dashboard_status
 from wiki_fast import exact_answer
 
 
@@ -119,13 +119,13 @@ class WikiChatTests(unittest.TestCase):
                     ack = os.read(fd, 4096)
                     self.assertTrue(ack.startswith(b"tellraw @a "))
                     self.assertEqual(json.loads(ack[len(b"tellraw @a "):]),
-                                     [{"text": "[Wiki] Looking that up..."}])
+                                     styled_components([{"text": "[Wiki] Looking that up..."}]))
                     second = line.replace("<Alex>", "<Steve>").replace("hopper", "furnace")
                     accept_chat(second, args, requests, None, 0)
                     ack = os.read(fd, 4096)
                     self.assertTrue(ack.startswith(b"tellraw @a "))
                     self.assertEqual(json.loads(ack[len(b"tellraw @a "):]),
-                                     [{"text": "[Wiki] Your question is queued; I'll look it up soon."}])
+                                     styled_components([{"text": "[Wiki] Your question is queued; I'll look it up soon."}]))
                     self.assertEqual(len(submitted), 0)
                     future, player, server, next_request, question = start_queued(
                         args, requests, worker, {}, None, 0, lambda _: None)
@@ -672,13 +672,26 @@ class WikiChatTests(unittest.TestCase):
                 command = os.read(fd, 4096)
                 self.assertEqual(command.count(b"\n"), 1)
                 self.assertTrue(command.startswith(b"tellraw Alex "))
-                self.assertEqual(json.loads(command[len(b"tellraw Alex "):]), components)
+                self.assertEqual(json.loads(command[len(b"tellraw Alex "):]), styled_components(components))
                 reply(fifo, "Alex", components, broadcast=True)
                 command = os.read(fd, 4096)
                 self.assertTrue(command.startswith(b"tellraw @a "))
-                self.assertEqual(json.loads(command[len(b"tellraw @a "):]), components)
+                self.assertEqual(json.loads(command[len(b"tellraw @a "):]), styled_components(components))
             finally:
                 os.close(fd)
+
+    def test_chat_styles_preserve_text_and_source_link(self):
+        components = render('Answer [1]', [{'title': 'Test', 'anchor': ''}])
+        styled = styled_components(components)
+        self.assertEqual(''.join(part['text'] for part in styled),
+                         ''.join(part['text'] for part in components))
+        self.assertTrue(styled[1]['bold'])
+        self.assertEqual(styled[1]['color'], 'aqua')
+        self.assertEqual(styled[-1]['click_event'], components[-1]['click_event'])
+        result = styled_components([{'text': '[Map] Home: -1, 64, 3 (minecraft:overworld)'}])
+        self.assertTrue(any(part['text'] == '-1, 64, 3' and part.get('color') == 'aqua' for part in result))
+        help_text = styled_components([{'text': '[Help] Commands:\n@map [search]'}])
+        self.assertTrue(any(part['text'] == '@map' and part.get('color') == 'aqua' for part in help_text))
 
 
 if __name__ == "__main__":

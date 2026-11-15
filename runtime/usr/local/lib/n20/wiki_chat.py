@@ -449,11 +449,42 @@ def server_identity_error(path, label):
     return f'[{label}] Minecraft server identity changed. Please try again.'
 
 
+def styled_components(components):
+    """Style server labels and preserve links as independent text components."""
+    colors = {'Wiki': 'aqua', 'Map': 'green', 'Death': 'gold', 'Help': 'yellow'}
+    result = [{'text': '', 'color': 'white', 'bold': False, 'underlined': False}]
+    for component in components:
+        part = dict(component)
+        match = re.match(r'^\[(Wiki|Map|Death|Help)\]', part.get('text', ''))
+        if match:
+            label = match.group(0)
+            result.append({'text': label, 'color': colors[match.group(1)], 'bold': True})
+            part['text'] = part['text'][len(label):]
+            if match.group(1) == 'Help':
+                pattern = r'(?m)^(@[a-z_]+)'
+                style = {'color': 'aqua'}
+            elif match.group(1) in ('Map', 'Death'):
+                pattern = r'(?<![\w.-])-?\d+, -?\d+, -?\d+(?![\w.-])'
+                style = {'color': 'aqua'}
+            else:
+                pattern = None
+            if pattern:
+                text, offset = part['text'], 0
+                # Keep component overhead bounded even if a note contains many numbers.
+                for hit in islice(re.finditer(pattern, text), 20):
+                    result.append({'text': text[offset:hit.start()]})
+                    result.append({'text': hit.group(), **style})
+                    offset = hit.end()
+                part['text'] = text[offset:]
+        result.append(part)
+    return result
+
+
 def reply(path, player, components, broadcast=False):
     if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
         raise ValueError("invalid player name")
     target = "@a" if broadcast else player
-    command = ("tellraw " + target + " " + json.dumps(components, ensure_ascii=True) + "\n").encode()
+    command = ("tellraw " + target + " " + json.dumps(styled_components(components), ensure_ascii=True) + "\n").encode()
     fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
@@ -515,9 +546,14 @@ def load_markers(path):
     return markers
 
 
+def display_note(note):
+    # Notes are literal text, not formatting codes or additional chat lines.
+    return ''.join(' ' if ord(ch) < 32 or ord(ch) == 127 else ch for ch in note).replace('§', '')
+
+
 def marker_text(marker):
     coords = ", ".join(str(math.floor(v)) for v in marker["pos"])
-    return f'{marker["note"]}: {coords} ({marker["dimension"]})'
+    return f'{display_note(marker["note"])}: {coords} ({marker["dimension"]})'
 
 
 def marker_prompt(markers):
@@ -931,9 +967,9 @@ def landmark_direction(target, landmarks, exclude_target=False):
     if isinstance(landmarks, dict):
         landmark = landmarks['named']
         if landmark['dimension'] != target['dimension']:
-            return f"From {landmark['note']}: direction unavailable across dimensions"
+            return f"From {display_note(landmark['note'])}: direction unavailable across dimensions"
         distance = round(math.dist(target['pos'], landmark['pos']))
-        return f"From {landmark['note']}: {compass_direction(target, landmark['pos'])} (about {distance} blocks away)"
+        return f"From {display_note(landmark['note'])}: {compass_direction(target, landmark['pos'])} (about {distance} blocks away)"
     nearest = None
     nearest_distance = math.inf
     skipped = False
@@ -949,7 +985,7 @@ def landmark_direction(target, landmarks, exclude_target=False):
             nearest, nearest_distance = landmark, distance
     if nearest is None:
         return None
-    return f"From {nearest['note']}: " + compass_direction(target, nearest['pos'])
+    return f"From {display_note(nearest['note'])}: " + compass_direction(target, nearest['pos'])
 
 
 def direct_marker_indices(markers, question):
@@ -1257,7 +1293,18 @@ class MarkerQueue:
         if not server and action != 'help':
             return
         if action == "help":
-            self.send(player, '[Help] @wiki <question> | @pin <note> | @pin_that <note> | @unpin <note> | @rename "old" "new" | @map [search] | @map --biome <name> | @map <search> --from-landmark "<name>" | @map <search> --from-nearest-landmark | @death | @help')
+            self.send(player, '[Help] Commands:\n'
+                      '@wiki <question> — ask the Minecraft Wiki\n'
+                      '@pin <note> — save your location\n'
+                      '@pin_that <note> — save the block you are looking at\n'
+                      '@unpin <note> — remove a saved location\n'
+                      '@rename "old" "new" — rename a saved location\n'
+                      '@map [search or player] — list or find locations\n'
+                      '@map --biome <name> — find a biome\n'
+                      '@map <search> --from-landmark "<name>" — directions from a landmark\n'
+                      '@map <search> --from-nearest-landmark — directions from the nearest landmark\n'
+                      '@death — show recent death locations\n'
+                      '@help — show these commands')
         elif action == 'rename' and parse_rename(note) is None:
             self.send(player, '[Map] Use @rename "old note" "new note" (new notes: up to 160 characters).')
         elif action == 'unpin' and (not note or not note.strip() or len(note.strip()) > 256):
@@ -1483,7 +1530,7 @@ class MarkerQueue:
                     not all(math.isfinite(v) and abs(v) <= 30000000 for v in position + rotation)):
                 self.send_private(player, "[Map] Couldn't determine your current position and facing for directions.")
                 return
-            lines = [marker['note'] + ": " + relative_direction(marker, position, rotation, dimensions[0])
+            lines = [display_note(marker['note']) + ": " + relative_direction(marker, position, rotation, dimensions[0])
                      + ('; compass: ' + compass_direction(marker, position)
                         if marker['dimension'] == dimensions[0] else '')
                      for marker in pending["markers"]]
@@ -1640,7 +1687,7 @@ class MarkerQueue:
                         worst += ''.join('\n  ' + (landmark_direction(item, request['landmarks'], True) or '')
                                          for item in proposed)
                     if page and max(len(json.dumps(rendered, ensure_ascii=True)),
-                                    len(json.dumps(worst, ensure_ascii=True))) > 2800:
+                                    len(json.dumps(worst, ensure_ascii=True))) > 2000:
                         break
                     page = proposed
                 rendered = '[Map] ' + '\n'.join(marker_text(item) for item in page)

@@ -22,6 +22,11 @@ PREFIX = "[12:34:56] [Server thread/INFO]: "
 
 
 class MarkerTests(unittest.TestCase):
+    def test_location_notes_are_literal_single_line_in_chat(self):
+        marker = {'note': 'Home\n§csecret', 'pos': [1, 64, -2], 'dimension': 'minecraft:overworld'}
+        self.assertEqual(m.marker_text(marker), 'Home csecret: 1, 64, -2 (minecraft:overworld)')
+        self.assertEqual(marker['note'], 'Home\n§csecret')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
