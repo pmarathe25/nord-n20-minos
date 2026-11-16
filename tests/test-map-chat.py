@@ -22,6 +22,25 @@ PREFIX = "[12:34:56] [Server thread/INFO]: "
 
 
 class MarkerTests(unittest.TestCase):
+    def test_straight_line_and_axis_distances_share_player_origin(self):
+        target = {'note': 'swamp', 'pos': [2200, 64, 1600], 'dimension': 'minecraft:overworld'}
+        position = [0, 64, 0]
+        direction = m.relative_direction(target, position, [0, 0], target['dimension'])
+        self.assertIn('straight-line: 2720 blocks', direction)
+        self.assertIn('2200 blocks east', m.compass_direction(target, position))
+        landmark = {'note': 'village', 'pos': [2200, 64, -100], 'dimension': target['dimension']}
+        self.assertIn('straight-line: 1700 blocks', m.landmark_direction(target, {'named': landmark}))
+
+    def test_directions_and_distances_have_distinct_styles(self):
+        text = '[Map] Home: From you: go forward (straight-line: 5 blocks); compass: 3 blocks east'
+        parts = m.styled_components([{'text': text}])
+        self.assertEqual(''.join(part['text'] for part in parts), text)
+        colors = {part['text']: part.get('color') for part in parts}
+        self.assertEqual(colors['From you:'], 'green')
+        self.assertEqual(colors['go forward'], 'green')
+        self.assertEqual(colors['straight-line: 5 blocks'], 'gold')
+        self.assertEqual(colors['3 blocks east'], 'yellow')
+
     def test_location_notes_are_literal_single_line_in_chat(self):
         marker = {'note': 'Home\n§csecret', 'pos': [1, 64, -2], 'dimension': 'minecraft:overworld'}
         self.assertEqual(m.marker_text(marker), 'Home csecret: 1, 64, -2 (minecraft:overworld)')
@@ -415,11 +434,32 @@ class MarkerTests(unittest.TestCase):
             self.service.next_biome_job = 0
             self.service.poll_biome_jobs((42, '1'))
             self.service.advance()
-            self.assertTrue(any('swamp biome (2 blocks from nether home): 2, 64, 0 (minecraft:the_nether)' in text
+            self.assertTrue(any('swamp biome (straight-line: 2 blocks from nether home): 2, 64, 0 (minecraft:the_nether)' in text
                                 and kw.get('broadcast') for _, text, kw in self.replies))
             self.capture_direction('Alex')
-            self.assertTrue(any('direction unavailable from here' in text and not kw.get('broadcast')
-                                for _, text, kw in self.replies))
+            _, text, kw = self.replies[-1]
+            self.assertIn('From nether home: 2 blocks east (straight-line: 2 blocks)', text)
+            self.assertNotIn('From you:', text)
+            self.assertNotIn('direction unavailable from here', text)
+            self.assertFalse(kw.get('broadcast'))
+
+    def test_biome_reference_directions_preserve_explicit_landmark_option(self):
+        reference = {'note': 'village', 'pos': [100, 64, 100], 'dimension': 'minecraft:overworld'}
+        other = {'note': 'home', 'pos': [0, 64, 0], 'dimension': 'minecraft:overworld'}
+        marker = {'note': 'swamp biome (straight-line: 10 blocks from village)', 'direction_note': 'swamp biome',
+                  'pos': [110, 64, 100], 'dimension': 'minecraft:overworld', 'biome_reference_landmark': reference}
+        pending = {'player': 'Alex', 'action': 'directions', 'markers': [marker],
+                   'dimensions': ['minecraft:overworld'] * 2, 'pos': [0, 64, 0], 'rotation': [0, 0],
+                   'landmarks': {'named': other}}
+        self.service.finish(pending)
+        text = self.replies[-1][1]
+        self.assertIn('From village: 10 blocks east (straight-line: 10 blocks)', text)
+        self.assertIn('From home: 110 blocks east, 100 blocks south', text)
+        self.assertNotIn('From you:', text)
+        self.assertFalse(self.replies[-1][2].get('broadcast'))
+        pending['landmarks'] = {'named': reference}
+        self.service.finish(pending)
+        self.assertEqual(self.replies[-1][1].count('From village:'), 1)
 
     def test_biome_search_does_not_repeat_same_location(self):
         landmark = {'note': 'home', 'pos': [1, 64, 2], 'dimension': 'minecraft:overworld'}
@@ -890,7 +930,7 @@ class MarkerTests(unittest.TestCase):
         self.service.advance()
         self.capture_direction('Alex')
         private = '\n'.join(text for _, text, kw in self.replies if not kw.get('broadcast'))
-        self.assertIn('From Home Base: 3 blocks east, 4 blocks north (about 5 blocks away)', private)
+        self.assertIn('From Home Base: 3 blocks east, 4 blocks north (straight-line: 5 blocks)', private)
 
     def test_named_landmark_unknown_ambiguous_and_cross_dimension(self):
         home = {'note': 'home', 'pos': [0, 64, 0], 'dimension': 'minecraft:overworld'}
@@ -915,7 +955,7 @@ class MarkerTests(unittest.TestCase):
         self.service.handle(PREFIX + f'Found no elements matching {token}')
         self.service.advance()
         self.capture_direction('Alex')
-        self.assertTrue(any('From home base: 10 blocks east (about 10 blocks away)' in text for _, text, _ in self.replies))
+        self.assertTrue(any('From home base: 10 blocks east (straight-line: 10 blocks)' in text for _, text, _ in self.replies))
         with patch.object(m, 'console_biome_query') as query:
             self.service.handle(PREFIX + '<Alex> @map --biome swamp --from-landmark "home base"')
             self.service.advance()
@@ -1208,7 +1248,7 @@ class MarkerTests(unittest.TestCase):
                     buffer = lines.pop()
                     commands.extend(lines)
             self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'Directions:' in line for line in commands))
-            self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'From Village east:' in line and b'blocks away' in line for line in commands))
+            self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'From Village east:' in line and b'straight-line:' in line for line in commands))
         finally:
             process.terminate()
             process.join(5)

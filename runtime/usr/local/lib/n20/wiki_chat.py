@@ -462,10 +462,13 @@ def styled_components(components):
             part['text'] = part['text'][len(label):]
             if match.group(1) == 'Help':
                 pattern = r'(?m)^(@[a-z_]+)'
-                style = {'color': 'aqua'}
             elif match.group(1) in ('Map', 'Death'):
-                pattern = r'(?<![\w.-])-?\d+, -?\d+, -?\d+(?![\w.-])'
-                style = {'color': 'aqua'}
+                pattern = (r'(?P<coords>(?<![\w.-])-?\d+, -?\d+, -?\d+(?![\w.-]))'
+                           r'|(?P<distance>straight-line: \d+ blocks?)'
+                           r'|(?P<axis>\d+ blocks? (?:east|west|north|south|up|down))'
+                           r'|(?P<direction>go (?:up|down|forward|back|to your right|to your left)'
+                           r'(?: and (?:up|down|forward|back|to your right|to your left))*)'
+                           r'|(?P<origin>From you:)')
             else:
                 pattern = None
             if pattern:
@@ -473,7 +476,9 @@ def styled_components(components):
                 # Keep component overhead bounded even if a note contains many numbers.
                 for hit in islice(re.finditer(pattern, text), 20):
                     result.append({'text': text[offset:hit.start()]})
-                    result.append({'text': hit.group(), **style})
+                    color = {'distance': 'gold', 'axis': 'yellow', 'direction': 'green',
+                             'origin': 'green'}.get(hit.lastgroup, 'aqua')
+                    result.append({'text': hit.group(), 'color': color})
                     offset = hit.end()
                 part['text'] = text[offset:]
         result.append(part)
@@ -940,7 +945,7 @@ def relative_direction(marker, position, rotation, dimension):
             parts.append("to your left")
     if not parts:
         return "nearby"
-    return "go " + " and ".join(parts) + f" (about {round(math.sqrt(dx * dx + dy * dy + dz * dz))} blocks away)"
+    return "go " + " and ".join(parts) + f" (straight-line: {round(math.dist(marker['pos'], position))} blocks)"
 
 
 def compass_direction(target, position):
@@ -969,7 +974,7 @@ def landmark_direction(target, landmarks, exclude_target=False):
         if landmark['dimension'] != target['dimension']:
             return f"From {display_note(landmark['note'])}: direction unavailable across dimensions"
         distance = round(math.dist(target['pos'], landmark['pos']))
-        return f"From {display_note(landmark['note'])}: {compass_direction(target, landmark['pos'])} (about {distance} blocks away)"
+        return f"From {display_note(landmark['note'])}: {compass_direction(target, landmark['pos'])} (straight-line: {distance} blocks)"
     nearest = None
     nearest_distance = math.inf
     skipped = False
@@ -1530,18 +1535,28 @@ class MarkerQueue:
                     not all(math.isfinite(v) and abs(v) <= 30000000 for v in position + rotation)):
                 self.send_private(player, "[Map] Couldn't determine your current position and facing for directions.")
                 return
-            lines = [display_note(marker['note']) + ": " + relative_direction(marker, position, rotation, dimensions[0])
-                     + ('; compass: ' + compass_direction(marker, position)
-                        if marker['dimension'] == dimensions[0] else '')
-                     for marker in pending["markers"]]
-            if pending.get('landmarks') is not None:
-                for index, marker in enumerate(pending['markers']):
-                    if (not pending.get('death') and not isinstance(pending['landmarks'], dict) and
-                            closest_to_player(marker, pending['landmarks'], position, dimensions[0])):
-                        continue
-                    nearby = landmark_direction(marker, pending['landmarks'], exclude_target=not pending.get('death'))
-                    if nearby:
-                        lines[index] += '\n  ' + nearby
+            lines = []
+            for marker in pending['markers']:
+                line = display_note(marker.get('direction_note', marker['note'])) + ':'
+                if not marker.get('biome_reference_landmark'):
+                    line += ' From you: ' + relative_direction(marker, position, rotation, dimensions[0])
+                    if marker['dimension'] == dimensions[0]:
+                        line += '; compass: ' + compass_direction(marker, position)
+                lines.append(line)
+            for index, marker in enumerate(pending['markers']):
+                reference = marker.get('biome_reference_landmark')
+                reference_line = landmark_direction(marker, {'named': reference}) if reference else None
+                if reference_line:
+                    lines[index] += '\n  ' + reference_line
+                landmarks = pending.get('landmarks')
+                if landmarks is None:
+                    continue
+                if (not pending.get('death') and not isinstance(landmarks, dict) and
+                        closest_to_player(marker, landmarks, position, dimensions[0])):
+                    continue
+                nearby = landmark_direction(marker, landmarks, exclude_target=not pending.get('death'))
+                if nearby and nearby != reference_line and not (reference_line and reference_line.startswith(nearby + ' (')):
+                    lines[index] += '\n  ' + nearby
             label = 'Death' if pending.get('death') else 'Map'
             if not self.send_private(player, f"[{label}] Directions:\n" + "\n".join(lines)):
                 self.enqueue_directions(player, pending['markers'], pending.get('landmarks'), pending.get('death', False))
@@ -1679,8 +1694,8 @@ class MarkerQueue:
                     proposed = page + [marker]
                     rendered = '[Map] ' + '\n'.join(marker_text(item) for item in proposed)
                     worst = '[Map] Directions:\n' + '\n'.join(
-                        item['note'] + ': ' + max('in ' + item['dimension'] + '; direction unavailable from here',
-                                                   'go down and forward and to your right (about 99999999 blocks away); '
+                        item['note'] + ': From you: ' + max('in ' + item['dimension'] + '; direction unavailable from here',
+                                                   'go down and forward and to your right (straight-line: 99999999 blocks); '
                                                    'compass: 60000000 blocks east, 60000000 blocks south, 60000000 blocks down', key=len)
                         for item in proposed)
                     if request.get('landmarks') is not None:
@@ -1794,8 +1809,9 @@ class MarkerQueue:
                         player_marker['pos'] == position):
                     continue
                 name = job['biome'].split(':', 1)[1].replace('_', ' ')
-                marker = {'note': f"{name} biome ({round(distance)} blocks from {landmark['note']})",
-                          'pos': position, 'dimension': landmark['dimension']}
+                marker = {'note': f"{name} biome (straight-line: {round(distance)} blocks from {landmark['note']})",
+                          'direction_note': f'{name} biome', 'pos': position, 'dimension': landmark['dimension'],
+                          'biome_reference_landmark': landmark}
                 self.enqueue_listing(job['player'], [marker], self.map_landmarks(job['from_landmark'], job['player']))
                 continue
             landmark = job['landmarks'][job['index']]
