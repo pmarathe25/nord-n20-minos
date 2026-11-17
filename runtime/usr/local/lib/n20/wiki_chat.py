@@ -41,7 +41,6 @@ STATUS_QUEUE_LIMIT = 128
 REQUEST_QUEUE_LIMIT = 16
 REQUEST_QUEUE_BYTES = 8192
 REQUEST_PLAYER_LIMIT = 2
-REQUEST_LIFETIME = 300
 REQUEST_ADMISSION_INTERVAL = 10
 REQUEST_REJECTION_INTERVAL = 30
 HISTORY_LIMIT = 50
@@ -51,6 +50,10 @@ MODEL_TOTAL_SECONDS = 105
 MODEL_STARTUP_SECONDS = 300
 MAX_MODEL_LINE = 8192
 MAX_MODEL_STREAM = 262144
+
+
+class LookupDeferred(Exception):
+    """A temporary lookup failure: keep the accepted question for retry."""
 
 
 class LogTail:
@@ -410,11 +413,9 @@ def answer_question(args, question, cache, report=None):
                     cache.popitem(last=False)
             return components
     except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, IndexError,
-            http.client.HTTPException, RecursionError):
-        print("Wiki lookup failed", flush=True)
-    if marker_search_query(question) is not None:
-        return [{"text": "[Map] Location lookup is temporarily unavailable."}]
-    return render(UNAVAILABLE, [])
+            http.client.HTTPException, RecursionError) as exc:
+        raise LookupDeferred('Wiki lookup is waiting for availability') from exc
+    raise LookupDeferred('Wiki lookup is waiting for resources')
 
 
 def server_identity(path):
@@ -1053,7 +1054,7 @@ def find_marker(args, question, report=None):
     if direct is not None:
         return direct
     if not resources_available():
-        return [{"text": "[Map] The model is temporarily unavailable."}]
+        raise LookupDeferred('Location lookup is waiting for resources')
     batches = list(model_marker_batches(markers))
     if not batches:
         return [{"text": "[Map] There are no saved locations."}]
@@ -1061,7 +1062,7 @@ def find_marker(args, question, report=None):
     initial_server = server_identity(args.pid_file) if getattr(args, 'pid_file', None) else None
     for batch in batches:
         if not resources_available() or (initial_server and server_identity(args.pid_file) != initial_server):
-            return [{"text": "[Map] The location search was interrupted; please try again."}]
+            raise LookupDeferred('Location lookup was interrupted')
         if report:
             report("prefill", 0)
         selected = generate_for_request(args, question, None, report, marker_request_body(batch, question))
@@ -1907,15 +1908,9 @@ def marker_search_query(question):
 class QueuedRequest(tuple):
     def __new__(cls, server, player, question):
         value = super().__new__(cls, (server, player, question))
-        value.accepted = time.monotonic()
+        value.retry_after = 0
+        value.waiting_notified = False
         return value
-
-
-def expire_requests(requests, now=None):
-    now = time.monotonic() if now is None else now
-    for item in list(requests):
-        if now - getattr(item, 'accepted', now) >= REQUEST_LIFETIME:
-            requests.remove(item)
 
 
 def queue_request(args, requests, pending, server, player, question):
@@ -1923,7 +1918,9 @@ def queue_request(args, requests, pending, server, player, question):
     if not question or len(question) > 256 or not re.fullmatch(r'[A-Za-z0-9_]{1,16}', player):
         return False
     now = time.monotonic()
-    expire_requests(requests, now)
+    for entry in list(requests):
+        if entry[0] != server:
+            requests.remove(entry)
     if getattr(args, '_admission_server', None) != server:
         args._admission_server = server
         args._admission = OrderedDict()
@@ -1932,8 +1929,12 @@ def queue_request(args, requests, pending, server, player, question):
     player_count = sum(entry[1] == player for entry in requests)
     if pending is not None and getattr(args, '_active_player', None) == player:
         player_count += 1
-    full = (len(requests) >= REQUEST_QUEUE_LIMIT or player_count >= REQUEST_PLAYER_LIMIT or
-            sum(len(entry[2].encode('utf-8')) for entry in requests) + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES or
+    active = getattr(args, '_active_request', None) if pending is not None else None
+    active_bytes = len(active[2].encode('utf-8')) if active is not None else 0
+    # Reserve the active request's slot and bytes so a failed attempt can
+    # return to the front without losing a question or exceeding the bounds.
+    full = (len(requests) + int(pending is not None) >= REQUEST_QUEUE_LIMIT or player_count >= REQUEST_PLAYER_LIMIT or
+            sum(len(entry[2].encode('utf-8')) for entry in requests) + active_bytes + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES or
             now - admitted < REQUEST_ADMISSION_INTERVAL)
     if full:
         if now - rejected >= REQUEST_REJECTION_INTERVAL:
@@ -1991,26 +1992,52 @@ def accept_chat(line, args, requests, pending, next_request, can_run=True):
 def start_queued(args, requests, worker, cache, pending, next_request, wake_on_reply, can_run=True, report=None):
     """Start the oldest request for the current server when the worker is free."""
     now = time.monotonic()
-    expire_requests(requests, now)
     if not can_run or pending is not None or now < next_request:
         return None
     while requests:
-        server, player, question = requests.popleft()
+        entry = requests[0]
+        server, player, question = entry
         if server != server_identity(args.pid_file):
+            requests.popleft()
             continue
+        if now < getattr(entry, 'retry_after', 0):
+            return None
+        requests.popleft()
+        if not isinstance(entry, QueuedRequest):
+            entry = QueuedRequest(server, player, question)
         if report:
             future = worker.submit(answer_question, args, question, cache, report)
         else:
             future = worker.submit(answer_question, args, question, cache)
-        future.add_done_callback(wake_on_reply)
+        future.wiki_request = entry
+        args._active_request = entry
         args._active_player = player
+        future.add_done_callback(wake_on_reply)
         return future, player, server, now + REQUEST_INTERVAL_SECONDS, question
     return None
 
 
+def finish_queued(args, requests, future, record_reply):
+    """Only completed answers leave the queue; unavailable attempts retry."""
+    entry = future.wiki_request
+    server, player, question = entry
+    if server != server_identity(args.pid_file):
+        return
+    try:
+        components = future.result()
+    except LookupDeferred:
+        entry.retry_after = time.monotonic() + REQUEST_INTERVAL_SECONDS
+        requests.appendleft(entry)
+        if not entry.waiting_notified:
+            label = 'Map' if marker_search_query(question) is not None else 'Wiki'
+            reply(args.console, player, [{'text': f'[{label}] Your question is queued until lookup is available.'}])
+            entry.waiting_notified = True
+        return
+    record_reply(player, question, components)
+
+
 def take_fast_find(args, requests):
     """Resolve a queued direct lookup even when the model is busy or asleep."""
-    expire_requests(requests)
     server = server_identity(args.pid_file)
     for entry in list(islice(requests, STATUS_QUEUE_LIMIT)):
         origin, player, question = entry
@@ -2023,7 +2050,7 @@ def take_fast_find(args, requests):
         try:
             components = direct_marker_reply(load_markers(args.pins_file), query)
         except (OSError, ValueError, TypeError, RecursionError):
-            components = [{"text": "[Map] Location lookup is temporarily unavailable."}]
+            continue  # Keep it queued for the normal lookup/retry path.
         if components is not None:
             requests.remove(entry)
             return player, question, components
@@ -2152,7 +2179,6 @@ def restore_handoff(path):
         if data.get("version") != 1 or len(data["queue"]) > REQUEST_QUEUE_LIMIT:
             raise ValueError("invalid Wiki handoff")
         requests = deque()
-        age = max(0, time.time() - info.st_mtime)
         for server, player, question in data["queue"]:
             if (not isinstance(server, list) or len(server) != 2 or
                     not isinstance(server[0], int) or not isinstance(server[1], str) or
@@ -2163,9 +2189,7 @@ def restore_handoff(path):
                     sum(len(entry[2].encode('utf-8')) for entry in requests) + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES):
                 raise ValueError("Wiki handoff exceeds admission limits")
             entry = QueuedRequest(tuple(server), player, question)
-            entry.accepted -= age
             requests.append(entry)
-        expire_requests(requests)
         log = data["log"]
         if any(not isinstance(log[key], int) or log[key] < 0 for key in ("dev", "ino", "offset")):
             raise ValueError("invalid Wiki handoff log position")
@@ -2245,13 +2269,13 @@ def run(args):
                     next_health = now + 1
                 can_run = resources_ok
                 if pending and pending.done():
-                    if server == server_identity(args.pid_file):
-                        try:
-                            components = pending.result()
-                            record_reply(player, question, components)
-                        except (OSError, ValueError):
-                            print("Wiki reply could not reach the Minecraft console", flush=True)
+                    try:
+                        finish_queued(args, requests, pending, record_reply)
+                    except (OSError, ValueError):
+                        print("Wiki reply could not reach the Minecraft console", flush=True)
                     pending = None
+                    args._active_request = None
+                    args._active_player = None
                     active = None
                     progress = None
                 try:

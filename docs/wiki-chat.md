@@ -204,10 +204,18 @@ removes it; if interrupted, the cloud expires after ten seconds while loaded.
 The bridge immediately acknowledges a valid question in public chat. It queues
 additional questions in arrival order, tells their senders they are queued,
 and processes one at a time, with at least 30 seconds between request starts.
+Accepted questions do not expire while waiting for availability. A temporary
+retrieval, model-startup or inference failure keeps the same question at the
+front of the queue and retries after at least 30 seconds. The sender receives
+one private waiting notice rather than a final unavailable answer. Only a
+completed answer is sent and added to history; a genuine no-answer result is
+still final. Up to 16 outstanding questions and 8 KiB of question text are
+retained, including active work, with at most two requests per player.
 The queue is held in memory and is discarded if the bridge or server restarts.
 Direct map matches and supported exact Wiki answers can run while the model is
 stopped. A request that actually needs inference asks the launcher to start the
-worker; the request waits for startup and the resource guard, up to five minutes.
+worker; each attempt waits for startup and the resource guard up to five
+minutes, then returns the question to the queue if the model is still unavailable.
 The existing dashboard may show the intentionally stopped model as unavailable
 or waiting until it is requested. The Wiki tab on
 the phone shows model health, resource limits, the active question, its current
@@ -333,8 +341,9 @@ seconds for the first text, 15 seconds between text updates, and 105 seconds
 total for the model request. Longer prompts get additional first-text and total
 time; requests allowing longer output also get additional total time. Each
 retrieval step can take up to 20 seconds.
-When the model deadline expires, the bridge closes the connection and sends
-the player an unavailable message. See the [streaming deadline trial](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-10-wiki-stream-deadline.md)
+When the model deadline expires, the bridge closes the connection and retains
+the question for retry; it does not send partial output. See the historical
+[streaming deadline trial](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-10-wiki-stream-deadline.md)
 for the phone comparison. The model worker has its own UID. The bridge runs
 as `minecraft` to use the game-owned console FIFO.
 

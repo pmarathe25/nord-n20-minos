@@ -49,6 +49,7 @@ python3 tests/test-firewall-dhcp.py
 python3 tests/test-log-rotation.py
 python3 tests/test-backup-locking.py
 python3 tests/test-wiki-admission.py
+python3 tests/test-wiki-retry.py
 sudo python3 tests/test-wiki-device-boundary.py  # fake nodes/socket, no model load
 python3 tests/test-wiki-resource-policy.py     # synthetic swap/pressure samples
 python3 tests/test-service-health.py

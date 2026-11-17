@@ -29,7 +29,8 @@ with patch.object(m,'server_identity',return_value=(42,'start')), patch.object(m
         assert len(requests)==m.REQUEST_QUEUE_LIMIT
     with patch.object(m.time,'monotonic',return_value=500):
         assert m.start_queued(args,requests,None,{},None,0,lambda _:None,False) is None
-        assert not requests
+        assert len(requests)==m.REQUEST_QUEUE_LIMIT  # Unavailability does not expire accepted work.
+        requests.clear()
         # An active request counts against this player's quota.
         args._active_player='Alex'
         assert m.queue_request(args,requests,Future(),(42,'start'),'Alex','one')
@@ -40,11 +41,11 @@ with patch.object(m,'server_identity',return_value=(42,'start')), patch.object(m
         for i in range(100):m.queue_request(args,requests,None,(43,'new'),'Player'+str(i),'\U0001f600'*256)
         assert sum(len(x[2].encode()) for x in requests)<=m.REQUEST_QUEUE_BYTES
         assert len(requests)==8
-with tempfile.TemporaryDirectory(prefix='n20-handoff-expiry-') as tmp:
+with tempfile.TemporaryDirectory(prefix='n20-handoff-wait-') as tmp:
     path=Path(tmp)/'handoff.json'
     path.write_text(json.dumps({'version':1,'queue':[[[42,'start'],'Alex','old question']],
                                 'log':{'dev':1,'ino':2,'offset':3}}))
     os.utime(path,(0,0))
     queue,resume=m.restore_handoff(path)
-    assert not queue and resume==((1,2),3) and not path.exists()
+    assert len(queue)==1 and queue[0][2]=='old question' and resume==((1,2),3) and not path.exists()
 print('WIKI_ADMISSION_BOUNDS_PASSED')

@@ -167,13 +167,16 @@ collection is not configured.
 ## Wiki request admission
 
 Chat requests and asynchronous map-search misses share admission controls:
-16 waiting requests, 8 KiB of waiting UTF-8 text, two requests per player
-including active model work, ten seconds between admissions for a player,
-and a five-minute waiting lifetime. Rejections are private and limited to one
+16 outstanding requests and 8 KiB of UTF-8 question text, including active
+work, two requests per player, and ten seconds between admissions for a player.
+Rejections are private and limited to one
 per player per 30 seconds; bookkeeping is capped at 128 player names.
-Admission remains bounded while the worker cannot run. Restored handoffs
-obey the same caps and retain age from the handoff file rather than receiving
-a new five-minute lifetime. These limits do not replace the model's resource
+Admission remains bounded while the worker cannot run. Accepted questions do
+not expire while waiting. A temporary lookup failure returns the same request
+to the front with a 30-second retry delay and one private waiting notice;
+its slot and byte budget stay reserved while active. Restored handoffs obey
+the same caps. Requests for a previous Minecraft process are discarded.
+These limits do not replace the model's resource
 guards or the separately bounded marker command queues.
 
 ## Backup locking and recovery
