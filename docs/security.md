@@ -64,18 +64,21 @@ tested recovery remains the durable platform remedy.
 ### Swap-aware Minecraft priority
 
 Wiki is allowed to page while Minecraft remains responsive. Initial model or
-launcher admission needs at least 768 MiB `MemAvailable`, 2 GiB free swap and
-3 GiB of their combined headroom, with 30 seconds of healthy samples. It no
-longer requires 1 GiB physical headroom during normal operation or stops merely
-because Minecraft has cold pages in swap.
+launcher admission needs at least 2 GiB free swap and 3 GiB of combined
+`MemAvailable` plus free swap, with 30 seconds of healthy samples. There is no
+physical-RAM-only minimum: even zero reported available RAM can pass when
+swap provides the headroom. The chat bridge uses matching capacity checks.
+Low RAM alone and cold pages in swap do not stop Wiki.
 
-The running model yields immediately below 256 MiB available RAM; after five
-consecutive checks below 384 MiB; or after three checks with less than 768 MiB
+The running model yields after three checks with less than 768 MiB
 free swap or less than 1 GiB combined headroom. Ten consecutive checks with
 memory PSI avg10 full at least 5%, some at least 20%, or IO full at least 25%
 also cause a yield. Healthy samples reset each counter independently. The
 launcher checks about once per second, so these are sample counts, not precise
 real-time deadlines. These are initial guardrails, not proven crash prevention.
+Linux can reclaim cache and swap anonymous pages, but some kernel/driver
+allocations are not reclaimable. Free swap does not guarantee GPU allocation
+success; the service limits, OOM preference and pressure guards still apply.
 
 A pressure stop waits at least 120 seconds before a new 30-second healthy
 admission window. Temperature protection remains active. Bounded TERM then

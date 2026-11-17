@@ -156,8 +156,8 @@ if [ -e "$tuned_enabled" ] || [ -L "$tuned_enabled" ]; then
 fi
 }
 
-# Model loading can consume more than 2 GiB on this device. Keep a wider
-# reserve before starting it and stop it if active gameplay uses that reserve.
+# Model loading can consume more than 2 GiB on this device. Admit against
+# RAM-plus-swap headroom and yield for sustained stalls or capacity exhaustion.
 memory_at_least() {
     awk -v limit="$1" '/^MemAvailable:/ { ok = ($2 >= limit) } END { exit !ok }' /proc/meminfo
 }

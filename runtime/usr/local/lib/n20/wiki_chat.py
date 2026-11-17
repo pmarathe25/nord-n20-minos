@@ -273,14 +273,17 @@ def render(answer, passages):
     ]
 
 
-def resources_available(minimum_kib=None):
+def resources_available(starting=False):
     memory = Path("/proc/meminfo").read_text()
     available = re.search(r"^MemAvailable:\s+(\d+) kB$", memory, re.M)
     swap_free = re.search(r"^SwapFree:\s+(\d+) kB$", memory, re.M)
-    if minimum_kib is None:
-        minimum_kib = 208 * 1024 if swap_free and int(swap_free[1]) >= 512 * 1024 else 980 * 1024
     temperature = int(Path("/sys/class/power_supply/battery/temp").read_text())
-    return available and int(available[1]) >= minimum_kib and 0 <= temperature < 400
+    # Match the launcher's capacity checks without a separate physical-RAM
+    # veto. The root launcher also monitors sustained pressure and temperature.
+    return bool(available and swap_free and
+                int(swap_free[1]) >= (2097152 if starting else 786432) and
+                int(available[1]) + int(swap_free[1]) >= (3145728 if starting else 1048576) and
+                0 <= temperature < 400)
 
 
 def comparison_topics(question):
@@ -2295,7 +2298,7 @@ def run(args):
                 if status_file and now >= next_status:
                     try:
                         display_health = health
-                        if health == "unavailable" and not resources_available(3670016):
+                        if health == "unavailable" and not resources_available(starting=True):
                             display_health = "waiting"
                         write_dashboard_status(status_file, display_health, active, requests, resources_ok, progress, history)
                     except (OSError, ValueError):

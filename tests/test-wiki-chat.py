@@ -231,11 +231,26 @@ class WikiChatTests(unittest.TestCase):
 
         with patch.object(Path, "read_text", fixture):
             self.assertTrue(wiki_chat.resources_available())
-            self.assertFalse(wiki_chat.resources_available(3670016))
+            self.assertFalse(wiki_chat.resources_available(starting=True))
         def no_swap(path, *args, **kwargs):
             value = fixture(path, *args, **kwargs)
             return value.replace("SwapFree: 1000000 kB", "SwapFree: 0 kB")
         with patch.object(Path, "read_text", no_swap):
+            self.assertFalse(wiki_chat.resources_available())
+        def swapping(path, *args, **kwargs):
+            if str(path) == "/proc/meminfo":
+                return "MemAvailable: 0 kB\nSwapFree: 3145728 kB\n"
+            return fixture(path, *args, **kwargs)
+        with patch.object(Path, "read_text", swapping):
+            self.assertTrue(wiki_chat.resources_available())
+            self.assertTrue(wiki_chat.resources_available(starting=True))
+        def hot(path, *args, **kwargs):
+            return "400\n" if str(path) == "/sys/class/power_supply/battery/temp" else swapping(path, *args, **kwargs)
+        with patch.object(Path, "read_text", hot):
+            self.assertFalse(wiki_chat.resources_available())
+        def missing(path, *args, **kwargs):
+            return "SwapFree: 3145728 kB\n" if str(path) == "/proc/meminfo" else fixture(path, *args, **kwargs)
+        with patch.object(Path, "read_text", missing):
             self.assertFalse(wiki_chat.resources_available())
 
     def test_handoff_restores_queue_and_log_position(self):

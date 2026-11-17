@@ -32,9 +32,8 @@ def reason(values, starting=False, launcher=False):
         return 'previous Wiki worker cleanup pending'
     if launcher and values.get('old_bridge'):
         return 'previous Wiki bridge cleanup pending'
-    # Healthy paging is allowed. Physical reserve also covers uncharged GPU RAM.
-    if values['MemAvailable'] < (786432 if starting else 262144):
-        return 'RAM reserve for Minecraft'
+    # Let reclaim/swap satisfy allocations. Low physical headroom alone is
+    # not evidence of harmful pressure; retain capacity and stall checks.
     if values['SwapFree'] < (2097152 if starting else 786432):
         return 'swap reserve for Minecraft'
     if values['MemAvailable'] + values['SwapFree'] < (3145728 if starting else 1048576):
@@ -64,12 +63,10 @@ def update(state, values, mode, now):
         state['healthy_since'] = None
         counts = state.setdefault('counts', {})
         checks = (
-            ('low_ram', values['MemAvailable'] < 393216, 5, 'sustained low RAM reserve'),
             ('low_swap', values['SwapFree'] < 786432, 3, 'swap reserve for Minecraft'),
             ('low_total', values['MemAvailable'] + values['SwapFree'] < 1048576, 3, 'combined free-memory reserve'),
             ('memory', values['memory_some'] >= 20 or values['memory_full'] >= 5, 10, 'sustained memory pressure'),
             ('io', values['io_full'] >= 25, 10, 'sustained storage pressure'))
-        if values['MemAvailable'] < 262144: blocked = 'emergency RAM reserve'
         for key, active, limit, label in checks:
             counts[key] = min(limit, counts.get(key, 0) + 1) if active else 0
             if counts[key] >= limit: blocked = blocked or label

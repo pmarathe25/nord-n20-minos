@@ -2,7 +2,7 @@
 
 The bridge has answered real chat messages on the phone using the Adreno
 GPU. It is enabled on the live server and can use the configured disk swap,
-with an emergency memory and temperature guard. Gameplay trials saw longer tail ticks during
+with swap-capacity, sustained-pressure and temperature guards. Gameplay trials saw longer tail ticks during
 inference; see the [end-to-end trial](https://github.com/pmarathe25/nord-n20-minos/blob/03af5bfb1d9afc5dd5a573855568d112fd42fe78/reports/2026-11-09-wiki-end-to-end.md).
 
 The phone can run the existing 4B model, but it is slow for interactive chat.
@@ -226,12 +226,12 @@ Wiki and cache the parsed articles. An offline invocation of the bridge
 searches cached pages only. The bridge caches up to 64 sourced replies in
 memory. Reusing a reply requires the same question and the same retrieved
 evidence, including the page revisions. The bridge pauses lookups at 40 °C
-battery temperature or above. Without at least 512 MiB of free swap, the
-bridge requires 980 MiB of available RAM; with swap available it requires
-208 MiB. The launcher normally waits for 3.5 GiB of available RAM, but permits
-startup with at least 336 MiB of available RAM and 2 GiB of free swap. It
-stops the worker if RAM falls below 208 MiB while at least 512 MiB of swap is
-free, or below 980 MiB otherwise, or if the battery reaches 40 °C. The bridge
+battery temperature or above. Neither bridge nor launcher requires a minimum
+amount of physical RAM alone. Startup needs 2 GiB free swap and 3 GiB combined
+available RAM plus free swap; ongoing work needs 768 MiB free swap and 1 GiB
+combined headroom. The launcher also yields for sustained paging/storage
+stalls or if the battery reaches 40 °C; see the
+[current pressure policy](security.md#swap-aware-minecraft-priority). The bridge
 remains available to acknowledge and queue questions while the worker is off.
 Swap can cause substantial storage traffic and gameplay stalls.
 
