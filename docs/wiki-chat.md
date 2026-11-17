@@ -66,7 +66,7 @@ The same bridge also recognizes these commands at the start of a chat message:
   lookup finds anything, the local model interprets the request. Punctuation,
   including `?`, is treated as part of the query.
   A query that is exactly an online player's name instead reports that player's
-  current position and provides private directions. If no such player is online,
+  current position and provides nearby directions. If no such player is online,
   the query falls back to saved-location search. An online player name takes
   precedence over a saved location with the same name.
 - `@map <search> --from-nearest-landmark` adds directions from the closest
@@ -92,13 +92,17 @@ The same bridge also recognizes these commands at the start of a chat message:
   Use `--` before a search beginning with a dash to treat it as text.
 - `@help` lists these commands and `@wiki`.
 
-For each matched location in a search, the bridge also privately tells the
-requesting player an approximate direction and distance based on a fresh
-position, dimension and facing query immediately before each page of directions.
-Directions also give compass and vertical offsets from the player's position.
-No direction is given across dimensions. If the player cannot be queried, the
+For each matched location in a search, the bridge whispers approximate directions
+and distance to the requesting player and players within 25 blocks of them in the
+same dimension. The radius is measured in three dimensions at delivery. Directions
+name the requester and use their position, dimension and facing from a fresh query
+immediately before each page; they are not relative to each recipient's facing.
+Directions also give compass and vertical offsets from the requester's position.
+No player-relative direction is given across dimensions. If the player cannot be queried, the
 bridge reports that privately. Large results are sent as multiple pages. Plain
-`@map` lists locations without directions.
+`@map` lists locations without directions. Death directions remain private to the
+player. A biome found from a landmark gives directions from that landmark rather
+than the player; an explicitly requested additional landmark is also included.
 When `--from-nearest-landmark` is included, the search also describes
 the closest other saved landmark in the same dimension, using east, west, north,
 south and vertical distances. When the target is already one of the player's

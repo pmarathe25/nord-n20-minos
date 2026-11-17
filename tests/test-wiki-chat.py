@@ -692,6 +692,16 @@ class WikiChatTests(unittest.TestCase):
                 command = os.read(fd, 4096)
                 self.assertTrue(command.startswith(b"tellraw @a "))
                 self.assertEqual(json.loads(command[len(b"tellraw @a "):]), styled_components(components))
+                reply(fifo, "Alex", components, nearby=True)
+                command = os.read(fd, 4096)
+                prefix = b"execute at Alex run tellraw @a[distance=..25] "
+                self.assertTrue(command.startswith(prefix))
+                self.assertEqual(command.count(b"\n"), 1)
+                self.assertEqual(json.loads(command[len(prefix):]), styled_components(components))
+                with self.assertRaises(ValueError):
+                    reply(fifo, "Alex", components, broadcast=True, nearby=True)
+                with self.assertRaises(ValueError):
+                    reply(fifo, "Alex] run say test", components, nearby=True)
             finally:
                 os.close(fd)
 

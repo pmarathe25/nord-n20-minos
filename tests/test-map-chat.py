@@ -659,7 +659,7 @@ class MarkerTests(unittest.TestCase):
         self.assertFalse(requests)
         self.assertFalse(self.service.queue)
 
-    def test_map_directions_use_fresh_snapshot_and_are_private(self):
+    def test_map_directions_use_fresh_snapshot_and_are_nearby(self):
         markers = [{'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'},
                    {'note': 'nether', 'pos': [10, 70, 10], 'dimension': 'minecraft:the_nether'}]
         with patch.object(m, 'load_markers', return_value=markers):
@@ -670,6 +670,8 @@ class MarkerTests(unittest.TestCase):
             self.capture_direction('Alex', pos='[0.0d, 64.0d, 0.0d]', rotation='[0.0f, 0.0f]')
         private = [(text, kw) for _, text, kw in self.replies if not kw.get('broadcast')]
         self.assertEqual(len(private), 1)
+        self.assertTrue(private[0][1].get('nearby'))
+        self.assertIn('From Alex:', private[0][0])
         self.assertTrue(any('go up and forward and to your left' in text for text, _ in private))
         self.assertTrue(any('another' in text or 'direction unavailable' in text for text, _ in private))
 
@@ -853,6 +855,7 @@ class MarkerTests(unittest.TestCase):
         self.assertTrue(any('[Death] Directions:' in text for _, text, _ in self.replies))
         self.assertTrue(any('compass: 5 blocks east, 10 blocks south, 1 block up' in text for _, text, _ in self.replies))
         self.assertTrue(all(not kwargs.get('broadcast') for _, _, kwargs in self.replies))
+        self.assertTrue(all(not kwargs.get('nearby') for _, _, kwargs in self.replies))
 
     def test_search_directions_include_nearest_landmark(self):
         target = {'note': 'target', 'pos': [10, 70, 10], 'dimension': 'minecraft:overworld'}
@@ -1241,14 +1244,14 @@ class MarkerTests(unittest.TestCase):
                     stream.write(PREFIX + f'System chat: Alex has the following entity data: {value}\n')
                 stream.write(PREFIX + f'System chat: Found no elements matching {token}\n')
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not any(line.startswith(b'tellraw Alex ') and b'Directions:' in line for line in commands):
+            while time.monotonic() < deadline and not any(line.startswith(b'execute at Alex run tellraw @a[distance=..25] ') and b'Directions:' in line for line in commands):
                 if select.select([fd], [], [], .1)[0]:
                     buffer += os.read(fd, 65536)
                     lines = buffer.split(b'\n')
                     buffer = lines.pop()
                     commands.extend(lines)
-            self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'Directions:' in line for line in commands))
-            self.assertTrue(any(line.startswith(b'tellraw Alex ') and b'From Village east:' in line and b'straight-line:' in line for line in commands))
+            self.assertTrue(any(line.startswith(b'execute at Alex run tellraw @a[distance=..25] ') and b'Directions:' in line for line in commands))
+            self.assertTrue(any(line.startswith(b'execute at Alex run tellraw @a[distance=..25] ') and b'From Village east:' in line and b'straight-line:' in line for line in commands))
         finally:
             process.terminate()
             process.join(5)

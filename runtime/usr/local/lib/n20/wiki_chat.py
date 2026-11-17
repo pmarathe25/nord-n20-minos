@@ -472,7 +472,7 @@ def styled_components(components):
                            r'|(?P<axis>\d+ blocks? (?:east|west|north|south|up|down))'
                            r'|(?P<direction>go (?:up|down|forward|back|to your right|to your left)'
                            r'(?: and (?:up|down|forward|back|to your right|to your left))*)'
-                           r'|(?P<origin>From you:)')
+                           r'|(?P<origin>From (?:you|[A-Za-z0-9_]{1,16}):)')
             else:
                 pattern = None
             if pattern:
@@ -489,11 +489,14 @@ def styled_components(components):
     return result
 
 
-def reply(path, player, components, broadcast=False):
+def reply(path, player, components, broadcast=False, nearby=False):
     if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
         raise ValueError("invalid player name")
-    target = "@a" if broadcast else player
-    command = ("tellraw " + target + " " + json.dumps(styled_components(components), ensure_ascii=True) + "\n").encode()
+    if broadcast and nearby:
+        raise ValueError('conflicting reply targets')
+    prefix = (f'execute at {player} run tellraw @a[distance=..25] ' if nearby else
+              'tellraw ' + ('@a' if broadcast else player) + ' ')
+    command = (prefix + json.dumps(styled_components(components), ensure_ascii=True) + "\n").encode()
     fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
@@ -1108,6 +1111,14 @@ class MarkerQueue:
             print("Map directions could not reach the Minecraft console", flush=True)
             return False
 
+    def send_nearby(self, player, message):
+        try:
+            reply(self.args.console, player, [{'text': message}], nearby=True)
+            return True
+        except (OSError, ValueError):
+            print('Nearby map directions could not reach the Minecraft console', flush=True)
+            return False
+
     def enqueue_directions(self, player, markers, landmarks=None, death=False):
         if not markers:
             return
@@ -1543,7 +1554,8 @@ class MarkerQueue:
             for marker in pending['markers']:
                 line = display_note(marker.get('direction_note', marker['note'])) + ':'
                 if not marker.get('biome_reference_landmark'):
-                    line += ' From you: ' + relative_direction(marker, position, rotation, dimensions[0])
+                    origin = 'you' if pending.get('death') else player
+                    line += f' From {origin}: ' + relative_direction(marker, position, rotation, dimensions[0])
                     if marker['dimension'] == dimensions[0]:
                         line += '; compass: ' + compass_direction(marker, position)
                 lines.append(line)
@@ -1562,7 +1574,8 @@ class MarkerQueue:
                 if nearby and nearby != reference_line and not (reference_line and reference_line.startswith(nearby + ' (')):
                     lines[index] += '\n  ' + nearby
             label = 'Death' if pending.get('death') else 'Map'
-            if not self.send_private(player, f"[{label}] Directions:\n" + "\n".join(lines)):
+            send_directions = self.send_private if pending.get('death') else self.send_nearby
+            if not send_directions(player, f"[{label}] Directions:\n" + "\n".join(lines)):
                 self.enqueue_directions(player, pending['markers'], pending.get('landmarks'), pending.get('death', False))
             return
         if "pos" not in pending or "dimension" not in pending:
@@ -1698,7 +1711,7 @@ class MarkerQueue:
                     proposed = page + [marker]
                     rendered = '[Map] ' + '\n'.join(marker_text(item) for item in proposed)
                     worst = '[Map] Directions:\n' + '\n'.join(
-                        item['note'] + ': From you: ' + max('in ' + item['dimension'] + '; direction unavailable from here',
+                        item['note'] + ': From ' + player + ': ' + max('in ' + item['dimension'] + '; direction unavailable from here',
                                                    'go down and forward and to your right (straight-line: 99999999 blocks); '
                                                    'compass: 60000000 blocks east, 60000000 blocks south, 60000000 blocks down', key=len)
                         for item in proposed)
