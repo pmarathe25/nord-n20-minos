@@ -263,6 +263,10 @@ class WikiChatTests(unittest.TestCase):
             self.assertEqual(resume, ((1, 2), 17))
             self.assertFalse(path.exists())
             self.assertEqual(restore_handoff(path), (deque(), None))
+            path.write_text(json.dumps({'version': 1, 'queue': [[[42, 'start'], 'Alex', str(i)] for i in range(40)],
+                                        'log': {'dev': 1, 'ino': 2, 'offset': 17}}))
+            requests, _ = restore_handoff(path)
+            self.assertEqual([entry[2] for entry in requests], [str(i) for i in range(40)])
             target = Path(tmp) / "target"
             target.write_text("private")
             path.symlink_to(target)

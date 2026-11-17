@@ -38,11 +38,6 @@ MAX_LINE = 4096
 REPLY_CACHE_SIZE = 64
 REQUEST_INTERVAL_SECONDS = 30
 STATUS_QUEUE_LIMIT = 128
-REQUEST_QUEUE_LIMIT = 16
-REQUEST_QUEUE_BYTES = 8192
-REQUEST_PLAYER_LIMIT = 2
-REQUEST_ADMISSION_INTERVAL = 10
-REQUEST_REJECTION_INTERVAL = 30
 HISTORY_LIMIT = 50
 MODEL_FIRST_REPLY_SECONDS = 75
 MODEL_STREAM_IDLE_SECONDS = 15
@@ -1927,43 +1922,14 @@ class QueuedRequest(tuple):
 
 
 def queue_request(args, requests, pending, server, player, question):
-    """Apply the same bounded admission to chat and asynchronous map misses."""
+    """Queue chat and asynchronous map misses without per-player admission limits."""
     if not question or len(question) > 256 or not re.fullmatch(r'[A-Za-z0-9_]{1,16}', player):
         return False
-    now = time.monotonic()
-    for entry in list(requests):
-        if entry[0] != server:
-            requests.remove(entry)
-    if getattr(args, '_admission_server', None) != server:
-        args._admission_server = server
-        args._admission = OrderedDict()
-    admission = args._admission
-    admitted, rejected = admission.pop(player, (float('-inf'), float('-inf')))
-    player_count = sum(entry[1] == player for entry in requests)
-    if pending is not None and getattr(args, '_active_player', None) == player:
-        player_count += 1
-    active = getattr(args, '_active_request', None) if pending is not None else None
-    active_bytes = len(active[2].encode('utf-8')) if active is not None else 0
-    # Reserve the active request's slot and bytes so a failed attempt can
-    # return to the front without losing a question or exceeding the bounds.
-    full = (len(requests) + int(pending is not None) >= REQUEST_QUEUE_LIMIT or player_count >= REQUEST_PLAYER_LIMIT or
-            sum(len(entry[2].encode('utf-8')) for entry in requests) + active_bytes + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES or
-            now - admitted < REQUEST_ADMISSION_INTERVAL)
-    if full:
-        if now - rejected >= REQUEST_REJECTION_INTERVAL:
-            try:
-                reply(args.console, player, [{"text": "[Wiki] Request limit reached; please try again later."}])
-            except (OSError, ValueError):
-                pass
-            rejected = now
-        admission[player] = (admitted, rejected)
-    else:
-        admission[player] = (now, rejected)
-    # Bound bookkeeping even when many distinct names appear in the log.
-    while len(admission) > 128:
-        admission.popitem(last=False)
-    if full:
-        return False
+    if getattr(args, '_queue_server', None) != server:
+        requests_copy = [entry for entry in requests if entry[0] == server]
+        requests.clear()
+        requests.extend(requests_copy)
+        args._queue_server = server
     requests.append(QueuedRequest(server, player, question))
     return True
 
@@ -2189,7 +2155,7 @@ def restore_handoff(path):
         with os.fdopen(fd, "r", encoding="utf-8") as source:
             fd = -1
             data = json.load(source)
-        if data.get("version") != 1 or len(data["queue"]) > REQUEST_QUEUE_LIMIT:
+        if data.get("version") != 1 or not isinstance(data.get("queue"), list):
             raise ValueError("invalid Wiki handoff")
         requests = deque()
         for server, player, question in data["queue"]:
@@ -2198,9 +2164,6 @@ def restore_handoff(path):
                     not isinstance(player, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player) or
                     not isinstance(question, str) or not question.strip() or len(question) > 256):
                 raise ValueError("invalid Wiki handoff request")
-            if (sum(entry[1] == player for entry in requests) >= REQUEST_PLAYER_LIMIT or
-                    sum(len(entry[2].encode('utf-8')) for entry in requests) + len(question.encode('utf-8')) > REQUEST_QUEUE_BYTES):
-                raise ValueError("Wiki handoff exceeds admission limits")
             entry = QueuedRequest(tuple(server), player, question)
             requests.append(entry)
         log = data["log"]

@@ -213,9 +213,10 @@ retrieval, model-startup or inference failure keeps the same question at the
 front of the queue and retries after at least 30 seconds. The sender receives
 one private waiting notice rather than a final unavailable answer. Only a
 completed answer is sent and added to history; a genuine no-answer result is
-still final. Up to 16 outstanding questions and 8 KiB of question text are
-retained, including active work, with at most two requests per player.
-The queue is held in memory and is discarded if the bridge or server restarts.
+still final. There is no per-player cooldown or fixed request-count limit;
+additional questions wait in the shared queue. The queue is held in memory, so
+a large backlog consumes memory, and it is discarded if the bridge or server
+restarts. A manually supplied restart handoff is limited to 128 KiB.
 Direct map matches and supported exact Wiki answers can run while the model is
 stopped. A request that actually needs inference asks the launcher to start the
 worker; each attempt waits for startup and the resource guard up to five

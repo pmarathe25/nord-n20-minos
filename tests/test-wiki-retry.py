@@ -1,4 +1,4 @@
-"""Retain bounded questions across unavailable lookups and deliver once ready."""
+"""Retain questions across unavailable lookups and deliver once ready."""
 from collections import OrderedDict, deque
 from concurrent.futures import Future
 from pathlib import Path
@@ -27,7 +27,7 @@ class Worker:
 
 
 class RetryTests(unittest.TestCase):
-    def test_failure_reserves_capacity_retries_once_and_does_not_write_history(self):
+    def test_failure_retries_once_and_does_not_write_history(self):
         args = SimpleNamespace(console='unused', pid_file='unused')
         queue = deque(m.QueuedRequest((42, 'start'), 'Player'+str(i), 'Question '+str(i)) for i in range(16))
         original = queue[0]
@@ -35,11 +35,11 @@ class RetryTests(unittest.TestCase):
         with patch.object(m, 'server_identity', return_value=(42, 'start')), patch.object(m, 'reply') as send:
             with patch.object(m.time, 'monotonic', return_value=100):
                 future, *_ = m.start_queued(args, queue, Worker(m.LookupDeferred()), {}, None, 0, lambda _: None)
-                self.assertFalse(m.queue_request(args, queue, future, (42,'start'), 'NewPlayer', 'Extra'))
-                self.assertFalse(m.queue_request(args, queue, future, (42,'start'), 'Player1', 'Extra'))
+                self.assertTrue(m.queue_request(args, queue, future, (42,'start'), 'NewPlayer', 'Extra'))
+                self.assertTrue(m.queue_request(args, queue, future, (42,'start'), 'Player1', 'Extra'))
                 m.finish_queued(args, queue, future, record)
                 self.assertIs(queue[0], original)
-                self.assertEqual(len(queue), 16)
+                self.assertEqual(len(queue), 18)
                 record.assert_not_called()
             notices = [call for call in send.call_args_list if 'queued until' in call.args[2][0]['text']]
             self.assertEqual(len(notices), 1)
@@ -55,16 +55,16 @@ class RetryTests(unittest.TestCase):
                 future, *_ = m.start_queued(args, queue, Worker(answer), {}, None, 0, lambda _: None)
                 m.finish_queued(args, queue, future, record)
             record.assert_called_once_with('Player0', 'Question 0', answer)
-            self.assertEqual(len(queue), 15)
+            self.assertEqual(len(queue), 17)
 
-    def test_active_question_bytes_are_reserved(self):
+    def test_active_question_retries_after_large_questions_are_queued(self):
         args = SimpleNamespace(console='unused', pid_file='unused')
         queue = deque(m.QueuedRequest((42,'start'), 'Player'+str(i), '\U0001f600'*256) for i in range(8))
         with patch.object(m, 'server_identity', return_value=(42,'start')), patch.object(m, 'reply'):
             future, *_ = m.start_queued(args, queue, Worker(m.LookupDeferred()), {}, None, 0, lambda _: None)
-            self.assertFalse(m.queue_request(args, queue, future, (42,'start'), 'NewPlayer', 'x'))
+            self.assertTrue(m.queue_request(args, queue, future, (42,'start'), 'NewPlayer', 'x'))
             m.finish_queued(args, queue, future, Mock())
-            self.assertEqual(sum(len(item[2].encode()) for item in queue), m.REQUEST_QUEUE_BYTES)
+            self.assertEqual(sum(len(item[2].encode()) for item in queue), 8193)
 
     def test_wait_does_not_expire_and_old_server_is_discarded(self):
         args = SimpleNamespace(console='unused', pid_file='unused')

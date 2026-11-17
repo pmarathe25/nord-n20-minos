@@ -166,18 +166,15 @@ collection is not configured.
 
 ## Wiki request admission
 
-Chat requests and asynchronous map-search misses share admission controls:
-16 outstanding requests and 8 KiB of UTF-8 question text, including active
-work, two requests per player, and ten seconds between admissions for a player.
-Rejections are private and limited to one
-per player per 30 seconds; bookkeeping is capped at 128 player names.
-Admission remains bounded while the worker cannot run. Accepted questions do
-not expire while waiting. A temporary lookup failure returns the same request
-to the front with a 30-second retry delay and one private waiting notice;
-its slot and byte budget stay reserved while active. Restored handoffs obey
-the same caps. Requests for a previous Minecraft process are discarded.
-These limits do not replace the model's resource
-guards or the separately bounded marker command queues.
+Chat requests and asynchronous map-search misses share an in-memory queue with
+no request-count, per-player, or admission-rate limit. This allows bursts to wait,
+but a large backlog can consume memory; the server whitelist is the access
+boundary for submitting questions. Each question is limited to 256 characters.
+Questions do not expire while waiting. A temporary lookup failure returns the
+same request to the front with a 30-second retry delay and one private waiting
+notice. Requests for a previous Minecraft process are discarded. A manually
+supplied restart handoff is limited to 128 KiB. The model's resource guards and
+the separately bounded marker command queues remain in place.
 
 ## Backup locking and recovery
 

@@ -4,7 +4,7 @@
 
 The current [security controls](security.md) add raw-storage protection,
 compatible kernel restrictions, service seccomp/memory limits, a dual-stack
-legacy firewall, protected SSH logs with rotation, and bounded Wiki admission.
+legacy firewall, protected SSH logs with rotation, and Wiki resource guards.
 That document also records deployment prerequisites and the physical-access,
 vendor-kernel and recovery risks that remain.
 
